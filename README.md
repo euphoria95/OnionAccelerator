@@ -45,4 +45,19 @@ Run the script with the desired mode:
  or
 ./OnionAccelerator.sh /path/to/download concurrent
 ```
+### Docker Setup
+To wrap the TOR proxy containers on localhost using ports 5000-5020, you can use the dperson/torproxy Docker container. Here is an example of how to set up the containers:
+```
+for port in {5000..5020}; do
+    docker run -d --name "torproxy_$port" -p 127.0.0.1:$port:9050 dperson/torproxy
+done
+```
 
+### Contributing
+We welcome contributions to improve OnionAccelerator. Please feel free to submit issues, feature requests, and pull requests on GitHub.
+
+### TODO
+Healthcheck and Speedtest for each Tor connection to better manage network performance.
+
+### License
+This project is licensed under the MIT License.
