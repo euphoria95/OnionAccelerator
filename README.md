@@ -34,6 +34,7 @@ PROXY_PORTS=5000
 PROXY_COUNT=21
 PROXY_TYPE=SOCKS5
 User_Agent=YourUserAgentStringHere
+'''
 
 ### Usage
 Create a file named URLs.txt containing the URLs of the files you want to download.
@@ -42,4 +43,5 @@ Run the script with the desired mode:
 ./OnionAccelerator.sh /path/to/download partial
  or
 ./OnionAccelerator.sh /path/to/download concurrent
+'''
 
