@@ -2,12 +2,6 @@
 
 OnionAccelerator is a multi-functional Python script designed for downloading files through multiple SOCKS5 proxies (commonly Tor instances). It supports three main modes:
 
-## Wrap Multiple Tor proxies with docker with Bash one-liner
-
-```bash
-for port in {5000..5020}; do     docker run -d --name "torproxy_$port" -p 127.0.0.1:$port:9050 dperson/torproxy; done
-```
-
 ## Modes
 
 ### Multi-Download Mode
@@ -115,6 +109,12 @@ python3 OnionAccelerator.py --mode speedtest
 - Python 3.7+
 - `requests[socks]` or `PySocks` for SOCKS5 support
 - `tqdm` for progress bars
+
+## Wrap Multiple Tor proxies with docker with Bash one-liner
+
+```bash
+for port in {5000..5020}; do     docker run -d --name "torproxy_$port" -p 127.0.0.1:$port:9050 dperson/torproxy; done
+```
 
 ## Contributing
 
