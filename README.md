@@ -1,63 +1,115 @@
 # OnionAccelerator
-OnionAccelerator is a project designed to exponentially increase the download speed of files by leveraging multiple TOR nodes running in Docker containers. This innovative approach allows for parallel downloading through multiple proxy servers, significantly boosting the overall download performance.
- 
-## Introduction
- 
-OnionAccelerator harnesses the power of Docker and TOR proxies to split file downloads into multiple parts, each fetched through a different proxy. This method not only speeds up the download process but also provides a layer of anonymity and security by routing traffic through the TOR network.
- 
-The project supports two modes of operation:
-1. **Partial Mode**: Splits a single file into multiple parts and downloads each part through a different proxy.
-2. **Concurrent Mode**: Downloads multiple files simultaneously, each through a different proxy.
- 
-## Features
- 
-- **Exponential Speed Increase**: By using multiple TOR nodes, download speeds are significantly increased.
-- **Anonymity and Security**: All traffic is routed through the TOR network, providing enhanced privacy.
-- **Docker Integration**: Easy deployment and management of TOR proxies using Docker.
- 
-## Getting Started
- 
-### Prerequisites
- 
-- Docker
-- Bash
-- curl
- 
-### Configuration
- 
-Create a `config.cfg` file with the following content:
- 
-```cfg
-# Proxy configuration
-PROXY_IP=127.0.0.1
-PROXY_PORTS=5000
-PROXY_COUNT=21
-PROXY_TYPE=SOCKS5
-User_Agent=YourUserAgentStringHere
+
+OnionAccelerator is a multi-functional Python script designed for downloading files through multiple SOCKS5 proxies (commonly Tor instances). It supports three main modes:
+
+## Modes
+
+### Multi-Download Mode
+
+- Simultaneously download multiple files listed in `URLs.txt` using up to 20 parallel threads/proxies.
+- Automatically retries failed downloads a configurable number of times.
+- Aggregates download progress via a single progress bar in the terminal.
+
+### Partial-Download Mode
+
+- Splits each file into multiple chunks (up to 20) and downloads them in parallel, each chunk assigned to a different SOCKS5 proxy.
+- If the server does not provide a `Content-Length` header, the script automatically falls back to a single, sequential download.
+- Merges the downloaded chunks into a final file upon success, and performs retry logic if any chunk fails.
+
+### Speedtest & Healthcheck Mode
+
+- Quickly measures proxy availability and approximate download speed on each SOCKS5 port, showing a summary of successes and failures (with emoji indicators).
+
+## Key Features
+
+### Multiple Threads & SOCKS5 Proxies
+
+- Dynamically assigns up to 20 local SOCKS5 ports (e.g., `127.0.0.1:5000–127.0.0.1:5019`) for parallel fetching, potentially speeding up downloads over Tor.
+
+### Progress Bars
+
+- Utilizes `tqdm` to show clear download progress:
+  - A single aggregated bar for multi-downloads.
+  - A dedicated bar per file in partial-download mode.
+  - Fallback sequential downloads also show an inline progress bar.
+
+### Retry Logic
+
+- Automatically retries failed downloads or chunks, up to a configurable limit (`--retries`).
+
+### Logging
+
+- Generates a unique `job_id` each time the script is run.
+- Writes detailed logs (DEBUG level) to a timestamped file in the `logs/` directory.
+- Outputs essential logs (INFO level) to the console.
+
+### User-Agents
+
+- Loads random User-Agent strings from a `UserAgents.tsv` file to help disguise download patterns.
+
+### Seamless Fallback
+
+- In partial-download mode, if no file size is advertised by the server (`Content-Length`), the script automatically switches to a single GET request and proceeds with a standard download.
+
+## Installation
+
+1. **Install Python 3** (3.7+ recommended).
+
+2. **Install dependencies:**
+
+    ```bash
+    pip install requests[socks] tqdm
+    ```
+
+3. **Ensure you have multiple SOCKS5 proxies** (e.g., Tor instances on ports `5000..5019`), or adapt the code to your setup.
+
+## Usage
+
+### Prepare `URLs.txt`
+
+- Put the URLs you want to download (one per line) into a file named `URLs.txt`.
+
+### Run the script:
+
+```bash
+python3 OnionAccelerator.py --mode <multi|partial|speedtest> [--retries N]
 ```
 
-### Usage
-Create a file named URLs.txt containing the URLs of the files you want to download.
-Run the script with the desired mode:
+- `--mode`:
+  - `multi`: Parallel download of all URLs in `URLs.txt`, each in a separate worker thread with its own SOCKS5 port.
+  - `partial`: Parallel chunk-based download for each URL, automatically merging chunks.
+  - `speedtest`: Test download speed and basic health for each SOCKS5 port using the first URL from `URLs.txt`.
+  
+- `--retries N`: Set how many times to retry if a download fails (default: 3).
 
-```
-./OnionAccelerator.sh /path/to/download partial
- or
-./OnionAccelerator.sh /path/to/download concurrent
-```
-### Docker Setup
-To wrap the TOR proxy containers on localhost using ports 5000-5020, you can use the dperson/torproxy Docker container. Here is an example of how to set up the containers:
-```
-for port in {5000..5020}; do
-    docker run -d --name "torproxy_$port" -p 127.0.0.1:$port:9050 dperson/torproxy
-done
+### Examples
+
+```bash
+# Multi-download mode, retrying up to 3 times:
+python3 OnionAccelerator.py --mode multi --retries 3
+
+# Partial-download mode, splitting each file into 20 chunks in parallel:
+python3 OnionAccelerator.py --mode partial
+
+# Speedtest mode, checks each proxy port:
+python3 OnionAccelerator.py --mode speedtest
 ```
 
-### Contributing
-We welcome contributions to improve OnionAccelerator. Please feel free to submit issues, feature requests, and pull requests on GitHub.
+## Project Structure
 
-### TODO
-Healthcheck and Speedtest for each Tor connection to better manage network performance.
+- `OnionAccelerator.py`: The main script containing all modes (multi-download, partial-download, speedtest).
+- `URLs.txt`: A text file with one URL per line.
+- `UserAgents.tsv`: A list of user-agent strings (one per line).
+- `logs/`: A directory automatically created to store timestamped log files.
+- `downloads/`: The default download location for multi mode.
+- `partials/`: The default download location for partial mode (temporary chunk files are merged here).
 
-### License
-This project is licensed under the MIT License.
+## Requirements
+
+- Python 3.7+
+- `requests[socks]` or `PySocks` for SOCKS5 support
+- `tqdm` for progress bars
+
+## Contributing
+
+Pull requests and suggestions for improvements are welcome. Feel free to open an issue if you encounter any problems or have questions regarding advanced Tor configurations.
