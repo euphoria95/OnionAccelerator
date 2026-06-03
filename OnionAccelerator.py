@@ -5,7 +5,6 @@ import sys
 import time
 import random
 import string
-import math
 import threading
 import queue
 from urllib.parse import urlparse
@@ -37,41 +36,41 @@ MAX_SPEEDTEST_BYTES = 5 * 1024 * 1024  # 5 MB
 SPEEDTEST_CHUNK_SIZE = 1024 * 64
 
 # =========== LOGGER & JOB_ID SETUP ============
+# Logger is configured in setup_logging(), called from main(), to avoid
+# side effects (file creation, stdout output) on module import.
+JOB_ID = None
+logger = logging.getLogger("OnionAccelerator")
+
+
 def generate_job_id():
-    """
-    Generate a unique ID based on timestamp + random chars
-    """
     ts = time.strftime("%Y%m%d_%H%M%S")
     rnd = ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
     return f"{ts}_{rnd}"
 
-JOB_ID = generate_job_id()
 
-logger = logging.getLogger("OnionAccelerator")
-logger.setLevel(logging.DEBUG)
+def setup_logging():
+    global JOB_ID
+    JOB_ID = generate_job_id()
+    logger.setLevel(logging.DEBUG)
+    os.makedirs(LOGS_DIR, exist_ok=True)
+    log_filename = os.path.join(LOGS_DIR, f"OnionAccelerator_{JOB_ID}.log")
 
-os.makedirs(LOGS_DIR, exist_ok=True)
-log_filename = os.path.join(LOGS_DIR, f"OnionAccelerator_{JOB_ID}.log")
+    fh = logging.FileHandler(log_filename)
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
+    logger.addHandler(fh)
 
-fh = logging.FileHandler(log_filename)
-fh.setLevel(logging.DEBUG)
-fh_formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
-fh.setFormatter(fh_formatter)
-logger.addHandler(fh)
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setLevel(logging.INFO)
+    ch.setFormatter(logging.Formatter('[%(levelname)s] %(message)s'))
+    logger.addHandler(ch)
 
-ch = logging.StreamHandler(sys.stdout)
-ch.setLevel(logging.INFO)
-ch_formatter = logging.Formatter('[%(levelname)s] %(message)s')
-ch.setFormatter(ch_formatter)
-logger.addHandler(ch)
-
-logger.info(f"Starting OnionAccelerator with job_id={JOB_ID}")
 
 # =========== UTILS ===========
 
 def load_user_agents(filepath=USERAGENTS_FILE):
     """
-    Load user-agent strings from a file. Fallback if missing.
+    Load user-agent strings from a TSV file (first column). Fallback if missing.
     """
     if not os.path.isfile(filepath):
         logger.warning(f"UserAgents file not found: {filepath}. Using fallback.")
@@ -82,22 +81,30 @@ def load_user_agents(filepath=USERAGENTS_FILE):
     agents = []
     with open(filepath, "r", encoding="utf-8") as f:
         for line in f:
-            ua = line.strip()
+            # TSV: first column is the UA string, remaining columns are metadata
+            parts = line.strip().split('\t')
+            ua = parts[0].strip()
             if ua:
                 agents.append(ua)
     if not agents:
         agents = ["Mozilla/5.0 (Windows NT 10.0; Win64; x64)"]
     return agents
 
+
 def random_user_agent(uas):
     return random.choice(uas)
 
-def parse_filename(url: str) -> str:
+
+def url_to_local_path(url: str, base_dir: str) -> str:
+    """
+    Derive a collision-free local path from a URL using hostname as a subdirectory.
+    e.g. http://example.onion/file.zip -> base_dir/example.onion/file.zip
+    """
     parsed = urlparse(url)
-    filename = os.path.basename(parsed.path)
-    if not filename:
-        filename = "index.html"
-    return filename
+    host = parsed.netloc.replace(":", "_") or "unknown"
+    filename = os.path.basename(parsed.path) or "index.html"
+    return os.path.join(base_dir, host, filename)
+
 
 def make_proxies_for_port(port: int) -> dict:
     """
@@ -108,6 +115,7 @@ def make_proxies_for_port(port: int) -> dict:
         "https": f"socks5h://127.0.0.1:{port}",
     }
 
+
 # =========== MULTI-DOWNLOAD ===========
 
 def download_file(url, port, user_agents, progress_queue=None):
@@ -116,9 +124,8 @@ def download_file(url, port, user_agents, progress_queue=None):
     """
     proxies = make_proxies_for_port(port)
     ua = random_user_agent(user_agents)
-    filename = parse_filename(url)
-    out_path = os.path.join(DOWNLOAD_DIR, filename)
-    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    out_path = url_to_local_path(url, DOWNLOAD_DIR)
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
     try:
         with requests.get(url, proxies=proxies, timeout=REQUEST_TIMEOUT,
@@ -138,15 +145,15 @@ def download_file(url, port, user_agents, progress_queue=None):
             os.remove(out_path)
         return False
 
+
 def multi_download_mode(urls, retries=DEFAULT_RETRIES):
     logger.info(f"multi_download_mode: {len(urls)} URLs, retries={retries}")
     user_agents = load_user_agents()
     ports = [BASE_PORT + i for i in range(MAX_WORKERS)]
 
-    # queue of (url, attempts_left)
     q = queue.Queue()
     for u in urls:
-        q.put((u, retries))
+        q.put(u)
 
     progress_queue = queue.Queue()
     stop_flag = threading.Event()
@@ -167,19 +174,20 @@ def multi_download_mode(urls, retries=DEFAULT_RETRIES):
         port = ports[thread_id]
         while True:
             try:
-                url, attempts_left = q.get_nowait()
+                url = q.get_nowait()
             except queue.Empty:
                 break
-            success = download_file(url, port, user_agents, progress_queue=progress_queue)
-            if not success:
-                attempts_left -= 1
-                if attempts_left > 0:
-                    logger.warning(f"Retrying {url} (left={attempts_left})")
-                    q.put((url, attempts_left))
-                else:
-                    logger.error(f"[FAIL] Giving up on {url} after {retries} attempts.")
+            # Inline retries — no re-queuing, which would deadlock if all workers
+            # exit with an empty queue before the retried item can be picked up.
+            for attempt in range(retries):
+                success = download_file(url, port, user_agents, progress_queue=progress_queue)
+                if success:
+                    logger.info(f"[OK] {url} (port={port})")
+                    break
+                if attempt < retries - 1:
+                    logger.warning(f"Retrying {url} ({attempt + 2}/{retries})")
             else:
-                logger.info(f"[OK] {url} (port={port})")
+                logger.error(f"[FAIL] Giving up on {url} after {retries} attempts.")
             q.task_done()
 
     threads = []
@@ -196,6 +204,7 @@ def multi_download_mode(urls, retries=DEFAULT_RETRIES):
     pm_thread.join()
     logger.info("multi_download_mode: completed")
 
+
 # =========== PARTIAL-DOWNLOAD ===========
 
 def get_content_length(url, port, ua):
@@ -210,6 +219,7 @@ def get_content_length(url, port, ua):
     except Exception as e:
         logger.debug(f"HEAD request for {url} (port={port}) failed: {e}")
     return None
+
 
 def partial_download_chunk_to_file(url, start, end, port, ua, progress_queue, part_path):
     proxies = make_proxies_for_port(port)
@@ -232,6 +242,7 @@ def partial_download_chunk_to_file(url, start, end, port, ua, progress_queue, pa
         if os.path.exists(part_path):
             os.remove(part_path)
         return False
+
 
 def fallback_sequential_download(url, out_path, user_agent, progress_queue):
     proxies = make_proxies_for_port(BASE_PORT)
@@ -260,10 +271,10 @@ def fallback_sequential_download(url, out_path, user_agent, progress_queue):
             os.remove(out_path)
         return False
 
+
 def partial_download_file(url, user_agents):
-    filename = parse_filename(url)
-    final_path = os.path.join(PARTIAL_DOWNLOAD_DIR, filename)
-    os.makedirs(PARTIAL_DOWNLOAD_DIR, exist_ok=True)
+    final_path = url_to_local_path(url, PARTIAL_DOWNLOAD_DIR)
+    os.makedirs(os.path.dirname(final_path), exist_ok=True)
 
     # HEAD for size
     port_for_head = BASE_PORT
@@ -279,17 +290,14 @@ def partial_download_file(url, user_agents):
     ranges = []
     for i in range(MAX_WORKERS):
         start = i * chunk_size
-        if i == MAX_WORKERS - 1:
-            end = size - 1
-        else:
-            end = (start + chunk_size) - 1
+        end = size - 1 if i == MAX_WORKERS - 1 else start + chunk_size - 1
         ranges.append((start, end))
 
     progress_queue = queue.Queue()
     stop_flag = threading.Event()
 
     def progress_manager():
-        with tqdm(total=size, desc=f"Partial: {filename}", unit="B", unit_scale=True) as pbar:
+        with tqdm(total=size, desc=f"Partial: {os.path.basename(final_path)}", unit="B", unit_scale=True) as pbar:
             while not stop_flag.is_set() or not progress_queue.empty():
                 try:
                     chunk_len = progress_queue.get(timeout=0.2)
@@ -301,15 +309,19 @@ def partial_download_file(url, user_agents):
     pm_thread.start()
 
     chunk_paths = [None] * MAX_WORKERS
+
     def chunk_worker(i):
         start, end = ranges[i]
         port = BASE_PORT + i
         ua = random_user_agent(user_agents)
-        part_file = os.path.join(PARTIAL_DOWNLOAD_DIR, f"{filename}.part{i}")
-        chunk_paths[i] = part_file
-        ok = partial_download_chunk_to_file(url, start, end, port, ua, progress_queue, part_file)
-        if not ok:
-            chunk_paths[i] = None
+        part_file = f"{final_path}.part{i}"
+        for attempt in range(DEFAULT_RETRIES):
+            ok = partial_download_chunk_to_file(url, start, end, port, ua, progress_queue, part_file)
+            if ok:
+                chunk_paths[i] = part_file
+                return
+            if attempt < DEFAULT_RETRIES - 1:
+                logger.warning(f"Chunk {i} retry {attempt + 2}/{DEFAULT_RETRIES}")
 
     threads = []
     for i in range(MAX_WORKERS):
@@ -357,6 +369,7 @@ def partial_download_file(url, user_agents):
     logger.info(f"[OK] Partial done: {final_path} ({total_merged} bytes)")
     return True
 
+
 def partial_download_mode(urls, retries=DEFAULT_RETRIES):
     logger.info(f"partial_download_mode: {len(urls)} URLs, retries={retries}")
     user_agents = load_user_agents()
@@ -376,6 +389,7 @@ def partial_download_mode(urls, retries=DEFAULT_RETRIES):
             logger.error(f"[FAIL] partial-download {url} after {retries} attempts.")
 
     logger.info("partial_download_mode: completed")
+
 
 # =========== SPEEDTEST + availability check ===========
 
@@ -412,12 +426,13 @@ def test_proxy_speed(url: str, port: int, ua) -> dict:
     result["success"] = True
     return result
 
-def check_url_availability(url, speed_bps=None):
+
+def check_url_availability(url, port=BASE_PORT, speed_bps=None):
     """
     HEAD request to see if available; if size known and speed known, estimate ETA.
     Returns (is_ok, size, eta_seconds).
     """
-    proxies = make_proxies_for_port(BASE_PORT)  # or random
+    proxies = make_proxies_for_port(port)
     try:
         r = requests.head(url, proxies=proxies, timeout=REQUEST_TIMEOUT, verify=False)
         r.raise_for_status()
@@ -432,12 +447,13 @@ def check_url_availability(url, speed_bps=None):
         size = int(cl_str)
     except ValueError:
         size = None
-    
+
     eta_sec = None
     if size and speed_bps and speed_bps > 0:
         eta_sec = size / speed_bps
-    
+
     return (True, size, eta_sec)
+
 
 def speedtest_mode(urls):
     if not urls:
@@ -447,15 +463,20 @@ def speedtest_mode(urls):
     logger.info(f"[Speedtest] Testing first URL: {test_url}")
 
     user_agents = load_user_agents()
-    results = []
-    for i in range(MAX_WORKERS):
+    results = [None] * MAX_WORKERS
+
+    def test_port(i):
         port = BASE_PORT + i
         ua = random_user_agent(user_agents)
         logger.info(f"Testing port={port} ...")
-        res = test_proxy_speed(test_url, port, ua)
-        results.append(res)
+        results[i] = test_proxy_speed(test_url, port, ua)
 
-    # Summaries
+    threads = [threading.Thread(target=test_port, args=(i,)) for i in range(MAX_WORKERS)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
     successful_speeds = []
     logger.info("\n=== SPEEDTEST SUMMARY ===")
     for r in results:
@@ -474,10 +495,13 @@ def speedtest_mode(urls):
         avg_speed_bps = None
         logger.warning("[WARN] No successful ports => no average speed.")
 
-    # Now check HEAD for each URL in the list, estimate ETA
+    # Use a random working port for availability checks instead of always BASE_PORT
+    working_ports = [r["port"] for r in results if r["success"]]
+
     logger.info("[INFO] Checking availability for all URLs, computing ETA if possible:")
     for u in urls:
-        is_ok, size, eta_sec = check_url_availability(u, speed_bps=avg_speed_bps)
+        port = random.choice(working_ports) if working_ports else BASE_PORT
+        is_ok, size, eta_sec = check_url_availability(u, port=port, speed_bps=avg_speed_bps)
         if not is_ok:
             logger.error(f"❌ Unavailable: {u}")
             continue
@@ -488,16 +512,20 @@ def speedtest_mode(urls):
                 logger.info(f"✅ {u}, size={size} B, no ETA (no speed?).")
         else:
             logger.info(f"✅ {u}, no size => no ETA.")
-    
+
     logger.info("[DONE] Speedtest + availability check.\n")
+
 
 # =========== MAIN ===========
 
 def main():
+    setup_logging()
+    logger.info(f"Starting OnionAccelerator with job_id={JOB_ID}")
+
     parser = argparse.ArgumentParser(
         description="OnionAccelerator: multi/partial download with Tor proxies, plus speedtest & availability check."
     )
-    parser.add_argument("--mode", choices=["multi","partial","speedtest"], required=True,
+    parser.add_argument("--mode", choices=["multi", "partial", "speedtest"], required=True,
                         help="Download mode: multi, partial, or speedtest.")
     parser.add_argument("--retries", type=int, default=DEFAULT_RETRIES,
                         help="Number of retries for download failures.")
@@ -524,6 +552,7 @@ def main():
         speedtest_mode(urls)
 
     logger.info("OnionAccelerator finished successfully.")
+
 
 if __name__ == "__main__":
     main()
