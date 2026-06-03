@@ -6,13 +6,13 @@ OnionAccelerator is a multi-functional Python script designed for downloading fi
 
 ### Multi-Download Mode
 
-- Simultaneously download multiple files listed in `URLs.txt` using up to 20 parallel threads/proxies.
+- Simultaneously download multiple files listed in `URLs.txt`, one worker thread per proxy (capped at the number of URLs, so no idle threads are spawned).
 - Automatically retries failed downloads a configurable number of times.
 - Aggregates download progress via a single progress bar in the terminal.
 
 ### Partial-Download Mode
 
-- Splits each file into multiple chunks (up to 20) and downloads them in parallel, each chunk assigned to a different SOCKS5 proxy.
+- Splits each file into parallel byte-range chunks — one per proxy, but never more chunks than the file size warrants (chunks are at least `MIN_PARTIAL_CHUNK_SIZE`, 1 MB by default) — each assigned to a different SOCKS5 proxy.
 - If the server does not provide a `Content-Length` header, the script automatically falls back to a single, sequential download.
 - Merges the downloaded chunks into a final file upon success, and performs retry logic if any chunk fails.
 
@@ -77,15 +77,17 @@ OnionAccelerator is a multi-functional Python script designed for downloading fi
 ### Run the script:
 
 ```bash
-python3 OnionAccelerator.py --mode <multi|partial|speedtest> [--retries N]
+python3 OnionAccelerator.py --mode <multi|partial|speedtest> [--retries N] [--external]
 ```
 
 - `--mode`:
-  - `multi`: Parallel download of all URLs in `URLs.txt`, each in a separate worker thread with its own SOCKS5 port.
+  - `multi`: Parallel download of all URLs in `URLs.txt`, each in a separate worker thread with its own SOCKS5 proxy.
   - `partial`: Parallel chunk-based download for each URL, automatically merging chunks.
-  - `speedtest`: Test download speed and basic health for each SOCKS5 port using the first URL from `URLs.txt`.
+  - `speedtest`: Test download speed and basic health for each SOCKS5 proxy using the first URL from `URLs.txt`.
   
 - `--retries N`: Set how many times to retry if a download fails (default: 3).
+
+- `--external`: Use remote `ip:port` SOCKS5 proxies fetched from a public list instead of local Docker Tor instances (see **External Proxy List** below). Works with any `--mode`.
 
 ### Examples
 
@@ -98,6 +100,9 @@ python3 OnionAccelerator.py --mode partial
 
 # Speedtest mode, checks each proxy port:
 python3 OnionAccelerator.py --mode speedtest
+
+# Multi-download using the external proxy list instead of local Docker Tor:
+python3 OnionAccelerator.py --mode multi --external
 ```
 
 ## Project Structure
@@ -121,6 +126,18 @@ python3 OnionAccelerator.py --mode speedtest
 ```bash
 for port in {5000..5020}; do     docker run -d --name "torproxy_$port" -p 127.0.0.1:$port:9050 dperson/torproxy; done
 ```
+
+## External Proxy List (`--external`)
+
+Instead of spinning up local Docker Tor instances, pass `--external` to pull a ready-made list of remote `ip:port` SOCKS5 proxies:
+
+```bash
+python3 OnionAccelerator.py --mode multi --external
+```
+
+- **Fetched fresh every run.** The list is downloaded from the public source on each invocation and is **never written to disk**, so every execution uses an up-to-date set of proxies.
+- **Capped at 100 proxies.** If the list is larger, a random subset of 100 is selected (this is also the hard limit on worker threads).
+- **Connectivity-checked before any work starts.** Each candidate proxy is tested in parallel by fetching a random URL from `URLs.txt`; only proxies that successfully return data are used. The run aborts if none pass.
 
 ## Contributing
 

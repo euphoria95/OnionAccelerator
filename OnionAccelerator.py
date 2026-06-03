@@ -22,6 +22,7 @@ import logging
 MAX_WORKERS = 20              # e.g. ports 5000..5019
 BASE_PORT = 5000
 CHUNK_SIZE = 1024 * 64        # 64 KB
+MIN_PARTIAL_CHUNK_SIZE = 1024 * 1024  # 1 MB: don't split a file finer than this
 REQUEST_TIMEOUT = 20          # seconds
 USERAGENTS_FILE = "UserAgents.tsv"
 URLS_FILE = "URLs.txt"
@@ -34,6 +35,11 @@ DEFAULT_RETRIES = 3
 # Dla speedtest:
 MAX_SPEEDTEST_BYTES = 5 * 1024 * 1024  # 5 MB
 SPEEDTEST_CHUNK_SIZE = 1024 * 64
+
+# External proxy list (--external): fetched fresh every run, never persisted.
+EXTERNAL_PROXIES_URL = "https://raw.githubusercontent.com/euphoria95/external-tor-proxies/refs/heads/main/proxies.txt"
+MAX_EXTERNAL_PROXIES = 100     # hard cap on threads/proxies for external mode
+CONNECTIVITY_TIMEOUT = 15      # seconds, per-proxy liveness check
 
 # =========== LOGGER & JOB_ID SETUP ============
 # Logger is configured in setup_logging(), called from main(), to avoid
@@ -106,23 +112,122 @@ def url_to_local_path(url: str, base_dir: str) -> str:
     return os.path.join(base_dir, host, filename)
 
 
-def make_proxies_for_port(port: int) -> dict:
+def make_proxies(proxy: str) -> dict:
     """
+    Build a SOCKS5 proxy dict for a 'host:port' endpoint (local or remote).
     Accept any cert (verify=False), resolve DNS via Tor (socks5h).
     """
     return {
-        "http": f"socks5h://127.0.0.1:{port}",
-        "https": f"socks5h://127.0.0.1:{port}",
+        "http": f"socks5h://{proxy}",
+        "https": f"socks5h://{proxy}",
     }
+
+
+# =========== EXTERNAL PROXIES ===========
+
+def fetch_external_proxies():
+    """
+    Fetch 'host:port' SOCKS5 proxies from EXTERNAL_PROXIES_URL.
+
+    The list is read fresh on every run and never written to disk, so each
+    execution picks up an up-to-date set of proxies.
+    """
+    logger.info(f"Fetching external proxy list from {EXTERNAL_PROXIES_URL}")
+    try:
+        r = requests.get(EXTERNAL_PROXIES_URL, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+    except Exception as e:
+        logger.error(f"Failed to fetch external proxies: {e}")
+        return []
+
+    endpoints = []
+    for line in r.text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        # rpartition on ':' keeps IPv6 hosts (e.g. [::1]:9050) intact.
+        host, sep, port = line.rpartition(":")
+        if not sep or not host or not port.isdigit():
+            logger.debug(f"Skipping malformed proxy line: {line!r}")
+            continue
+        endpoints.append(f"{host}:{port}")
+    logger.info(f"Fetched {len(endpoints)} candidate proxies.")
+    return endpoints
+
+
+def verify_proxy(proxy, test_url, user_agents):
+    """Return True if the proxy can actually fetch test_url within the timeout."""
+    proxies = make_proxies(proxy)
+    ua = random_user_agent(user_agents)
+    try:
+        with requests.get(test_url, proxies=proxies, timeout=CONNECTIVITY_TIMEOUT,
+                          verify=False, stream=True, headers={"User-Agent": ua}) as r:
+            r.raise_for_status()
+            # Pull one chunk to confirm bytes actually flow through the proxy.
+            next(r.iter_content(SPEEDTEST_CHUNK_SIZE), None)
+        return True
+    except Exception as e:
+        logger.debug(f"[proxy down] {proxy} via {test_url}: {e}")
+        return False
+
+
+def verify_proxies(candidates, urls, user_agents):
+    """
+    Check each candidate proxy in parallel by fetching a random URL from the
+    list. Return only the proxies that pass the connectivity check.
+    """
+    logger.info(f"Verifying connectivity of {len(candidates)} proxies ...")
+    working = []
+    lock = threading.Lock()
+
+    with tqdm(total=len(candidates), desc="Verifying proxies", unit="proxy") as pbar:
+        def check(proxy):
+            ok = verify_proxy(proxy, random.choice(urls), user_agents)
+            with lock:
+                if ok:
+                    working.append(proxy)
+                pbar.update(1)
+
+        threads = [threading.Thread(target=check, args=(c,)) for c in candidates]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+    logger.info(f"{len(working)}/{len(candidates)} proxies passed the connectivity check.")
+    return working
+
+
+def resolve_proxies(use_external, urls):
+    """
+    Return the list of 'host:port' SOCKS5 endpoints to use for this run.
+
+    Default: local Docker Tor instances on ports BASE_PORT..BASE_PORT+MAX_WORKERS-1.
+    External (--external): fetched fresh from EXTERNAL_PROXIES_URL (never persisted),
+    capped at MAX_EXTERNAL_PROXIES and filtered down to proxies that pass a live
+    connectivity check.
+    """
+    if not use_external:
+        return [f"127.0.0.1:{BASE_PORT + i}" for i in range(MAX_WORKERS)]
+
+    candidates = fetch_external_proxies()
+    if len(candidates) > MAX_EXTERNAL_PROXIES:
+        candidates = random.sample(candidates, MAX_EXTERNAL_PROXIES)
+        logger.info(f"Capped to {MAX_EXTERNAL_PROXIES} candidate proxies.")
+    if not candidates:
+        return []
+
+    user_agents = load_user_agents()
+    return verify_proxies(candidates, urls, user_agents)
 
 
 # =========== MULTI-DOWNLOAD ===========
 
-def download_file(url, port, user_agents, progress_queue=None):
+def download_file(url, proxy, user_agents, progress_queue=None):
     """
     Download a single file with requests, streaming, ignoring HTTPS cert.
     """
-    proxies = make_proxies_for_port(port)
+    proxies = make_proxies(proxy)
     ua = random_user_agent(user_agents)
     out_path = url_to_local_path(url, DOWNLOAD_DIR)
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
@@ -137,19 +242,18 @@ def download_file(url, port, user_agents, progress_queue=None):
                         f.write(chunk)
                         if progress_queue:
                             progress_queue.put(len(chunk))
-        logger.debug(f"[OK] {url} -> {out_path} (port={port})")
+        logger.debug(f"[OK] {url} -> {out_path} (proxy={proxy})")
         return True
     except Exception as e:
-        logger.error(f"[ERR] Download failed for {url} on port={port}: {e}")
+        logger.error(f"[ERR] Download failed for {url} on proxy={proxy}: {e}")
         if os.path.exists(out_path):
             os.remove(out_path)
         return False
 
 
-def multi_download_mode(urls, retries=DEFAULT_RETRIES):
-    logger.info(f"multi_download_mode: {len(urls)} URLs, retries={retries}")
+def multi_download_mode(urls, proxies, retries=DEFAULT_RETRIES):
+    logger.info(f"multi_download_mode: {len(urls)} URLs, {len(proxies)} proxies, retries={retries}")
     user_agents = load_user_agents()
-    ports = [BASE_PORT + i for i in range(MAX_WORKERS)]
 
     q = queue.Queue()
     for u in urls:
@@ -171,7 +275,7 @@ def multi_download_mode(urls, retries=DEFAULT_RETRIES):
     pm_thread.start()
 
     def worker_thread(thread_id):
-        port = ports[thread_id]
+        proxy = proxies[thread_id]
         while True:
             try:
                 url = q.get_nowait()
@@ -180,9 +284,9 @@ def multi_download_mode(urls, retries=DEFAULT_RETRIES):
             # Inline retries — no re-queuing, which would deadlock if all workers
             # exit with an empty queue before the retried item can be picked up.
             for attempt in range(retries):
-                success = download_file(url, port, user_agents, progress_queue=progress_queue)
+                success = download_file(url, proxy, user_agents, progress_queue=progress_queue)
                 if success:
-                    logger.info(f"[OK] {url} (port={port})")
+                    logger.info(f"[OK] {url} (proxy={proxy})")
                     break
                 if attempt < retries - 1:
                     logger.warning(f"Retrying {url} ({attempt + 2}/{retries})")
@@ -190,8 +294,11 @@ def multi_download_mode(urls, retries=DEFAULT_RETRIES):
                 logger.error(f"[FAIL] Giving up on {url} after {retries} attempts.")
             q.task_done()
 
+    # One worker per proxy, but never more workers than there are URLs to fetch
+    # (extra proxies would just spawn threads that exit on an empty queue).
+    n_workers = min(len(proxies), len(urls))
     threads = []
-    for i in range(MAX_WORKERS):
+    for i in range(n_workers):
         t = threading.Thread(target=worker_thread, args=(i,))
         t.start()
         threads.append(t)
@@ -207,8 +314,8 @@ def multi_download_mode(urls, retries=DEFAULT_RETRIES):
 
 # =========== PARTIAL-DOWNLOAD ===========
 
-def get_content_length(url, port, ua):
-    proxies = make_proxies_for_port(port)
+def get_content_length(url, proxy, ua):
+    proxies = make_proxies(proxy)
     try:
         r = requests.head(url, proxies=proxies, timeout=REQUEST_TIMEOUT,
                           verify=False, headers={"User-Agent": ua})
@@ -217,12 +324,12 @@ def get_content_length(url, port, ua):
         if cl is not None:
             return int(cl)
     except Exception as e:
-        logger.debug(f"HEAD request for {url} (port={port}) failed: {e}")
+        logger.debug(f"HEAD request for {url} (proxy={proxy}) failed: {e}")
     return None
 
 
-def partial_download_chunk_to_file(url, start, end, port, ua, progress_queue, part_path):
-    proxies = make_proxies_for_port(port)
+def partial_download_chunk_to_file(url, start, end, proxy, ua, progress_queue, part_path):
+    proxies = make_proxies(proxy)
     headers = {
         "User-Agent": ua,
         "Range": f"bytes={start}-{end}"
@@ -238,14 +345,14 @@ def partial_download_chunk_to_file(url, start, end, port, ua, progress_queue, pa
                         progress_queue.put(len(chunk))
         return True
     except Exception as e:
-        logger.error(f"Chunk {start}-{end} failed on port={port}: {e}")
+        logger.error(f"Chunk {start}-{end} failed on proxy={proxy}: {e}")
         if os.path.exists(part_path):
             os.remove(part_path)
         return False
 
 
-def fallback_sequential_download(url, out_path, user_agent, progress_queue):
-    proxies = make_proxies_for_port(BASE_PORT)
+def fallback_sequential_download(url, out_path, user_agent, proxy, progress_queue):
+    proxies = make_proxies(proxy)
     try:
         with requests.get(url, proxies=proxies, timeout=REQUEST_TIMEOUT,
                           verify=False, stream=True, headers={"User-Agent": user_agent}) as r:
@@ -272,25 +379,28 @@ def fallback_sequential_download(url, out_path, user_agent, progress_queue):
         return False
 
 
-def partial_download_file(url, user_agents):
+def partial_download_file(url, proxies, user_agents):
     final_path = url_to_local_path(url, PARTIAL_DOWNLOAD_DIR)
     os.makedirs(os.path.dirname(final_path), exist_ok=True)
 
     # HEAD for size
-    port_for_head = BASE_PORT
     ua_head = random_user_agent(user_agents)
-    size = get_content_length(url, port_for_head, ua_head)
+    size = get_content_length(url, proxies[0], ua_head)
     if not size or size < 1:
         logger.warning(f"No Content-Length for {url}, fallback to sequential.")
-        return fallback_sequential_download(url, final_path, ua_head, progress_queue=None)
+        return fallback_sequential_download(url, final_path, ua_head, proxies[0], progress_queue=None)
 
-    logger.info(f"[PARTIAL] {url} => size={size} bytes")
+    # Cap chunks at the proxy count, and don't split finer than
+    # MIN_PARTIAL_CHUNK_SIZE. Guarantees 1 <= n_chunks <= size, so chunk_size is
+    # always >= 1 (no degenerate ranges) and tiny files aren't over-split.
+    n_chunks = min(len(proxies), max(1, size // MIN_PARTIAL_CHUNK_SIZE))
+    logger.info(f"[PARTIAL] {url} => size={size} bytes, {n_chunks} chunk(s)")
 
-    chunk_size = size // MAX_WORKERS
+    chunk_size = size // n_chunks
     ranges = []
-    for i in range(MAX_WORKERS):
+    for i in range(n_chunks):
         start = i * chunk_size
-        end = size - 1 if i == MAX_WORKERS - 1 else start + chunk_size - 1
+        end = size - 1 if i == n_chunks - 1 else start + chunk_size - 1
         ranges.append((start, end))
 
     progress_queue = queue.Queue()
@@ -308,15 +418,15 @@ def partial_download_file(url, user_agents):
     pm_thread = threading.Thread(target=progress_manager, daemon=True)
     pm_thread.start()
 
-    chunk_paths = [None] * MAX_WORKERS
+    chunk_paths = [None] * n_chunks
 
     def chunk_worker(i):
         start, end = ranges[i]
-        port = BASE_PORT + i
+        proxy = proxies[i]
         ua = random_user_agent(user_agents)
         part_file = f"{final_path}.part{i}"
         for attempt in range(DEFAULT_RETRIES):
-            ok = partial_download_chunk_to_file(url, start, end, port, ua, progress_queue, part_file)
+            ok = partial_download_chunk_to_file(url, start, end, proxy, ua, progress_queue, part_file)
             if ok:
                 chunk_paths[i] = part_file
                 return
@@ -324,7 +434,7 @@ def partial_download_file(url, user_agents):
                 logger.warning(f"Chunk {i} retry {attempt + 2}/{DEFAULT_RETRIES}")
 
     threads = []
-    for i in range(MAX_WORKERS):
+    for i in range(n_chunks):
         t = threading.Thread(target=chunk_worker, args=(i,))
         t.start()
         threads.append(t)
@@ -370,8 +480,8 @@ def partial_download_file(url, user_agents):
     return True
 
 
-def partial_download_mode(urls, retries=DEFAULT_RETRIES):
-    logger.info(f"partial_download_mode: {len(urls)} URLs, retries={retries}")
+def partial_download_mode(urls, proxies, retries=DEFAULT_RETRIES):
+    logger.info(f"partial_download_mode: {len(urls)} URLs, {len(proxies)} proxies, retries={retries}")
     user_agents = load_user_agents()
 
     for idx, url in enumerate(urls, start=1):
@@ -379,7 +489,7 @@ def partial_download_mode(urls, retries=DEFAULT_RETRIES):
         success = False
         attempts_left = retries
         while attempts_left > 0 and not success:
-            success = partial_download_file(url, user_agents)
+            success = partial_download_file(url, proxies, user_agents)
             if not success:
                 attempts_left -= 1
                 if attempts_left > 0:
@@ -393,10 +503,10 @@ def partial_download_mode(urls, retries=DEFAULT_RETRIES):
 
 # =========== SPEEDTEST + availability check ===========
 
-def test_proxy_speed(url: str, port: int, ua) -> dict:
-    proxies = make_proxies_for_port(port)
+def test_proxy_speed(url: str, proxy: str, ua) -> dict:
+    proxies = make_proxies(proxy)
     result = {
-        "port": port,
+        "proxy": proxy,
         "success": False,
         "downloaded_bytes": 0,
         "speed_bps": 0.0,
@@ -427,12 +537,12 @@ def test_proxy_speed(url: str, port: int, ua) -> dict:
     return result
 
 
-def check_url_availability(url, port=BASE_PORT, speed_bps=None):
+def check_url_availability(url, proxy, speed_bps=None):
     """
     HEAD request to see if available; if size known and speed known, estimate ETA.
     Returns (is_ok, size, eta_seconds).
     """
-    proxies = make_proxies_for_port(port)
+    proxies = make_proxies(proxy)
     try:
         r = requests.head(url, proxies=proxies, timeout=REQUEST_TIMEOUT, verify=False)
         r.raise_for_status()
@@ -455,7 +565,7 @@ def check_url_availability(url, port=BASE_PORT, speed_bps=None):
     return (True, size, eta_sec)
 
 
-def speedtest_mode(urls):
+def speedtest_mode(urls, proxies):
     if not urls:
         logger.warning("No URLs for speedtest.")
         return
@@ -463,15 +573,16 @@ def speedtest_mode(urls):
     logger.info(f"[Speedtest] Testing first URL: {test_url}")
 
     user_agents = load_user_agents()
-    results = [None] * MAX_WORKERS
+    n = len(proxies)
+    results = [None] * n
 
-    def test_port(i):
-        port = BASE_PORT + i
+    def test_one(i):
+        proxy = proxies[i]
         ua = random_user_agent(user_agents)
-        logger.info(f"Testing port={port} ...")
-        results[i] = test_proxy_speed(test_url, port, ua)
+        logger.info(f"Testing proxy={proxy} ...")
+        results[i] = test_proxy_speed(test_url, proxy, ua)
 
-    threads = [threading.Thread(target=test_port, args=(i,)) for i in range(MAX_WORKERS)]
+    threads = [threading.Thread(target=test_one, args=(i,)) for i in range(n)]
     for t in threads:
         t.start()
     for t in threads:
@@ -483,25 +594,25 @@ def speedtest_mode(urls):
         if r["success"]:
             sp_kbps = r["speed_bps"] / 1024
             successful_speeds.append(r["speed_bps"])
-            logger.info(f"✅ Port {r['port']} => downloaded={r['downloaded_bytes']} B, speed={sp_kbps:.2f} KB/s")
+            logger.info(f"✅ Proxy {r['proxy']} => downloaded={r['downloaded_bytes']} B, speed={sp_kbps:.2f} KB/s")
         else:
-            logger.error(f"❌ Port {r['port']} => err={r['error']}")
-    logger.info("[DONE] Speedtest for ports.\n")
+            logger.error(f"❌ Proxy {r['proxy']} => err={r['error']}")
+    logger.info("[DONE] Speedtest for proxies.\n")
 
     if successful_speeds:
         avg_speed_bps = sum(successful_speeds) / len(successful_speeds)
-        logger.info(f"[INFO] Average speed among working ports: {avg_speed_bps/1024:.2f} KB/s")
+        logger.info(f"[INFO] Average speed among working proxies: {avg_speed_bps/1024:.2f} KB/s")
     else:
         avg_speed_bps = None
-        logger.warning("[WARN] No successful ports => no average speed.")
+        logger.warning("[WARN] No successful proxies => no average speed.")
 
-    # Use a random working port for availability checks instead of always BASE_PORT
-    working_ports = [r["port"] for r in results if r["success"]]
+    # Use a random working proxy for availability checks instead of always the first.
+    working_proxies = [r["proxy"] for r in results if r["success"]]
 
     logger.info("[INFO] Checking availability for all URLs, computing ETA if possible:")
     for u in urls:
-        port = random.choice(working_ports) if working_ports else BASE_PORT
-        is_ok, size, eta_sec = check_url_availability(u, port=port, speed_bps=avg_speed_bps)
+        proxy = random.choice(working_proxies) if working_proxies else proxies[0]
+        is_ok, size, eta_sec = check_url_availability(u, proxy, speed_bps=avg_speed_bps)
         if not is_ok:
             logger.error(f"❌ Unavailable: {u}")
             continue
@@ -529,6 +640,11 @@ def main():
                         help="Download mode: multi, partial, or speedtest.")
     parser.add_argument("--retries", type=int, default=DEFAULT_RETRIES,
                         help="Number of retries for download failures.")
+    parser.add_argument("--external", action="store_true",
+                        help=f"Fetch ip:port SOCKS5 proxies from the external list "
+                             f"instead of local Docker Tor instances. The list is "
+                             f"re-fetched every run (never persisted), capped at "
+                             f"{MAX_EXTERNAL_PROXIES} proxies, and connectivity-checked.")
     args = parser.parse_args()
 
     if not os.path.exists(URLS_FILE):
@@ -544,12 +660,19 @@ def main():
 
     logger.info(f"Mode={args.mode}, total URLs={len(urls)}, job_id={JOB_ID}")
 
+    proxies = resolve_proxies(args.external, urls)
+    if not proxies:
+        logger.error("No usable proxies available. Aborting.")
+        sys.exit(1)
+    logger.info(f"Using {len(proxies)} proxies "
+                f"({'external list' if args.external else 'local docker'}).")
+
     if args.mode == "multi":
-        multi_download_mode(urls, retries=args.retries)
+        multi_download_mode(urls, proxies, retries=args.retries)
     elif args.mode == "partial":
-        partial_download_mode(urls, retries=args.retries)
+        partial_download_mode(urls, proxies, retries=args.retries)
     elif args.mode == "speedtest":
-        speedtest_mode(urls)
+        speedtest_mode(urls, proxies)
 
     logger.info("OnionAccelerator finished successfully.")
 
