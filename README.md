@@ -18,7 +18,8 @@ OnionAccelerator is a multi-functional Python script designed for downloading fi
 
 ### Speedtest & Healthcheck Mode
 
-- Quickly measures proxy availability and approximate download speed on each SOCKS5 port, showing a summary of successes and failures (with emoji indicators).
+- Tests all SOCKS5 ports **in parallel** and shows a summary of per-port speeds and failures (with emoji indicators).
+- Availability checks for the full URL list use a randomly selected working port rather than always defaulting to port 5000.
 
 ## Key Features
 
@@ -35,7 +36,11 @@ OnionAccelerator is a multi-functional Python script designed for downloading fi
 
 ### Retry Logic
 
-- Automatically retries failed downloads or chunks, up to a configurable limit (`--retries`).
+- Failed downloads and individual chunks are retried inline (up to `--retries` attempts) without re-queuing, avoiding potential deadlocks when the worker pool empties mid-retry.
+
+### Collision-Free Output Paths
+
+- Downloaded files are stored under a hostname subdirectory (e.g., `downloads/example.onion/file.zip`), so URLs from different hosts that share the same filename never overwrite each other.
 
 ### Logging
 
@@ -45,7 +50,7 @@ OnionAccelerator is a multi-functional Python script designed for downloading fi
 
 ### User-Agents
 
-- Loads random User-Agent strings from a `UserAgents.tsv` file to help disguise download patterns.
+- Loads random User-Agent strings from the first column of `UserAgents.tsv` (tab-separated; subsequent columns such as usage weights are ignored).
 
 ### Seamless Fallback
 
@@ -58,7 +63,7 @@ OnionAccelerator is a multi-functional Python script designed for downloading fi
 2. **Install dependencies:**
 
     ```bash
-    pip install requests[socks] tqdm
+    pip install -r requirements.txt
     ```
 
 3. **Ensure you have multiple SOCKS5 proxies** (e.g., Tor instances on ports `5000..5019`), or adapt the code to your setup.
@@ -98,11 +103,12 @@ python3 OnionAccelerator.py --mode speedtest
 ## Project Structure
 
 - `OnionAccelerator.py`: The main script containing all modes (multi-download, partial-download, speedtest).
+- `requirements.txt`: Python dependencies.
 - `URLs.txt`: A text file with one URL per line.
-- `UserAgents.tsv`: A list of user-agent strings (one per line).
+- `UserAgents.tsv`: Tab-separated file; first column is the User-Agent string.
 - `logs/`: A directory automatically created to store timestamped log files.
-- `downloads/`: The default download location for multi mode.
-- `partials/`: The default download location for partial mode (temporary chunk files are merged here).
+- `downloads/<host>/`: Output directory for multi mode, organised by hostname.
+- `partials/<host>/`: Output directory for partial mode; temporary chunk files are merged here.
 
 ## Requirements
 
