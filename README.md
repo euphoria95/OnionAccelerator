@@ -16,6 +16,18 @@ OnionAccelerator is a multi-functional Python script designed for downloading fi
 - If the server does not provide a `Content-Length` header, the script automatically falls back to a single, sequential download.
 - Merges the downloaded chunks into a final file upon success, and performs retry logic if any chunk fails — each chunk retry lands on a different live proxy via the pool's failover.
 
+### Remote Archive Tree Mode (`--mode tree`)
+
+- Lists or extracts members of a **huge remote archive** (`.rar`, `.tar`, `.zip`, `.7z`,
+  `.tar.xz`) using HTTP Range requests, **without downloading it**. A 100 GB archive costs
+  kilobytes to read, because every supported format keeps its metadata somewhere a handful
+  of range requests can reach.
+- Backed by [`remote_viewer/rvtree`](remote_viewer/), driven over the same `host:port`
+  SOCKS5 pool the download modes use — so a `--farm` of independent Tor daemons, or an
+  `--external` proxy list, gives it real parallelism.
+- Everything after `--` is passed straight to rvtree, so the full `list` / `extract` /
+  `probe` surface is available with no flags to keep in sync.
+
 ### Speedtest & Healthcheck Mode
 
 - Tests all SOCKS5 ports **in parallel** and shows a summary of per-port speeds and failures (with emoji indicators).
@@ -82,6 +94,9 @@ python3 OnionAccelerator.py --farm <up|status|down|destroy> [--count N] [--base-
 
 # Download / speedtest through the proxies:
 python3 OnionAccelerator.py --mode <multi|partial|speedtest> [--retries N] [--external] [--test-url URL]
+
+# Read a remote archive's file tree without downloading it:
+python3 OnionAccelerator.py --mode tree [--external] -- <rvtree arguments>
 ```
 
 Exactly one of `--farm` or `--mode` must be given.
@@ -92,6 +107,7 @@ Exactly one of `--farm` or `--mode` must be given.
   - `multi`: Parallel download of all URLs in `URLs.txt`, each in a separate worker thread with its own SOCKS5 proxy.
   - `partial`: Parallel chunk-based download for each URL, automatically merging chunks.
   - `speedtest`: Test download speed and basic health for each SOCKS5 proxy using the first URL from `URLs.txt`.
+  - `tree`: List or extract members of a remote archive over the proxy pool without downloading it. Takes its target from the arguments after `--`, not from `URLs.txt` (see **Remote Archive Tree** below).
   
 - `--retries N`: Set how many times to retry if a download fails (default: 3).
 
@@ -119,9 +135,70 @@ python3 OnionAccelerator.py --mode multi --external
 python3 OnionAccelerator.py --mode multi --external --test-url http://your-own-service.onion/ping
 ```
 
+## Remote Archive Tree (`--mode tree`)
+
+Reading a 2.4 GB `.rar` on an onion service to find out what is in it means transferring
+2.4 GB — unless you only fetch the headers. That is what `rvtree` does, and `--mode tree`
+runs it over OnionAccelerator's proxy fleet.
+
+```bash
+# What is in this archive, and what did it cost to find out?
+python3 OnionAccelerator.py --mode tree -- list https://example.onion/backup.rar
+
+# Server capabilities and archive shape first — about 65 KiB.
+python3 OnionAccelerator.py --mode tree -- probe https://example.onion/backup.tar.xz
+
+# Pull one member out of it.
+python3 OnionAccelerator.py --mode tree -- extract https://example.onion/backup.rar etc/hosts -o hosts
+
+# Stream a huge tree as it is discovered, so an interrupted run keeps what it had.
+python3 OnionAccelerator.py --mode tree -- list https://example.onion/big.tar.xz -f ndjson > tree.ndjson
+
+# Through the external proxy list instead of a local farm.
+python3 OnionAccelerator.py --mode tree --external --test-url http://your-own/ping -- list https://example.onion/a.7z
+```
+
+**Why the farm matters here.** rvtree's own default is a single Tor daemon with several
+credential-isolated circuits, and that is what makes it slow: one daemon is one guard and
+one single-threaded crypto path, so the circuits queue behind each other. A recorded
+production run listed a 2.4 GB RAR in **2 h 3 m**, spending 97.7% of that wall clock
+waiting on 7,540 sequential 4 KiB round trips — every one of them on the *same* circuit.
+
+`--mode tree` replaces that with the concept the download modes already use:
+
+- **Endpoints, not circuits.** Each `host:port` is an independent Tor daemon with its own
+  guard and its own bandwidth. Discovered from the farm automatically.
+- **Round-robin lanes with failover.** A failed request parks its endpoint and retries on
+  a different one, exactly as `ProxyPool` does for downloads.
+- **Size-aware range splitting.** A bulk read — an xz block, a solid 7z folder — is split
+  across lanes using the same `min(lanes, size // 1 MB)` rule as partial-download mode.
+- **Hedged small reads.** A header read under 64 KiB is raced across two or three
+  *different* daemons and the first answer wins. This is the only lever that helps a
+  header chain, because the chain cannot be parallelised — entry *n+1*'s offset is not
+  known until entry *n* has been read.
+- **Parallel segmented walking.** For RAR and plain tar, the archive is divided into
+  segments, a verified header is located in each (RAR5 by its CRC32, RAR4 by its CRC plus
+  its successor, tar by its magic and checksum), and several walkers run at once. Walker 0
+  starts where the format says the chain starts, and every later walker is believed only
+  once the walker before it *arrives* at the offset it began from — so a boundary that
+  turns out to be wrong costs time, never entries.
+
+**Without a farm** the mode falls back to a local Tor client on `127.0.0.1:9150`, warns
+that it is a single daemon, and suggests bringing a farm up. It works, but one daemon is
+the thing that made it slow in the first place:
+
+```bash
+sudo python3 OnionAccelerator.py --farm up --count 8
+python3 OnionAccelerator.py --mode tree -- list https://example.onion/backup.rar
+```
+
+rvtree writes its own full debug log to `logs/rvtree_<job_id>.log` for every run. Add `-v`
+to watch the pipeline, or `-vv` for one line per range request.
+
 ## Project Structure
 
-- `OnionAccelerator.py`: The main script containing all modes (multi-download, partial-download, speedtest).
+- `OnionAccelerator.py`: The main script containing all modes (multi-download, partial-download, speedtest, tree).
+- `remote_viewer/`: The `rvtree` package behind `--mode tree`. Usable on its own too — see its own README.
 - `requirements.txt`: Python dependencies.
 - `URLs.txt`: A text file with one URL per line.
 - `UserAgents.tsv`: Tab-separated file; first column is the User-Agent string.

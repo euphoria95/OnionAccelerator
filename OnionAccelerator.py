@@ -978,6 +978,119 @@ def run_farm_action(action, count, base_port, timeout):
         farm_destroy()
 
 
+# =========== REMOTE ARCHIVE TREE (--mode tree) ===========
+# rvtree lists and extracts members of a huge remote archive (.rar, .tar, .zip, .7z,
+# .tar.xz) using HTTP Range requests instead of downloading it. It ships in
+# remote_viewer/ next to this script and is imported lazily, inside tree_mode(), so that
+# importing this module stays free of side effects and --farm still works on a host
+# where rvtree is absent.
+#
+# The point of the integration is the network layer: rvtree's pooled transport takes the
+# same 'host:port' SOCKS5 endpoints the download modes use, so a --farm of independent
+# Tor daemons (or an --external list) gives it real parallelism. Its own default is a
+# single daemon, which is what made a 2.4 GB listing take two hours.
+RVTREE_DIR = "remote_viewer"
+TREE_CIRCUITS_PER_ENDPOINT = 1
+TREE_HEDGE = 3                 # copies of a small range raced across endpoints
+LOCAL_TOR_SOCKS = "127.0.0.1:9150"   # a personal Tor client, used when no farm is up
+
+
+def _import_rvtree():
+    """Import rvtree from remote_viewer/, or explain why it could not be used."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    pkg_dir = os.path.join(here, RVTREE_DIR)
+    if os.path.isdir(os.path.join(pkg_dir, "rvtree")) and pkg_dir not in sys.path:
+        sys.path.insert(0, pkg_dir)
+    try:
+        from rvtree import cli as rvtree_cli
+        from rvtree.transport import PooledTransport
+        return rvtree_cli, PooledTransport
+    except ImportError as e:
+        logger.error(f"--mode tree needs the rvtree package: {e}. Expected it under "
+                     f"{pkg_dir}, or install it with 'pip install -e {RVTREE_DIR}'.")
+        return None
+
+
+def tree_urls(rv_args):
+    """The URLs in the passed-through rvtree arguments.
+
+    Only used as the last-resort target for the external-proxy liveness check, which is
+    why --test-url exists: see the warning resolve_proxies() emits.
+    """
+    return [a for a in rv_args if "://" in a]
+
+
+def resolve_tree_endpoints(args, urls):
+    """SOCKS5 endpoints for tree mode, preferring a farm and degrading to a local client.
+
+    Deliberately not resolve_proxies()' local branch: that falls back to the *fixed*
+    BASE_PORT..BASE_PORT+19 list when nothing is listening, which for a download job is a
+    reasonable bet on a racing Docker setup, but here would hand the transport twenty
+    dead endpoints to time out on one at a time.
+    """
+    if args.external:
+        return resolve_proxies(True, urls, test_url=args.test_url)
+
+    live = discover_local_socks_ports(base_port=args.base_port, max_ports=args.count)
+    if live:
+        logger.info(f"Discovered {len(live)} live local Tor SOCKS port(s) "
+                    f"({live[0]} - {live[-1]}).")
+        return live
+
+    host, port = LOCAL_TOR_SOCKS.rsplit(":", 1)
+    if _port_is_open(host, int(port)):
+        logger.warning(f"No farm on 127.0.0.1:{args.base_port}-"
+                       f"{args.base_port + args.count - 1}; falling back to the local Tor "
+                       f"client at {LOCAL_TOR_SOCKS}. That is a single daemon, so the "
+                       f"listing runs one request at a time. For real parallelism start a "
+                       f"farm first: 'sudo python3 OnionAccelerator.py --farm up --count 8'.")
+        return [LOCAL_TOR_SOCKS]
+
+    logger.error(f"No SOCKS5 proxy found: nothing on 127.0.0.1:{args.base_port}-"
+                 f"{args.base_port + args.count - 1} and nothing on {LOCAL_TOR_SOCKS}. "
+                 f"Start a farm with 'sudo python3 OnionAccelerator.py --farm up', or "
+                 f"pass --external.")
+    return []
+
+
+def tree_mode(rv_args, proxies, retries=DEFAULT_RETRIES):
+    """Run one rvtree invocation over the resolved endpoints. Returns rvtree's exit code."""
+    imported = _import_rvtree()
+    if imported is None:
+        return 1
+    rvtree_cli, PooledTransport = imported
+
+    rv_args = list(rv_args)
+    if "--log-file" not in rv_args:
+        # rvtree writes its own full debug log; point it at this job so the run is
+        # recoverable the same way every other mode's is.
+        os.makedirs(LOGS_DIR, exist_ok=True)
+        rv_args += ["--log-file", os.path.join(LOGS_DIR, f"rvtree_{JOB_ID}.log")]
+
+    try:
+        transport = PooledTransport(
+            endpoints=proxies,
+            circuits_per_endpoint=TREE_CIRCUITS_PER_ENDPOINT,
+            user_agents=load_user_agents(),
+            timeout=(REQUEST_TIMEOUT, REQUEST_TIMEOUT * 6),
+            retries=retries,
+            verify=False,          # onion services are their own authentication
+            hedge=TREE_HEDGE,
+        )
+    except Exception as e:
+        logger.error(f"Could not build the pooled transport: {e}")
+        return 1
+
+    logger.info(f"rvtree over {transport.lanes} lane(s): {' '.join(rv_args)}")
+    try:
+        return rvtree_cli.main(rv_args, transport=transport)
+    except Exception as e:
+        logger.error(f"rvtree failed: {e}")
+        return 1
+    finally:
+        transport.close()
+
+
 # =========== MAIN ===========
 
 def main():
@@ -988,9 +1101,11 @@ def main():
         description="OnionAccelerator: multi/partial download with Tor proxies, plus "
                     "speedtest & availability check, and a native Tor-instance farm."
     )
-    parser.add_argument("--mode", choices=["multi", "partial", "speedtest"], default=None,
-                        help="Download mode: multi, partial, or speedtest. "
-                             "Mutually exclusive with --farm.")
+    parser.add_argument("--mode", choices=["multi", "partial", "speedtest", "tree"], default=None,
+                        help="Download mode: multi, partial, speedtest, or tree. 'tree' "
+                             "lists/extracts members of a huge remote archive over the "
+                             "proxy pool without downloading it; everything after '--' is "
+                             "passed to rvtree. Mutually exclusive with --farm.")
     parser.add_argument("--farm", choices=["up", "status", "down", "destroy"], default=None,
                         help="Manage a native Tor-instance farm (tor-instance-create + "
                              "systemd, no Docker): 'up' creates/starts/bootstraps "
@@ -1018,7 +1133,16 @@ def main():
                              "it at an endpoint you control/trust so real target URLs "
                              "are never revealed to proxies that get discarded. If "
                              "unset, a random URL from URLs.txt is used instead.")
-    args = parser.parse_args()
+    # Everything after '--' belongs to rvtree, so unknown arguments are collected rather
+    # than rejected. Only tree mode may have any; for every other mode a stray argument
+    # is still a typo and still an error.
+    args, rv_args = parser.parse_known_args()
+    # argparse only consumes '--' when it has positionals to feed; this parser has none,
+    # so the separator survives into the leftovers and would reach rvtree as a mode name.
+    if "--" in rv_args:
+        rv_args.remove("--")
+    if rv_args and args.mode != "tree":
+        parser.error(f"unrecognized arguments: {' '.join(rv_args)}")
 
     if bool(args.farm) == bool(args.mode):
         parser.error("specify exactly one of --farm or --mode")
@@ -1028,6 +1152,18 @@ def main():
         run_farm_action(args.farm, args.count, args.base_port, args.bootstrap_timeout)
         logger.info("OnionAccelerator farm action finished.")
         return
+
+    # Tree mode takes its target from the passed-through arguments, not from URLs.txt.
+    if args.mode == "tree":
+        if not rv_args:
+            parser.error("--mode tree needs rvtree arguments after '--', e.g. "
+                         "--mode tree -- list https://example.onion/backup.rar")
+        proxies = resolve_tree_endpoints(args, tree_urls(rv_args))
+        if not proxies:
+            sys.exit(1)
+        code = tree_mode(rv_args, proxies, retries=args.retries)
+        logger.info(f"OnionAccelerator tree mode finished (exit {code}).")
+        sys.exit(code)
 
     if not os.path.exists(URLS_FILE):
         logger.error(f"{URLS_FILE} not found.")
