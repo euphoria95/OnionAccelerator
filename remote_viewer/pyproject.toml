@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rvtree"
+version = "0.1.0"
+description = "List and extract from very large remote archives over Tor, without downloading them"
+requires-python = ">=3.9"
+dependencies = [
+    "requests>=2.25",
+    "PySocks>=1.7",
+]
+
+[project.scripts]
+rvtree = "rvtree.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["rvtree*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-m 'not network'"
+markers = [
+    "network: hits the real internet over Tor; run with -m network",
+]
