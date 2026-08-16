@@ -1,0 +1,6 @@
+[
+{ "name":"archive", "type":"directory", "mtime":"Thu, 02 Nov 2023 14:31:02 GMT" },
+{ "name":"incoming", "type":"directory", "mtime":"Wed, 17 Jan 2024 03:02:55 GMT" },
+{ "name":"dump.sql.gz", "type":"file", "mtime":"Thu, 02 Nov 2023 14:29:41 GMT", "size":536870912 },
+{ "name":"README.txt", "type":"file", "mtime":"Thu, 02 Nov 2023 14:28:03 GMT", "size":4198 }
+]

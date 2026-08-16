@@ -3,6 +3,7 @@ __pycache__/
 logs/
 downloads/
 partials/
+crawls/
 .pytest_cache/
 *.egg-info/
 .serena/
@@ -11,3 +12,6 @@ partials/
 # rv.log is a real debug capture: it names a live onion service and a real
 # organisation on every line. Kept locally as design evidence, never committed.
 rv.log
+# URLs.txt is the operator's own target list, and crawl mode makes it the seed
+# list too. It names live onion services; it is local input, not source.
+URLs.txt

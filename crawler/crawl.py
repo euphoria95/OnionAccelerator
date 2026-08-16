@@ -1,0 +1,351 @@
+"""The crawl orchestrator: workers, layer control, stop conditions.
+
+Everything hard has been pushed into the pieces this drives -- the parser decides what
+is in a listing, the pool decides which circuit a request goes down, the fetcher decides
+what a failure means, the frontier decides what runs next. What is left here is flow
+control, and it is meant to stay readable as such.
+
+The unit of work is one directory. When a listing is parsed, every subdirectory in it
+becomes its own independent job, schedulable on any free circuit -- so a directory with
+fifty subdirectories becomes fifty parallel units of work rather than one long walk.
+That is the whole reason a crawl of an open directory over Tor is tractable at all.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import logging
+import signal
+import time
+from typing import Any, Optional, Sequence
+
+from .config import (
+    CrawlConfig,
+    ORDER_BFS,
+    ORDER_DFS,
+    STATS_INTERVAL,
+)
+from .fetcher import AsyncFetcher, FetchResult, Verdict, backoff_delay
+from .frontier import Frontier, HostLimiter, Job
+from .indexparse import parse_index
+from .proxypool import AsyncLanePool, ConnectorFactory, Endpoint
+from .report import CrawlReport
+
+logger = logging.getLogger("OnionAccelerator.crawl")
+
+
+class Crawler:
+    """Drives N workers over one frontier until a stop condition fires."""
+
+    def __init__(
+        self,
+        config: CrawlConfig,
+        pool: AsyncLanePool,
+        frontier: Frontier,
+        fetcher: AsyncFetcher,
+        report: CrawlReport,
+    ) -> None:
+        self.config = config
+        self.pool = pool
+        self.frontier = frontier
+        self.fetcher = fetcher
+        self.report = report
+        self.hosts = HostLimiter(config.per_host)
+
+        self._pages = 0
+        self._stopped_because = "completed"
+        self._stopping = False
+        # Which endpoint last failed a given URL, so its retry is steered elsewhere.
+        # Keyed by URL because Job is frozen and a retry is a different Job object.
+        self._last_failed: dict[str, Endpoint] = {}
+
+    # ------------------------------------------------------------ run
+
+    async def run(self) -> dict[str, Any]:
+        """Seed, spawn workers, wait, and write the report. Always writes a report."""
+        for seed in self.config.seeds:
+            if not await self.frontier.add(seed, depth=0, parent=None):
+                logger.warning("seed rejected by the frontier: %s", seed)
+
+        n_workers = self.config.workers or len(self.pool)
+        n_workers = max(1, min(n_workers, len(self.pool)))
+        logger.info(
+            "crawl starting: %d seed(s), %d worker(s) over %d circuit(s), max_depth=%d, order=%s",
+            len(self.config.seeds), n_workers, len(self.pool),
+            self.config.max_depth, self.frontier.order,
+        )
+
+        workers = [asyncio.create_task(self._worker(i), name=f"crawl-worker-{i}")
+                   for i in range(n_workers)]
+        watchers = [asyncio.create_task(self._progress(), name="crawl-progress")]
+        if self.config.time_budget:
+            watchers.append(asyncio.create_task(self._deadline(), name="crawl-deadline"))
+        self._install_signal_handlers()
+
+        try:
+            await asyncio.gather(*workers)
+        finally:
+            for task in watchers:
+                task.cancel()
+            await asyncio.gather(*watchers, return_exceptions=True)
+            self._remove_signal_handlers()
+
+        return self.report.finalize(
+            layers=self.frontier.layer_summary(),
+            endpoints=self.pool.stats(),
+            config=self._config_record(),
+            stopped_because=self._stopped_because,
+        )
+
+    async def _worker(self, index: int) -> None:
+        """Pull jobs until the frontier says the crawl is over."""
+        while True:
+            job = await self.frontier.get()
+            if job is None:
+                logger.debug("worker %d: frontier drained, exiting", index)
+                return
+            failed = False
+            requeued = False
+            try:
+                requeued, failed = await self._process(job)
+            except asyncio.CancelledError:
+                # Put the work back before unwinding, so a cancelled run's report still
+                # reflects what was outstanding rather than silently losing it.
+                await self.frontier.requeue(job, 0.0)
+                await self.frontier.complete(job, requeued=True)
+                raise
+            except Exception as exc:                      # noqa: BLE001
+                logger.exception("worker %d: unhandled error on %s: %s", index, job.url, exc)
+                self.report.record_failure(
+                    job, {"url": job.url, "error": f"{type(exc).__name__}: {exc}"}, final=True
+                )
+                failed = True
+            finally:
+                await self.frontier.complete(job, failed=failed, requeued=requeued)
+
+    # ------------------------------------------------------------ one directory
+
+    async def _process(self, job: Job) -> tuple[bool, bool]:
+        """Fetch, parse and expand one directory. Returns (requeued, failed)."""
+        async with self.hosts.for_url(job.url):
+            result = await self.fetcher.fetch(job, exclude=self._last_failed.get(job.url))
+
+        self.report.totals.requests += 1
+        self.report.totals.bytes_fetched += result.nbytes
+        record = result.as_record()
+
+        if result.verdict is Verdict.OK:
+            self._last_failed.pop(job.url, None)
+            await self._expand(job, result, record)
+            return False, False
+
+        if result.verdict is Verdict.LEAF:
+            self._last_failed.pop(job.url, None)
+            self.report.record_leaf(job, record)
+            return False, False
+
+        if result.verdict is Verdict.DROP:
+            self.report.record_failure(job, record, final=True)
+            return False, True
+
+        return await self._retry(job, result, record)
+
+    async def _expand(self, job: Job, result: FetchResult, record: dict[str, Any]) -> None:
+        """Parse a fetched page and turn each subdirectory into its own job."""
+        listing = parse_index(
+            result.body or "",
+            result.final_url or job.url,
+            content_type=result.content_type,
+            allow_offsite=self.config.allow_offsite,
+        )
+
+        if not listing.is_index:
+            # Not an open directory: a landing page, an app, a file served as HTML.
+            # Recording it as a leaf is what stops the crawl turning into a site crawl.
+            logger.info("[SKIP] not a directory index (confidence %.2f): %s",
+                        listing.confidence, job.url)
+            self.report.record_leaf(job, record)
+            return
+
+        self.report.record_listing(job, listing, record)
+        self._pages += 1
+
+        for entry in listing.directories:
+            await self.frontier.add(entry.url, depth=job.depth + 1, parent=job.url)
+
+        await self._check_layer_switch()
+        await self._check_page_budget()
+
+    async def _retry(
+        self, job: Job, result: FetchResult, record: dict[str, Any]
+    ) -> tuple[bool, bool]:
+        """Handle a RETRY or ROTATE verdict. Returns (requeued, failed)."""
+        budget = self.config.retries
+        if result.retry_budget is not None:
+            budget = min(budget, result.retry_budget)
+
+        if result.endpoint is not None:
+            self._last_failed[job.url] = result.endpoint
+        if result.verdict is Verdict.ROTATE:
+            self.report.totals.rotations += 1
+
+        if job.attempt + 1 >= budget:
+            self.report.record_failure(job, record, final=True)
+            self._last_failed.pop(job.url, None)
+            return False, True
+
+        self.report.record_failure(job, record, final=False)
+        self.report.totals.retries += 1
+        delay = backoff_delay(job.attempt, result.retry_after)
+        logger.warning(
+            "[RETRY] %s (attempt %d/%d, %s) in %.1fs: %s",
+            job.url, job.attempt + 1, budget, result.verdict.value, delay, result.error,
+        )
+        await self.frontier.requeue(job, delay)
+        return True, False
+
+    # ------------------------------------------------------------ flow control
+
+    async def _check_page_budget(self) -> None:
+        """Stop cleanly once --max-pages directories have been listed."""
+        if self.config.max_pages and self._pages >= self.config.max_pages and not self._stopping:
+            await self._stop(f"max_pages ({self.config.max_pages}) reached")
+
+    async def _check_layer_switch(self) -> None:
+        """Flip traversal order once --switch-after directories have been listed.
+
+        The use for this is a wide, shallow root: sweep breadth-first until the shape of
+        the tree is known, then dive depth-first so that whole branches are finished (and
+        written out) instead of every branch being left half-done.
+        """
+        if not self.config.switch_after or self._pages != self.config.switch_after:
+            return
+        target = ORDER_DFS if self.frontier.order == ORDER_BFS else ORDER_BFS
+        await self.frontier.set_order(target)
+
+    async def _deadline(self) -> None:
+        """Stop the crawl when --time-budget expires."""
+        assert self.config.time_budget is not None
+        await asyncio.sleep(self.config.time_budget)
+        await self._stop(f"time budget ({self.config.time_budget:.0f}s) expired")
+
+    async def _stop(self, reason: str) -> None:
+        if self._stopping:
+            return
+        self._stopping = True
+        self._stopped_because = reason
+        logger.warning("stopping crawl: %s", reason)
+        await self.frontier.close()
+
+    async def _progress(self) -> None:
+        """Periodic progress and per-endpoint balance.
+
+        The balance line is the one number that says whether multi-Tor concurrency is
+        actually working: if one endpoint's count is far ahead of the others, lanes are
+        not being spread and the extra daemons are decoration.
+        """
+        while True:
+            await asyncio.sleep(STATS_INTERVAL)
+            logger.info(
+                "progress: %d dir(s), %d file(s), %d queued, %d in flight, %d seen | %s",
+                self.report.totals.directories, self.report.totals.files,
+                self.frontier.pending - self.frontier.in_flight,
+                self.frontier.in_flight, self.frontier.seen,
+                self.pool.balance_line(),
+            )
+
+    # ------------------------------------------------------------ signals
+
+    def _install_signal_handlers(self) -> None:
+        """Ctrl-C stops the crawl cleanly instead of killing it.
+
+        A crawl that dies on SIGINT still has its JSONL (it is flushed per line), but it
+        has no stats.json, no tree and no urls.txt -- and those are the files anyone
+        actually opens first.
+        """
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            with contextlib.suppress(NotImplementedError, ValueError):
+                loop.add_signal_handler(
+                    sig, lambda s=sig: asyncio.create_task(self._stop(f"signal {s.name}"))
+                )
+
+    def _remove_signal_handlers(self) -> None:
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            with contextlib.suppress(NotImplementedError, ValueError):
+                loop.remove_signal_handler(sig)
+
+    def _config_record(self) -> dict[str, Any]:
+        """The knobs this run used, echoed into stats.json so it can be reproduced."""
+        return {
+            "max_depth": self.config.max_depth,
+            "order": self.frontier.order,
+            "workers": self.config.workers or len(self.pool),
+            "circuits": len(self.pool),
+            "per_host": self.config.per_host,
+            "retries": self.config.retries,
+            "max_pages": self.config.max_pages,
+            "time_budget": self.config.time_budget,
+            "allow_offsite": self.config.allow_offsite,
+            "include": self.config.include.pattern if self.config.include else None,
+            "exclude": self.config.exclude.pattern if self.config.exclude else None,
+        }
+
+
+# ---------------------------------------------------------------- entry points
+
+
+async def run_crawl(
+    config: CrawlConfig,
+    endpoints: Sequence[str],
+    user_agents: Sequence[str],
+    *,
+    connector_factory: Optional[ConnectorFactory] = None,
+) -> tuple[dict[str, Any], list[str]]:
+    """Run one crawl to completion. Returns (stats, discovered file URLs).
+
+    `connector_factory` is the Tor seam: leave it None in production, pass a direct
+    connector in tests.
+    """
+    pool = await AsyncLanePool.create(
+        endpoints,
+        circuits_per_endpoint=config.circuits_per_endpoint,
+        user_agents=list(user_agents),
+        connector_factory=connector_factory,
+    )
+    frontier = Frontier(
+        seeds=config.seeds,
+        max_depth=config.max_depth,
+        order=config.order,
+        include=config.include,
+        exclude=config.exclude,
+        allow_offsite=config.allow_offsite,
+    )
+    fetcher = AsyncFetcher(pool, max_page_bytes=config.max_page_bytes)
+
+    try:
+        with CrawlReport(config.out_dir, config.job_id, config.seeds) as report:
+            crawler = Crawler(config, pool, frontier, fetcher, report)
+            stats = await crawler.run()
+            return stats, report.file_urls
+    finally:
+        await pool.close()
+
+
+def crawl(
+    config: CrawlConfig,
+    endpoints: Sequence[str],
+    user_agents: Sequence[str],
+    *,
+    connector_factory: Optional[ConnectorFactory] = None,
+) -> tuple[dict[str, Any], list[str]]:
+    """Synchronous wrapper, so the rest of OnionAccelerator never has to see a loop."""
+    started = time.monotonic()
+    try:
+        return asyncio.run(run_crawl(
+            config, endpoints, user_agents, connector_factory=connector_factory
+        ))
+    finally:
+        logger.debug("crawl mode wall time: %.1fs", time.monotonic() - started)
