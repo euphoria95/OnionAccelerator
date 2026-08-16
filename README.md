@@ -1,6 +1,6 @@
 # OnionAccelerator
 
-OnionAccelerator is a multi-functional Python script designed for downloading files through multiple SOCKS5 proxies (commonly Tor instances). It supports three main modes:
+OnionAccelerator is a multi-functional Python script designed for discovering and downloading files through multiple SOCKS5 proxies (commonly Tor instances). It supports five modes:
 
 ## Modes
 
@@ -13,7 +13,8 @@ OnionAccelerator is a multi-functional Python script designed for downloading fi
 ### Partial-Download Mode
 
 - Splits each file into parallel byte-range chunks — up to one per proxy, but never more chunks than the file size warrants (chunks are at least `MIN_PARTIAL_CHUNK_SIZE`, 1 MB by default) — each served by a SOCKS5 proxy drawn from the shared pool.
-- If the server does not provide a `Content-Length` header, the script automatically falls back to a single, sequential download.
+- Establishes the file size through a ladder of four probes, so a server that withholds `Content-Length` no longer costs you the parallelism: a `HEAD`, then the `size=` parameter of that same response's `Content-Disposition`, then the total in the `Content-Range` of a one-byte `Range: bytes=0-0` GET, and finally a plain streamed GET aborted the moment its headers arrive. No probe transfers a payload.
+- If none of the four can establish a size, the script automatically falls back to a single, sequential download.
 - Merges the downloaded chunks into a final file upon success, and performs retry logic if any chunk fails — each chunk retry lands on a different live proxy via the pool's failover.
 
 ### Remote Archive Tree Mode (`--mode tree`)
@@ -27,6 +28,19 @@ OnionAccelerator is a multi-functional Python script designed for downloading fi
   `--external` proxy list, gives it real parallelism.
 - Everything after `--` is passed straight to rvtree, so the full `list` / `extract` /
   `probe` surface is available with no flags to keep in sync.
+
+### Open-Directory Crawl Mode (`--mode crawl`)
+
+- Walks an **"Index of /" open directory** recursively and writes a manifest of every file
+  it finds — the one mode that *discovers* URLs instead of consuming a list of them.
+- Parses listings with a **server-agnostic** parser: Apache `<pre>` and `<table>`, nginx,
+  lighttpd, Caddy, hand-rolled templates and nginx's JSON autoindex all come out as the
+  same `directories` / `files` split, because the filtering is structural rather than
+  template-matched (see **Open-Directory Crawl** below).
+- Spreads its requests across **many Tor circuits at once** — every SOCKS endpoint × N
+  credential-isolated circuits — with per-endpoint failover, circuit rotation and
+  exponential backoff for the timeouts, 503s and dropped circuits that Tor guarantees.
+- Optionally hands the discovered URLs straight to the multi-download path (`--download`).
 
 ### Speedtest & Healthcheck Mode
 
@@ -66,7 +80,7 @@ OnionAccelerator is a multi-functional Python script designed for downloading fi
 
 ### Seamless Fallback
 
-- In partial-download mode, if no file size is advertised by the server (`Content-Length`), the script automatically switches to a single GET request and proceeds with a standard download.
+- In partial-download mode, if none of the four size probes can establish a file size, the script automatically switches to a single GET request and proceeds with a standard download. The same applies when a response arrives under a `Content-Encoding`: the length it advertises describes the compressed transfer rather than the file, so it is not safe to split into ranges.
 
 ## Installation
 
@@ -97,6 +111,9 @@ python3 OnionAccelerator.py --mode <multi|partial|speedtest> [--retries N] [--ex
 
 # Read a remote archive's file tree without downloading it:
 python3 OnionAccelerator.py --mode tree [--external] -- <rvtree arguments>
+
+# Recursively map an open directory (and optionally download what it finds):
+python3 OnionAccelerator.py --mode crawl [--max-depth N] [--order bfs|dfs] [--socks host:port,...] [--download]
 ```
 
 Exactly one of `--farm` or `--mode` must be given.
@@ -108,7 +125,9 @@ Exactly one of `--farm` or `--mode` must be given.
   - `partial`: Parallel chunk-based download for each URL, automatically merging chunks.
   - `speedtest`: Test download speed and basic health for each SOCKS5 proxy using the first URL from `URLs.txt`.
   - `tree`: List or extract members of a remote archive over the proxy pool without downloading it. Takes its target from the arguments after `--`, not from `URLs.txt` (see **Remote Archive Tree** below).
-  
+  - `crawl`: Recursively walk the open directories seeded from `URLs.txt` and write a manifest of every file found, spread across many Tor circuits at once (see **Open-Directory Crawl** below).
+
+
 - `--retries N`: Set how many times to retry if a download fails (default: 3).
 
 - `--external`: Use remote `ip:port` SOCKS5 proxies fetched from a public list instead of local Docker Tor instances (see **External Proxy List** below). Works with any `--mode`.
@@ -133,6 +152,9 @@ python3 OnionAccelerator.py --mode multi --external
 # External mode, verifying proxies against your own endpoint (keeps real
 # targets private) instead of a random URL from URLs.txt:
 python3 OnionAccelerator.py --mode multi --external --test-url http://your-own-service.onion/ping
+
+# Map the open directories in URLs.txt three levels deep:
+python3 OnionAccelerator.py --mode crawl --max-depth 3
 ```
 
 ## Remote Archive Tree (`--mode tree`)
@@ -195,22 +217,151 @@ python3 OnionAccelerator.py --mode tree -- list https://example.onion/backup.rar
 rvtree writes its own full debug log to `logs/rvtree_<job_id>.log` for every run. Add `-v`
 to watch the pipeline, or `-vv` for one line per range request.
 
+## Open-Directory Crawl (`--mode crawl`)
+
+Every other mode needs to be told what to fetch. This one finds out. Seeds come from
+`URLs.txt` — one open-directory URL per line — and the crawl walks down from each of them,
+listing directories and recording files, until it runs out of tree or out of budget.
+
+```bash
+# Map everything under the seeds in URLs.txt, five levels deep (the default).
+python3 OnionAccelerator.py --mode crawl
+
+# A quick reconnaissance pass: two levels, fifty directories, then stop.
+python3 OnionAccelerator.py --mode crawl --max-depth 2 --max-pages 50
+
+# Map the shape of the tree breadth-first, then dive once it is known.
+python3 OnionAccelerator.py --mode crawl --order bfs --switch-after 200
+
+# Only the dumps, never the thumbnails.
+python3 OnionAccelerator.py --mode crawl --include '/(dumps?|leaks)/' --exclude '/thumbs/'
+
+# Through Tor daemons this script does not manage, four circuits on each.
+python3 OnionAccelerator.py --mode crawl --socks 127.0.0.1:9050,127.0.0.1:9052 --circuits-per-endpoint 4
+
+# Map, then pull everything down, mirroring the remote tree under downloads/<host>/.
+python3 OnionAccelerator.py --mode crawl --max-depth 3 --download
+```
+
+### A parser with no server templates
+
+Open directories are rendered by at least half a dozen web servers and any number of
+hand-rolled templates, so matching markup per server is a losing game. The parser reads
+*every* `<a href>` on the page and then discards junk by **structure**:
+
+- Anything that does not resolve strictly *below* the directory being listed is
+  navigation. That single rule kills `../`, `/`, "Parent Directory" and every breadcrumb
+  on every server, without matching a word of link text.
+- Anything whose path equals the page's own path but carries a query is a sort control.
+  That covers Apache's `?C=N;O=D`, nginx's `?sort=`, lighttpd's `?N=D` and h5ai's
+  `?view=` without hard-coding a single parameter name.
+- A small junk-text set (`Name`, `Last modified`, `Size`, `Description`, …) is a secondary
+  net for column headers that are links, not the primary filter.
+
+What survives is split into directories and files: a trailing slash first, then link text,
+then a `[DIR]` icon, then "no extension **and** no size in the row" — so a template that
+strips the slash is still categorised correctly. Sizes (`4.1K`, `512M`, `1.2 GiB`, raw
+bytes) and modification dates are recovered from the row where they exist and recorded in
+the manifest. `application/json` bodies (nginx `autoindex_format json`, Caddy) are read as
+JSON and produce identical entries.
+
+Before recursing, each page is scored on whether it *is* an index (title, in-scope link
+ratio, absence of forms). Below `0.5` it is recorded as a leaf and never expanded — the
+guard that stops a directory walk from turning into an unbounded crawl of somebody's forum
+over Tor. Skips are logged with their score.
+
+### Concurrency: circuits, not just threads
+
+Endpoints resolve exactly like `--mode tree`: `--socks` if given, else `--external`, else a
+live probe of the farm range, else the local Tor client, else an error. The download modes'
+fallback to a fixed twenty-port list is deliberately *not* used — a crawl issues thousands
+of requests and would spend all of them timing out on ports that were never there.
+
+Each endpoint is opened `--circuits-per-endpoint` times (default 2), and **each circuit
+gets its own SOCKS username/password**. That is what makes them separate Tor circuits
+rather than one shared one, and it is the difference between real parallelism and twenty
+sessions queueing behind a single guard. Every circuit also pins one User-Agent for its
+lifetime — a UA that changes per request on a fixed circuit is itself a fingerprint.
+
+Lanes are handed out round-robin across *daemons*, so consecutive requests land on
+different guards. A failing endpoint is parked after three consecutive failures and every
+later lease prefers a live one; a dropped circuit is rotated (new credential, new circuit)
+rather than retried into the same hole. Errors are classified rather than counted:
+timeouts and 429/502/503/504 back off exponentially with full jitter (honouring
+`Retry-After`), circuit drops and SOCKS errors rotate, and 401/403/404/410 are recorded
+once and never retried. A backed-off job is re-heaped with a `not_before` timestamp instead
+of sleeping, so a slow host never occupies a worker.
+
+`--per-host` (default 8) caps concurrent requests against any single target: an onion
+service is usually one small process, and past that it starts refusing connections.
+
+### Queueing and layers
+
+The frontier is a depth-ordered heap with exact URL deduplication — every discovered
+subdirectory becomes its own schedulable job, so a directory with 50 subdirectories becomes
+50 units of work rather than one. `--order bfs` maps the whole tree shallow-first;
+`--order dfs` finishes branches; `--switch-after N` flips from one to the other mid-run,
+which re-orders work that is *already queued* (an `asyncio.PriorityQueue` could not — it
+fixes each item's key when it is pushed). Depth is capped by `--max-depth`, which is also
+what terminates a directory that contains itself: a symlink loop produces a genuinely new
+URL at every level, so deduplication cannot cut it.
+
+Stops are `--max-depth`, `--max-pages`, `--time-budget` and `Ctrl-C` — all of them clean.
+The report is streamed and flushed per line, so an interrupted run still leaves a valid,
+complete-as-far-as-it-got manifest.
+
+### Output
+
+Everything lands in `crawls/<job_id>/` (gitignored):
+
+| File | Contents |
+|---|---|
+| `listing.jsonl` | one record per file: `url, host, path, name, size_bytes, mtime_text, depth, parent, http_status, content_type, endpoint, discovered_at` |
+| `dirs.jsonl` | one per directory: `url, depth, parent, status, n_dirs, n_files, is_index, confidence, server, title, elapsed_ms, attempts, endpoint` |
+| `failed.jsonl` | `url, depth, attempts, status, verdict, error, endpoint, final` (`final` marks the attempt that exhausted `--retries`) |
+| `stats.json` | totals, per-layer counts, per-endpoint throughput and failures, wall time, why it stopped |
+| `tree.txt` | the tree, rendered for eyeballing |
+| `urls.txt` | bare file URLs, ready to feed straight back in |
+
+```bash
+python3 OnionAccelerator.py --mode crawl --max-depth 3
+cp crawls/<job_id>/urls.txt URLs.txt
+python3 OnionAccelerator.py --mode partial
+```
+
+`--download` does that for you as a second, sequential phase after the crawl — sequential
+on purpose, because the download stack is threads over `requests` and running it alongside
+the event loop would put two unrelated concurrency models on the same Tor daemons at once.
+It downloads with the remote directory structure **preserved** under
+`downloads/<host>/a/b/file.txt`; a crawled tree routinely holds many same-named files in
+different directories, and the flat `downloads/<host>/file.txt` layout the other modes use
+would silently overwrite all but one of them.
+
+Logging goes into the usual `logs/OnionAccelerator_<job_id>.log`: one DEBUG line per
+request (`lane`, `endpoint`, `depth`, `attempt`, `status`, `bytes`, `ms`, `verdict`, `url`),
+one INFO line per listed directory, and a periodic progress line whose per-endpoint balance
+(`127.0.0.1:9050=214 127.0.0.1:9052=209/3f`) is the one number that says whether the
+multi-circuit spread is actually working.
+
 ## Project Structure
 
-- `OnionAccelerator.py`: The main script containing all modes (multi-download, partial-download, speedtest, tree).
+- `OnionAccelerator.py`: The main script containing all modes (multi-download, partial-download, speedtest, tree, crawl).
 - `remote_viewer/`: The `rvtree` package behind `--mode tree`. Usable on its own too — see its own README.
+- `crawler/`: The asyncio package behind `--mode crawl` — universal listing parser, multi-circuit proxy pool, frontier and reporting. The only async code in the project; the other modes stay on threads over `requests`.
 - `requirements.txt`: Python dependencies.
 - `URLs.txt`: A text file with one URL per line.
 - `UserAgents.tsv`: Tab-separated file; first column is the User-Agent string.
 - `logs/`: A directory automatically created to store timestamped log files.
-- `downloads/<host>/`: Output directory for multi mode, organised by hostname.
+- `downloads/<host>/`: Output directory for multi mode, organised by hostname. With `--mode crawl --download` the remote directory structure is mirrored underneath it.
 - `partials/<host>/`: Output directory for partial mode; temporary chunk files are merged here.
+- `crawls/<job_id>/`: Manifests written by crawl mode (`listing.jsonl`, `dirs.jsonl`, `failed.jsonl`, `stats.json`, `tree.txt`, `urls.txt`).
 
 ## Requirements
 
-- Python 3.7+
+- Python 3.7+ (3.8+ for `--mode crawl`, which is `aiohttp`'s own floor)
 - `requests[socks]` or `PySocks` for SOCKS5 support
 - `tqdm` for progress bars
+- `aiohttp`, `aiohttp-socks`, `beautifulsoup4`, `lxml` — `--mode crawl` only; the other modes run without them
 
 ## Native Tor Farm (`--farm`)
 

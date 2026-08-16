@@ -12,7 +12,9 @@ import string
 import threading
 import queue
 import subprocess
-from urllib.parse import urlparse
+from email.message import Message
+from typing import NamedTuple, Optional
+from urllib.parse import urlparse, unquote
 
 import requests
 # Wyłączamy ostrzeżenia o certyfikatach
@@ -131,15 +133,39 @@ def random_user_agent(uas):
     return random.choice(uas)
 
 
-def url_to_local_path(url: str, base_dir: str) -> str:
+def url_to_local_path(url: str, base_dir: str, preserve_path: bool = False) -> str:
     """
     Derive a collision-free local path from a URL using hostname as a subdirectory.
     e.g. http://example.onion/file.zip -> base_dir/example.onion/file.zip
+
+    With `preserve_path`, the URL's directories are mirrored under the hostname:
+    http://example.onion/a/b/file.zip -> base_dir/example.onion/a/b/file.zip. The
+    hostname alone is enough for a hand-written URL list, where two entries rarely
+    share a basename, but not for a crawl: an open directory routinely holds a
+    README.txt in every subdirectory, and flattening those would have each overwrite
+    the last. Crawl mode passes True; every other caller keeps the flat layout.
     """
     parsed = urlparse(url)
     host = parsed.netloc.replace(":", "_") or "unknown"
     filename = os.path.basename(parsed.path) or "index.html"
-    return os.path.join(base_dir, host, filename)
+    if not preserve_path:
+        return os.path.join(base_dir, host, filename)
+
+    # Sanitise every component: a path traversal in a URL served by a hostile onion
+    # must not be able to write outside base_dir.
+    parts = [_safe_path_component(unquote(p)) for p in parsed.path.split("/") if p]
+    parts = [p for p in parts if p]
+    if not parts:
+        parts = ["index.html"]
+    return os.path.join(base_dir, host, *parts)
+
+
+def _safe_path_component(component: str) -> str:
+    """One URL path segment, made safe to use as a filename."""
+    if component in (".", ".."):
+        return ""
+    cleaned = re.sub(r'[\x00-\x1f/\\:*?"<>|]', "_", component).strip(". ")
+    return cleaned[:120]
 
 
 def make_proxies(proxy: str) -> dict:
@@ -355,13 +381,13 @@ class ProxyPool:
 
 # =========== MULTI-DOWNLOAD ===========
 
-def download_file(url, proxy, user_agents, progress_queue=None):
+def download_file(url, proxy, user_agents, progress_queue=None, preserve_path=False):
     """
     Download a single file with requests, streaming, ignoring HTTPS cert.
     """
     proxies = make_proxies(proxy)
     ua = random_user_agent(user_agents)
-    out_path = url_to_local_path(url, DOWNLOAD_DIR)
+    out_path = url_to_local_path(url, DOWNLOAD_DIR, preserve_path=preserve_path)
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
     try:
@@ -383,7 +409,13 @@ def download_file(url, proxy, user_agents, progress_queue=None):
         return False
 
 
-def multi_download_mode(urls, proxies, retries=DEFAULT_RETRIES):
+def multi_download_mode(urls, proxies, retries=DEFAULT_RETRIES, preserve_path=False):
+    """Download every URL in parallel, one worker per proxy.
+
+    `preserve_path` mirrors each URL's directories under downloads/<host>/ instead of
+    flattening to the basename; crawl mode's --download phase needs it, because a
+    crawled tree is full of same-named files in different directories.
+    """
     logger.info(f"multi_download_mode: {len(urls)} URLs, {len(proxies)} proxies, retries={retries}")
     user_agents = load_user_agents()
     pool = ProxyPool(proxies)
@@ -420,7 +452,8 @@ def multi_download_mode(urls, proxies, retries=DEFAULT_RETRIES):
             last = None
             for attempt in range(retries):
                 proxy = pool.acquire(exclude=last)
-                success = download_file(url, proxy, user_agents, progress_queue=progress_queue)
+                success = download_file(url, proxy, user_agents, progress_queue=progress_queue,
+                                        preserve_path=preserve_path)
                 if success:
                     pool.mark_alive(proxy)
                     logger.info(f"[OK] {url} (proxy={proxy})")
@@ -451,20 +484,201 @@ def multi_download_mode(urls, proxies, retries=DEFAULT_RETRIES):
     logger.info("multi_download_mode: completed")
 
 
-# =========== PARTIAL-DOWNLOAD ===========
+# =========== REMOTE FILE SIZE PROBE ===========
 
-def get_content_length(url, proxy, ua):
-    proxies = make_proxies(proxy)
+# The lengths a response advertises only describe the file when the body is sent
+# as-is. Under any other Content-Encoding they describe the *compressed* transfer,
+# and feeding one of those to the range splitter would cut the file at the wrong
+# offsets. See _size_from_response().
+IDENTITY_ENCODINGS = {"", "identity"}
+
+
+class SizeProbe(NamedTuple):
+    """What a size probe learned about a URL.
+
+    `size is None` means undetermined, which is not the same as unreachable:
+    `reachable` says whether any probe got an answer out of the server at all.
+    """
+    size: Optional[int] = None
+    reachable: bool = False
+    source: str = ""
+    error: Optional[str] = None
+
+
+def _positive_int(value) -> Optional[int]:
+    """A header value as a positive int, or None if it isn't one.
+
+    Zero counts as undetermined on purpose: a HEAD-hostile server answering
+    "Content-Length: 0" is far more common than a genuinely empty file, and
+    treating it as unknown keeps the ladder walking instead of stopping there.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text.isdigit():
+        return None
+    n = int(text)
+    return n if n > 0 else None
+
+
+def _size_from_content_length(headers) -> Optional[int]:
+    """Content-Length, which on a non-206 response is the size of the whole entity."""
+    return _positive_int(headers.get("content-length"))
+
+
+def _size_from_content_disposition(headers) -> Optional[int]:
+    """The optional `size` parameter of Content-Disposition.
+
+    `Message.get_param` is the stdlib's header parser, so quoting and the RFC 2231
+    form come for free and, unlike a "size=(digits)" regex, it will not read the 99
+    out of `filename="report-size=99.pdf"`. (`cgi.parse_header` would be the obvious
+    alternative and is gone in Python 3.13.)
+    """
+    raw = headers.get("content-disposition")
+    if not raw:
+        return None
+    msg = Message()
+    msg["Content-Disposition"] = raw
+    param = msg.get_param("size", header="content-disposition")
+    if isinstance(param, tuple):    # RFC 2231 form: (charset, language, value)
+        param = param[2]
+    return _positive_int(param)
+
+
+def _size_from_content_range(headers) -> Optional[int]:
+    """The total after the slash in `Content-Range: bytes 0-0/1048576`.
+
+    An unsatisfied range answers `bytes */0`, whose "*" is not a digit and is
+    rejected by _positive_int.
+    """
+    return _positive_int(headers.get("content-range", "").rsplit("/", 1)[-1])
+
+
+def _size_from_response(status, headers):
+    """The size a single response advertises, as (size, source); (None, "") if none.
+
+    A non-identity Content-Encoding disqualifies the whole response: every number it
+    carries then describes the compressed transfer rather than the file, and a body
+    that arrives encoded cannot be reassembled out of parallel ranges anyway.
+    Answering "unknown" routes the file to fallback_sequential_download(), which
+    handles it correctly, instead of letting the merge fail after every byte has
+    already been pulled over Tor.
+
+    On a 206 the Content-Length is the length of the returned range -- one byte for
+    our probe -- so the entity size has to come from Content-Range instead. Reading
+    Content-Length there would report every file as 1 byte.
+    """
+    encoding = headers.get("content-encoding", "").strip().lower()
+    if encoding not in IDENTITY_ENCODINGS:
+        logger.debug(f"Ignoring the sizes on a response sent with Content-Encoding: {encoding}")
+        return None, ""
+    if status == 206:
+        size = _size_from_content_range(headers)
+        if size:
+            return size, "Content-Range"
+    else:
+        size = _size_from_content_length(headers)
+        if size:
+            return size, "Content-Length"
+    size = _size_from_content_disposition(headers)
+    if size:
+        return size, "Content-Disposition size="
+    return None, ""
+
+
+def _probe(session, url, method, extra_headers=None, stream=False):
+    """Issue one probe request and return (status, lower-cased headers).
+
+    allow_redirects is passed explicitly because requests.head() defaults it to
+    False, and a redirect is not a 4xx -- so an unguarded HEAD happily reports the
+    redirect's empty body as the size of a file that downloads perfectly well.
+
+    The body is never touched on the streaming probes: closing an unconsumed
+    response tears the socket down instead of returning it to the pool, and that is
+    what stops the payload from being downloaded. The close sits in a finally so it
+    happens on every path out.
+    """
+    r = session.request(method, url, headers=extra_headers, stream=stream,
+                        timeout=REQUEST_TIMEOUT, allow_redirects=True)
     try:
-        r = requests.head(url, proxies=proxies, timeout=REQUEST_TIMEOUT,
-                          verify=False, headers={"User-Agent": ua})
-        r.raise_for_status()
-        cl = r.headers.get("Content-Length")
-        if cl is not None:
-            return int(cl)
-    except Exception as e:
-        logger.debug(f"HEAD request for {url} (proxy={proxy}) failed: {e}")
-    return None
+        return r.status_code, {k.lower(): v for k, v in r.headers.items()}
+    finally:
+        r.close()
+
+
+def probe_remote_size(url, proxy, ua=None) -> SizeProbe:
+    """Determine the size of `url` without downloading it.
+
+    Four sources of evidence, tried in this order and stopping at the first that
+    answers. They cost at most three requests, because the first two read the same
+    response:
+
+      1. Content-Length on a HEAD.
+      2. The `size=` parameter of that same response's Content-Disposition -- free,
+         since it shares the round trip.
+      3. Content-Range on a one-byte `Range: bytes=0-0` GET. A 206 gives the total
+         after the slash; a server that ignores the Range answers 200, and then its
+         Content-Length is the whole entity.
+      4. A plain streamed GET, aborted as soon as the headers are in. It earns its
+         place because a server that rejects *any* Range header with 501 never gets
+         an answer out of probe 3.
+
+    One Session covers all of them, so the proxy is dialled once rather than three
+    times, and its close() releases every socket on every exit path.
+    """
+    last_error = None
+    reachable = False
+
+    with requests.Session() as session:
+        session.proxies.update(make_proxies(proxy))
+        session.verify = False
+        if ua:
+            session.headers["User-Agent"] = ua
+
+        probes = (
+            ("HEAD", "HEAD", None, False),
+            ("range GET", "GET", {"Range": "bytes=0-0"}, True),
+            ("streamed GET", "GET", None, True),
+        )
+        for label, method, extra_headers, stream in probes:
+            try:
+                status, headers = _probe(session, url, method, extra_headers, stream)
+            except requests.exceptions.ConnectionError as e:
+                # Covers ProxyError and ConnectTimeout: the proxy or the endpoint is
+                # unreachable, so the remaining probes would fail the same way on the
+                # same proxy. Stop rather than spend another 2 x REQUEST_TIMEOUT.
+                logger.debug(f"{label} for {url} (proxy={proxy}) could not connect: {e}")
+                return SizeProbe(reachable=reachable, error=str(e))
+            except requests.RequestException as e:
+                # Read timeout, too many redirects, malformed response: this probe is
+                # out, but another method may still get an answer.
+                last_error = str(e)
+                logger.debug(f"{label} for {url} (proxy={proxy}) failed: {e}")
+                continue
+
+            if status >= 400:
+                # A 405 on HEAD or a 501/416 on Range is the very reason the later
+                # probes exist, so it isn't an error -- just move on.
+                last_error = f"HTTP {status}"
+                logger.debug(f"{label} for {url} returned HTTP {status}, trying the next probe")
+                continue
+
+            reachable = True
+            size, source = _size_from_response(status, headers)
+            if size:
+                logger.debug(f"{url}: size={size} B via {source} ({label})")
+                return SizeProbe(size=size, reachable=True, source=source)
+
+    logger.debug(f"No size for {url} after all probes (last error: {last_error})")
+    return SizeProbe(reachable=reachable, error=last_error)
+
+
+def get_remote_file_size(url, proxy, ua) -> Optional[int]:
+    """The size of `url` in bytes, or None if no probe could determine it."""
+    return probe_remote_size(url, proxy, ua).size
+
+
+# =========== PARTIAL-DOWNLOAD ===========
 
 
 def partial_download_chunk_to_file(url, start, end, proxy, ua, progress_queue, part_path):
@@ -522,13 +736,13 @@ def partial_download_file(url, pool, user_agents):
     final_path = url_to_local_path(url, PARTIAL_DOWNLOAD_DIR)
     os.makedirs(os.path.dirname(final_path), exist_ok=True)
 
-    # HEAD for size, on a single pooled proxy. A missing Content-Length is a
-    # server trait, not a proxy fault, so we don't mark the proxy dead here.
-    ua_head = random_user_agent(user_agents)
-    size = get_content_length(url, pool.acquire(), ua_head)
+    # Probe for the size on a single pooled proxy. A server that won't disclose one
+    # is a server trait, not a proxy fault, so we don't mark the proxy dead here.
+    ua_probe = random_user_agent(user_agents)
+    size = get_remote_file_size(url, pool.acquire(), ua_probe)
     if not size or size < 1:
-        logger.warning(f"No Content-Length for {url}, fallback to sequential.")
-        return fallback_sequential_download(url, final_path, ua_head, pool.acquire(), progress_queue=None)
+        logger.warning(f"Could not determine the size of {url}, fallback to sequential.")
+        return fallback_sequential_download(url, final_path, ua_probe, pool.acquire(), progress_queue=None)
 
     # Cap chunks at the proxy count, and don't split finer than
     # MIN_PARTIAL_CHUNK_SIZE. Guarantees 1 <= n_chunks <= size, so chunk_size is
@@ -686,32 +900,26 @@ def test_proxy_speed(url: str, proxy: str, ua) -> dict:
 
 def check_url_availability(url, proxy, ua=None, speed_bps=None):
     """
-    HEAD request to see if available; if size known and speed known, estimate ETA.
+    Probe the URL to see if it is available; if size and speed are known, estimate ETA.
     Returns (is_ok, size, eta_seconds).
+
+    Availability means "some probe got an answer", not "HEAD didn't raise": a server
+    that answers 405 to HEAD but serves the file happily was reported as unavailable
+    before, and its size was missed whenever it withheld Content-Length.
     """
-    proxies = make_proxies(proxy)
-    headers = {"User-Agent": ua} if ua else {}
-    try:
-        r = requests.head(url, proxies=proxies, timeout=REQUEST_TIMEOUT,
-                          verify=False, headers=headers)
-        r.raise_for_status()
-    except Exception as e:
-        logger.error(f"URL not available: {url}, err={e}")
+    probe = probe_remote_size(url, proxy, ua)
+    if not probe.reachable:
+        logger.error(f"URL not available: {url}, err={probe.error}")
         return (False, None, None)
-    cl_str = r.headers.get("Content-Length")
-    if not cl_str:
+    if probe.size is None:
         logger.info(f"URL available but no size info: {url}")
         return (True, None, None)
-    try:
-        size = int(cl_str)
-    except ValueError:
-        size = None
 
     eta_sec = None
-    if size and speed_bps and speed_bps > 0:
-        eta_sec = size / speed_bps
+    if speed_bps and speed_bps > 0:
+        eta_sec = probe.size / speed_bps
 
-    return (True, size, eta_sec)
+    return (True, probe.size, eta_sec)
 
 
 def speedtest_mode(urls, proxies):
@@ -1091,6 +1299,168 @@ def tree_mode(rv_args, proxies, retries=DEFAULT_RETRIES):
         transport.close()
 
 
+# =========== CRAWL ("Index of /") ===========
+
+# The crawler recursively harvests open directories on onion services. It lives in the
+# crawler/ package next to this script and is imported lazily, for the same reason
+# rvtree is: importing this module must stay side-effect free, and --farm has to keep
+# working on a host that lacks aiohttp.
+#
+# It is also the only asyncio code in the project. Every other mode is threads over
+# `requests`, and deliberately stays that way -- a crawl is thousands of small, slow,
+# failure-prone requests, which is the one workload where an event loop plus a queue is
+# clearly the better shape.
+CRAWLER_DIR = "crawler"
+
+
+def _import_crawler():
+    """Import the crawler package, or explain what is missing."""
+    try:
+        import crawler
+        return crawler
+    except ImportError as e:
+        logger.error(f"--mode crawl needs the crawler package and its dependencies "
+                     f"({e}). Install them with 'pip install -r requirements.txt' "
+                     f"(aiohttp, aiohttp-socks, beautifulsoup4, lxml).")
+        return None
+
+
+def crawler_default(name, fallback):
+    """A default from crawler.config, without making --help depend on aiohttp.
+
+    The argument parser is built before anything is imported lazily, and `--farm` must
+    keep working on a host with no crawler dependencies installed -- so a missing
+    package degrades to the documented fallback instead of killing --help.
+    """
+    try:
+        from crawler import config as crawl_config
+        return getattr(crawl_config, name, fallback)
+    except ImportError:
+        return fallback
+
+
+def parse_socks_list(value):
+    """Parse --socks 'host:port,host:port' into a list of endpoints."""
+    endpoints = []
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        host, _, port = item.rpartition(":")
+        if not host or not port.isdigit():
+            raise argparse.ArgumentTypeError(f"not a host:port SOCKS endpoint: {item!r}")
+        endpoints.append(item)
+    if not endpoints:
+        raise argparse.ArgumentTypeError("--socks needs at least one host:port")
+    return endpoints
+
+
+def resolve_crawl_endpoints(args, urls):
+    """SOCKS5 endpoints for crawl mode.
+
+    --socks wins outright and is checked but never second-guessed: it is how you point
+    the crawler at a Tor daemon this script does not manage (a personal client on 9050,
+    a remote SOCKS relay) without the farm tooling ever going near it.
+
+    Otherwise this behaves like tree mode rather than like the download modes: a live
+    probe of the farm range, then a single local client, then an error. The download
+    modes' fallback to the *fixed* BASE_PORT..+19 list is a reasonable bet when a Docker
+    setup might just be racing the probe, but a crawl issues thousands of requests and
+    would spend all of them timing out on twenty endpoints that were never there.
+    """
+    if args.socks:
+        live, dead = [], []
+        for endpoint in args.socks:
+            host, _, port = endpoint.rpartition(":")
+            (live if _port_is_open(host, int(port)) else dead).append(endpoint)
+        if dead:
+            logger.warning(f"--socks endpoints not accepting connections: {', '.join(dead)}")
+        if not live:
+            logger.error("None of the --socks endpoints are reachable.")
+        else:
+            logger.info(f"Using {len(live)} explicitly configured SOCKS endpoint(s).")
+        return live
+
+    if args.external:
+        return resolve_proxies(True, urls, test_url=args.test_url)
+
+    live = discover_local_socks_ports(base_port=args.base_port, max_ports=args.count)
+    if live:
+        logger.info(f"Discovered {len(live)} live local Tor SOCKS port(s) "
+                    f"({live[0]} - {live[-1]}).")
+        return live
+
+    host, port = LOCAL_TOR_SOCKS.rsplit(":", 1)
+    if _port_is_open(host, int(port)):
+        logger.warning(f"No farm on 127.0.0.1:{args.base_port}-"
+                       f"{args.base_port + args.count - 1}; falling back to the local Tor "
+                       f"client at {LOCAL_TOR_SOCKS}. One daemon still gives you "
+                       f"--circuits-per-endpoint isolated circuits, but a farm gives you "
+                       f"independent guards too: "
+                       f"'sudo python3 OnionAccelerator.py --farm up --count 8'.")
+        return [LOCAL_TOR_SOCKS]
+
+    logger.error(f"No SOCKS5 proxy found: nothing on 127.0.0.1:{args.base_port}-"
+                 f"{args.base_port + args.count - 1} and nothing on {LOCAL_TOR_SOCKS}. "
+                 f"Start a farm with 'sudo python3 OnionAccelerator.py --farm up', pass "
+                 f"--socks host:port, or pass --external.")
+    return []
+
+
+def crawl_mode(urls, proxies, args):
+    """Run one crawl, then optionally download everything it found. Returns an exit code."""
+    pkg = _import_crawler()
+    if pkg is None:
+        return 1
+
+    out_dir = os.path.join(pkg.config.CRAWLS_DIR, JOB_ID)
+    try:
+        config = pkg.CrawlConfig(
+            seeds=list(urls),
+            max_depth=args.max_depth,
+            order=args.order,
+            workers=args.workers,
+            circuits_per_endpoint=args.circuits_per_endpoint,
+            per_host=args.per_host,
+            retries=args.retries,
+            max_pages=args.max_pages,
+            time_budget=args.time_budget,
+            max_page_bytes=args.max_page_bytes,
+            allow_offsite=args.allow_offsite,
+            include=pkg.CrawlConfig.compile_filter(args.include),
+            exclude=pkg.CrawlConfig.compile_filter(args.exclude),
+            switch_after=args.switch_after,
+            download=args.download,
+            out_dir=out_dir,
+            job_id=JOB_ID,
+        )
+    except re.error as e:
+        logger.error(f"Bad --include/--exclude regex: {e}")
+        return 1
+
+    stats, file_urls = pkg.crawl(config, proxies, load_user_agents())
+    logger.info(f"Crawl manifest: {os.path.abspath(out_dir)} "
+                f"({len(file_urls)} file URL(s) in {pkg.config.URLS_FILE})")
+
+    if not args.download:
+        if file_urls:
+            logger.info(f"Feed them to a download run with: cp "
+                        f"{os.path.join(out_dir, pkg.config.URLS_FILE)} {URLS_FILE} && "
+                        f"python3 OnionAccelerator.py --mode multi")
+        return 0 if stats["totals"]["directories"] else 1
+
+    if not file_urls:
+        logger.warning("--download was given but the crawl found no files.")
+        return 0
+
+    # A separate, sequential phase on purpose: the download stack is threads over
+    # `requests`, and running it alongside the event loop would put two unrelated
+    # concurrency models on the same Tor daemons at the same time.
+    logger.info(f"Downloading {len(file_urls)} discovered file(s) into {DOWNLOAD_DIR}/ ...")
+    multi_download_mode(file_urls, proxies, retries=args.retries, preserve_path=True)
+    return 0
+
+
 # =========== MAIN ===========
 
 def main():
@@ -1101,11 +1471,14 @@ def main():
         description="OnionAccelerator: multi/partial download with Tor proxies, plus "
                     "speedtest & availability check, and a native Tor-instance farm."
     )
-    parser.add_argument("--mode", choices=["multi", "partial", "speedtest", "tree"], default=None,
-                        help="Download mode: multi, partial, speedtest, or tree. 'tree' "
+    parser.add_argument("--mode", choices=["multi", "partial", "speedtest", "tree", "crawl"],
+                        default=None,
+                        help="Mode: multi, partial, speedtest, tree, or crawl. 'tree' "
                              "lists/extracts members of a huge remote archive over the "
                              "proxy pool without downloading it; everything after '--' is "
-                             "passed to rvtree. Mutually exclusive with --farm.")
+                             "passed to rvtree. 'crawl' recursively harvests 'Index of /' "
+                             "open directories starting from the URLs in URLs.txt. "
+                             "Mutually exclusive with --farm.")
     parser.add_argument("--farm", choices=["up", "status", "down", "destroy"], default=None,
                         help="Manage a native Tor-instance farm (tor-instance-create + "
                              "systemd, no Docker): 'up' creates/starts/bootstraps "
@@ -1133,6 +1506,61 @@ def main():
                              "it at an endpoint you control/trust so real target URLs "
                              "are never revealed to proxies that get discarded. If "
                              "unset, a random URL from URLs.txt is used instead.")
+
+    crawl_opts = parser.add_argument_group(
+        "crawl mode", "Options for --mode crawl (ignored by the other modes)."
+    )
+    crawl_opts.add_argument("--socks", type=parse_socks_list, default=None,
+                            help="Comma-separated 'host:port' SOCKS5 endpoints to crawl "
+                                 "through, e.g. '127.0.0.1:9050,127.0.0.1:9052'. "
+                                 "Overrides farm discovery and --external. Use this to "
+                                 "point the crawler at Tor daemons this script does not "
+                                 "manage; the --farm tooling never touches them.")
+    crawl_opts.add_argument("--max-depth", type=int,
+                            default=crawler_default("DEFAULT_MAX_DEPTH", 5),
+                            help="How many directory levels below each seed to crawl "
+                                 "(default 5). Seeds are depth 0.")
+    crawl_opts.add_argument("--order", choices=["bfs", "dfs"], default="bfs",
+                            help="Traversal order: breadth-first (default) maps the whole "
+                                 "tree shallow-first; depth-first finishes branches.")
+    crawl_opts.add_argument("--switch-after", type=int, default=None,
+                            help="Switch traversal order once N directories have been "
+                                 "listed. Maps the shape of the tree breadth-first, then "
+                                 "dives.")
+    crawl_opts.add_argument("--workers", type=int, default=None,
+                            help="Concurrent workers (default: one per circuit). Capped "
+                                 "at the circuit count -- extra workers would only queue.")
+    crawl_opts.add_argument("--circuits-per-endpoint", type=int,
+                            default=crawler_default("DEFAULT_CIRCUITS_PER_ENDPOINT", 2),
+                            help="Isolated Tor circuits to open per SOCKS endpoint "
+                                 "(default 2). Each gets its own SOCKS credential, which "
+                                 "is what makes them separate circuits rather than one "
+                                 "shared one.")
+    crawl_opts.add_argument("--per-host", type=int,
+                            default=crawler_default("DEFAULT_PER_HOST", 8),
+                            help="Maximum concurrent requests against any single target "
+                                 "host (default 8). Onion services are usually one small "
+                                 "process; past this they start refusing connections.")
+    crawl_opts.add_argument("--max-pages", type=int, default=None,
+                            help="Stop after listing this many directories.")
+    crawl_opts.add_argument("--time-budget", type=float, default=None,
+                            help="Stop after this many seconds and write the report.")
+    crawl_opts.add_argument("--max-page-bytes", type=int,
+                            default=crawler_default("MAX_PAGE_BYTES", 4 * 1024 * 1024),
+                            help="Abandon a body larger than this instead of parsing it; "
+                                 "the URL is recorded as a file (default 4 MiB).")
+    crawl_opts.add_argument("--include", default=None,
+                            help="Only crawl directory URLs matching this regex.")
+    crawl_opts.add_argument("--exclude", default=None,
+                            help="Never crawl directory URLs matching this regex.")
+    crawl_opts.add_argument("--allow-offsite", action="store_true",
+                            help="Follow links off the seed hosts. Off by default: on Tor "
+                                 "this is how a directory walk becomes an unbounded crawl.")
+    crawl_opts.add_argument("--download", action="store_true",
+                            help="After crawling, download every discovered file through "
+                                 "the same proxies, mirroring the remote directory tree "
+                                 f"under {DOWNLOAD_DIR}/<host>/.")
+
     # Everything after '--' belongs to rvtree, so unknown arguments are collected rather
     # than rejected. Only tree mode may have any; for every other mode a stray argument
     # is still a typo and still an error.
@@ -1169,6 +1597,7 @@ def main():
         logger.error(f"{URLS_FILE} not found.")
         sys.exit(1)
 
+
     with open(URLS_FILE, "r", encoding="utf-8") as f:
         urls = [line.strip() for line in f if line.strip()]
 
@@ -1177,6 +1606,19 @@ def main():
         sys.exit(0)
 
     logger.info(f"Mode={args.mode}, total URLs={len(urls)}, job_id={JOB_ID}")
+
+    # Crawl resolves its own endpoints: --socks may override, and its fallback ladder
+    # differs from the download modes' (see resolve_crawl_endpoints).
+    if args.mode == "crawl":
+        proxies = resolve_crawl_endpoints(args, urls)
+        if not proxies:
+            logger.error("No usable proxies available. Aborting.")
+            sys.exit(1)
+        logger.info(f"Using {len(proxies)} SOCKS endpoint(s) x "
+                    f"{args.circuits_per_endpoint} circuit(s).")
+        code = crawl_mode(urls, proxies, args)
+        logger.info(f"OnionAccelerator crawl mode finished (exit {code}).")
+        sys.exit(code)
 
     proxies = resolve_proxies(args.external, urls, test_url=args.test_url)
     if not proxies:
