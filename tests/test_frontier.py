@@ -209,6 +209,19 @@ async def test_depth_cap():
 
 
 @async_test
+async def test_no_depth_cap_when_unlimited():
+    """max_depth=None is the default: crawl the whole tree, however deep.
+
+    Termination then rests on deduplication and the crawl's other brakes, not on a level
+    limit -- an arbitrarily deep but finite directory must still be fully accepted.
+    """
+    frontier = make_frontier(max_depth=None)
+    deep = SEED + "a/b/c/d/e/f/g/h/i/j/"
+    assert await frontier.add(deep, depth=10)
+    assert await frontier.add(SEED + "a/b/c/d/e/f/g/h/i/j/k/l/", depth=12)
+
+
+@async_test
 async def test_scope_is_the_seed_directory():
     frontier = make_frontier()
     assert not await frontier.add("http://examplexyz.onion/other/", depth=1)

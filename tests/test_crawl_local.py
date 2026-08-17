@@ -173,6 +173,26 @@ def test_max_pages_stops_the_crawl(tree, tmp_path):
     assert stats["totals"]["directories"] >= 3
 
 
+def test_unlimited_depth_walks_a_finite_tree_to_the_bottom(tree, tmp_path):
+    """max_depth=None is the default: no level cap, termination by exhausting the tree.
+
+    Depth no longer bounds the crawl -- deduplication and the tree simply running out
+    do. The deepest file, buried three levels down, must still be reached, and the run
+    must end on its own rather than needing a brake. (A *symlink loop* would not stop
+    here; that is what test_depth_cap_stops_the_symlink_loop covers, and why --max-depth
+    still exists.)
+    """
+    out = str(tmp_path / "out")
+    with IndexServer(tree) as server:
+        stats, urls = crawl(server.base_url, out, max_depth=None)
+
+    assert sorted(os.path.basename(u) for u in urls) == [
+        "buried.txt", "readme.txt", "readme.txt", "top.bin",
+    ]
+    assert stats["stopped_because"] == "completed"
+    assert stats["config"]["max_depth"] is None
+
+
 def test_exclude_keeps_a_subtree_out(tree, tmp_path):
     out = str(tmp_path / "out")
     with IndexServer(tree) as server:
