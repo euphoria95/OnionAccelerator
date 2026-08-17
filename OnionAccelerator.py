@@ -26,6 +26,11 @@ requests.packages.urllib3.disable_warnings(category=InsecureRequestWarning)
 from tqdm import tqdm
 import logging
 
+# The --full-help reference. Kept out of this file because it is 300 lines of prose, and
+# imported eagerly because it is pure stdlib with no side effects -- unlike crawler/ and
+# remote_viewer/, it can never make --help fail on a host missing a dependency.
+import fullhelp
+
 # ================== GLOBAL CONFIG ==================
 MAX_WORKERS = 20              # e.g. ports 5000..5019
 BASE_PORT = 5000
@@ -1364,6 +1369,11 @@ def run_farm_action(action, count, base_port, timeout):
 # Tor daemons (or an --external list) gives it real parallelism. Its own default is a
 # single daemon, which is what made a 2.4 GB listing take two hours.
 RVTREE_DIR = "remote_viewer"
+# rvtree's subcommands, mirrored rather than imported: --url has to know where rvtree
+# expects its URL positional, and working that out must not drag httpx into a run that
+# only wants --help. tests/test_cli.py reads rvtree's own MODES out of its source and
+# fails if the two ever disagree.
+TREE_SUBCOMMANDS = ("list", "extract", "probe")
 TREE_CIRCUITS_PER_ENDPOINT = 1
 TREE_HEDGE = 3                 # copies of a small range raced across endpoints
 LOCAL_TOR_SOCKS = "127.0.0.1:9150"   # a personal Tor client, used when no farm is up
@@ -1389,9 +1399,38 @@ def tree_urls(rv_args):
     """The URLs in the passed-through rvtree arguments.
 
     Only used as the last-resort target for the external-proxy liveness check, which is
-    why --test-url exists: see the warning resolve_proxies() emits.
+    why --test-url exists: see the warning resolve_proxies() emits. Deliberately crude: it
+    will happily return the value of rvtree's own '--proxy socks5://...', which costs
+    nothing when all you need is something to ping. Use rv_target_urls() instead wherever
+    being wrong would cost the user an error message.
     """
     return [a for a in rv_args if "://" in a]
+
+
+def rv_target_urls(rv_args):
+    """The URLs rvtree would read as its *positional* target, ignoring option values.
+
+    tree_urls() cannot be used to decide whether --url collides with an inline URL: it
+    matches 'socks5://127.0.0.1:9050' after --proxy just as readily as the archive, and
+    would reject a perfectly good command line. So skip anything that looks like an
+    option, and anything sitting in an option's value slot.
+
+    Boolean flags ('--force', '-v') make this under-detect, since the URL after one sits
+    in what looks like a value slot. That is the safe direction: under-detecting hands
+    rvtree an extra positional and it says so plainly, while over-detecting would reject
+    a command line that was fine.
+    """
+    urls = []
+    previous = None
+    for arg in rv_args[1:]:            # rv_args[0] is the subcommand
+        is_option = arg.startswith("-")
+        # A value slot: the previous token was an option and did not carry its own '='.
+        in_value_slot = (previous is not None and previous.startswith("-")
+                         and previous != "--" and "=" not in previous)
+        if not is_option and not in_value_slot and "://" in arg:
+            urls.append(arg)
+        previous = arg
+    return urls
 
 
 def resolve_tree_endpoints(args, urls):
@@ -1521,6 +1560,37 @@ def parse_socks_list(value):
     return endpoints
 
 
+def parse_url(value):
+    """Validate one --url. A scheme is required, and the reason is not pedantry.
+
+    A bare 'example.onion/a.iso' would be handed to requests, which rejects it -- but not
+    before resolve_proxies() may have picked it as the --external liveness target and
+    published it to a hundred third-party proxies. Cheaper to refuse it here.
+    """
+    value = value.strip()
+    if "://" not in value:
+        raise argparse.ArgumentTypeError(
+            f"not a URL, no scheme: {value!r} (try 'http://{value}')")
+    return value
+
+
+class _FullHelpAction(argparse.Action):
+    """--full-help [MODE]: print the long-form reference and exit.
+
+    An action rather than a flag checked in main(), so it fires during parsing and works
+    on its own -- without --mode or --farm, which main() would otherwise insist on.
+    """
+
+    def __init__(self, option_strings, dest, **kwargs):
+        kwargs.setdefault("nargs", "?")
+        kwargs.setdefault("default", None)
+        super().__init__(option_strings, dest, **kwargs)
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        sys.stdout.write(fullhelp.render(values))
+        parser.exit(0)
+
+
 def resolve_crawl_endpoints(args, urls):
     """SOCKS5 endpoints for crawl mode.
 
@@ -1629,24 +1699,41 @@ def crawl_mode(urls, proxies, args):
     return 0
 
 
-# =========== MAIN ===========
+# =========== COMMAND LINE ===========
 
-def main():
-    setup_logging()
-    logger.info(f"Starting OnionAccelerator with job_id={JOB_ID}")
+def build_parser():
+    """The argument parser, built without side effects so tests can read it.
 
+    Separate from main() for the reason rvtree's build_parser() is: a parser that can
+    only be reached by running the program is a parser whose help nobody can test, and a
+    reference that drifts is worse than none.
+    """
     parser = argparse.ArgumentParser(
         description="OnionAccelerator: multi/partial download with Tor proxies, plus "
-                    "speedtest & availability check, and a native Tor-instance farm."
+                    "speedtest & availability check, and a native Tor-instance farm.",
+        epilog="Run --full-help for the per-mode reference: what each mode does, which "
+               "of these flags actually reach it, and worked examples. "
+               "--full-help MODE narrows it to one."
     )
-    parser.add_argument("--mode", choices=["multi", "partial", "speedtest", "tree", "crawl"],
-                        default=None,
+    parser.add_argument("--mode", choices=list(fullhelp.MODES), default=None,
                         help="Mode: multi, partial, speedtest, tree, or crawl. 'tree' "
                              "lists/extracts members of a huge remote archive over the "
                              "proxy pool without downloading it; everything after '--' is "
                              "passed to rvtree. 'crawl' recursively harvests 'Index of /' "
-                             "open directories starting from the URLs in URLs.txt. "
+                             "open directories starting from the seed URLs. "
                              "Mutually exclusive with --farm.")
+    parser.add_argument("--full-help", action=_FullHelpAction, metavar="MODE",
+                        choices=list(fullhelp.TOPICS),
+                        help="Print the long-form per-mode reference and exit. Give a "
+                             f"mode name ({', '.join(fullhelp.TOPICS)}) to print just "
+                             f"that section.")
+    parser.add_argument("--url", action="append", type=parse_url, default=None,
+                        metavar="URL",
+                        help="A target URL, given here instead of in URLs.txt. Repeat it "
+                             "for several. When --url is given at least once it replaces "
+                             "the file entirely: URLs.txt is not read and need not exist. "
+                             "Under --mode tree it becomes rvtree's URL argument, so "
+                             "'--url X -- extract p' runs 'extract X p'.")
     parser.add_argument("--farm", choices=["up", "status", "down", "destroy"], default=None,
                         help="Manage a native Tor-instance farm (tor-instance-create + "
                              "systemd, no Docker): 'up' creates/starts/bootstraps "
@@ -1681,7 +1768,7 @@ def main():
                              "(overrides the PROXY_TEST_URL config constant). Point "
                              "it at an endpoint you control/trust so real target URLs "
                              "are never revealed to proxies that get discarded. If "
-                             "unset, a random URL from URLs.txt is used instead.")
+                             "unset, a random one of your own targets is used instead.")
 
     crawl_opts = parser.add_argument_group(
         "crawl mode", "Options for --mode crawl (ignored by the other modes)."
@@ -1741,11 +1828,77 @@ def main():
                             help="After crawling, download every discovered file through "
                                  "the same proxies, mirroring the remote directory tree "
                                  f"under {DOWNLOAD_DIR}/<host>/.")
+    return parser
+
+
+def resolve_urls(args):
+    """The URLs for this run: --url if given, otherwise every line of URLs.txt.
+
+    --url wins outright rather than adding to the file. Merging would mean a stale list
+    left over from the last job silently rides along with the one URL you meant to fetch,
+    and on Tor that is a lot of traffic you did not ask for.
+    """
+    if args.url:
+        return list(args.url)
+
+    if not os.path.exists(URLS_FILE):
+        logger.error(f"{URLS_FILE} not found. Pass targets with --url instead, e.g. "
+                     f"--url https://example.onion/file.bin")
+        sys.exit(1)
+
+    with open(URLS_FILE, "r", encoding="utf-8") as f:
+        urls = [line.strip() for line in f if line.strip()]
+
+    if not urls:
+        logger.warning(f"{URLS_FILE} is empty. Nothing to do.")
+        sys.exit(0)
+    return urls
+
+
+def inject_tree_url(parser, args, rv_args):
+    """Put --url where rvtree expects its URL: as the positional after the subcommand.
+
+    rvtree takes 'list URL', 'extract URL PATH' and 'probe URL', so appending would put
+    extract's URL and PATH the wrong way round. Every rvtree option lives on the
+    subcommands rather than the top-level parser, so the subcommand is always rv_args[0]
+    and no searching is needed.
+    """
+    if not args.url:
+        return rv_args
+
+    if len(args.url) > 1:
+        parser.error(f"--mode tree reads one archive per run; --url was given "
+                     f"{len(args.url)} times")
+    inline = rv_target_urls(rv_args)
+    if inline:
+        parser.error(f"URL given twice: --url {args.url[0]} and {inline[0]} after '--'")
+
+    url = args.url[0]
+    if not rv_args:
+        # The common case deserves the short spelling: 'what is in this archive?'
+        return ["list", url]
+    if rv_args[0] not in TREE_SUBCOMMANDS:
+        parser.error(f"--mode tree: the first argument after '--' must be one of "
+                     f"{', '.join(TREE_SUBCOMMANDS)}, not {rv_args[0]!r}")
+    return [rv_args[0], url] + rv_args[1:]
+
+
+# =========== MAIN ===========
+
+def main(argv=None):
+    parser = build_parser()
 
     # Everything after '--' belongs to rvtree, so unknown arguments are collected rather
     # than rejected. Only tree mode may have any; for every other mode a stray argument
     # is still a typo and still an error.
-    args, rv_args = parser.parse_known_args()
+    #
+    # Parsing comes before setup_logging() so that --help and --full-help do not create a
+    # timestamped log file for a run that never happens. Nothing below logs before it.
+    args, rv_args = parser.parse_known_args(argv)
+
+    setup_logging()
+    logger.info(f"Starting OnionAccelerator with job_id={JOB_ID}")
+
     # argparse only consumes '--' when it has positionals to feed; this parser has none,
     # so the separator survives into the leftovers and would reach rvtree as a mode name.
     if "--" in rv_args:
@@ -1756,17 +1909,25 @@ def main():
     if bool(args.farm) == bool(args.mode):
         parser.error("specify exactly one of --farm or --mode")
 
+    if args.farm and args.url:
+        parser.error("--url has no meaning for --farm; it manages proxies, not targets")
+
     # Farm management needs no URL list; run the action and exit.
     if args.farm:
         run_farm_action(args.farm, args.count, args.base_port, args.bootstrap_timeout)
         logger.info("OnionAccelerator farm action finished.")
         return
 
-    # Tree mode takes its target from the passed-through arguments, not from URLs.txt.
+    # Tree mode takes its target from --url or the passed-through arguments, never from
+    # URLs.txt. Injection happens before the emptiness check, so '--url X' alone is a
+    # complete command line, and before resolve_tree_endpoints(), so --external still has
+    # a liveness target to fall back on.
     if args.mode == "tree":
+        rv_args = inject_tree_url(parser, args, rv_args)
         if not rv_args:
-            parser.error("--mode tree needs rvtree arguments after '--', e.g. "
-                         "--mode tree -- list https://example.onion/backup.rar")
+            parser.error("--mode tree needs a target: either --url, e.g. "
+                         "--mode tree --url https://example.onion/backup.rar, or rvtree "
+                         "arguments after '--', e.g. -- list https://example.onion/b.rar")
         proxies = resolve_tree_endpoints(args, tree_urls(rv_args))
         if not proxies:
             sys.exit(1)
@@ -1774,19 +1935,10 @@ def main():
         logger.info(f"OnionAccelerator tree mode finished (exit {code}).")
         sys.exit(code)
 
-    if not os.path.exists(URLS_FILE):
-        logger.error(f"{URLS_FILE} not found.")
-        sys.exit(1)
-
-
-    with open(URLS_FILE, "r", encoding="utf-8") as f:
-        urls = [line.strip() for line in f if line.strip()]
-
-    if not urls:
-        logger.warning(f"{URLS_FILE} is empty. Nothing to do.")
-        sys.exit(0)
-
-    logger.info(f"Mode={args.mode}, total URLs={len(urls)}, job_id={JOB_ID}")
+    urls = resolve_urls(args)
+    source = "--url" if args.url else URLS_FILE
+    logger.info(f"Mode={args.mode}, total URLs={len(urls)} (from {source}), "
+                f"job_id={JOB_ID}")
 
     # Crawl resolves its own endpoints: --socks may override, and its fallback ladder
     # differs from the download modes' (see resolve_crawl_endpoints).
