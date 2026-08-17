@@ -18,7 +18,13 @@ import os
 import pytest
 
 from crawler.indexparse import parse_index, score_index, _parse_size
-from crawler.urlnorm import is_parent_dir
+from crawler.urlnorm import (
+    dedup_key,
+    is_parent_dir,
+    is_within,
+    match_segments,
+    path_segments,
+)
 
 # A custom file-manager autoindex: no "Index of" title, no server <address> footer, a
 # search <form> on every page, Apache-style column-sort links, and a "Parent directory"
@@ -38,6 +44,30 @@ FILEMANAGER_ONE_ENTRY = (
     '</tbody></table></body></html>'
 )
 FILEMANAGER_BASE = "http://examplexyz.onion/r/fm/TOK/IT"      # note: no trailing slash
+
+# The same file manager one level further down, where it stops spelling paths with
+# slashes. The route takes the relative path as a parameter, so from the second level
+# the separator is percent-encoded into a single segment -- while the up-link keeps the
+# real ones, leaving the page's own URL and its parent's encoded differently.
+FILEMANAGER_ENCODED = (
+    '<html><head><meta charset="utf-8"></head><body>'
+    '<form action="/r/fm/TOK/search" method="get"><input name="search"></form>'
+    '<table><thead><tr>'
+    '<th><a href="?C=N&O=A">Name</a><a href="?C=N&O=D">down</a></th>'
+    '<th><a href="?C=S&O=A">Size</a><a href="?C=S&O=D">down</a></th>'
+    '</tr></thead><tbody>'
+    '<tr><td><a href="/r/fm/TOK/dumps">Parent directory/</a></td><td>-</td></tr>'
+    '<tr><td><a href="/r/fm/TOK/dumps%2Fraw/nested">'
+    '<img src="/static/icons/folder.svg">nested</a></td><td>-</td></tr>'
+    '<tr><td><a href="/r/fm/TOK/dumps%2Fraw/part.bin">part.bin</a></td><td>271K</td></tr>'
+    '</tbody></table></body></html>'
+)
+# The two ways the very same page is addressed: the parent lists it with a separator,
+# its own children fold that separator away. Both have to parse identically.
+FILEMANAGER_ENCODED_BASES = (
+    "http://examplexyz.onion/r/fm/TOK/dumps/raw",
+    "http://examplexyz.onion/r/fm/TOK/dumps%2Fraw",
+)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LISTINGS = os.path.join(HERE, "fixtures", "listings")
@@ -261,6 +291,123 @@ def test_is_parent_dir_is_segment_aligned():
     assert not is_parent_dir("http://h.onion/rules", "http://h.onion/files/sub/")
     # Cross-host never counts.
     assert not is_parent_dir("http://other.onion/a/", "http://h.onion/a/b/")
+
+
+# ------------------------------------------------- the encoded-separator file manager
+
+
+@pytest.mark.parametrize("base", FILEMANAGER_ENCODED_BASES)
+def test_encoded_separators_are_still_this_directory_s_children(base):
+    """Children whose parent path is encoded into one segment are entries, not junk.
+
+    Compared as raw text, `/r/fm/TOK/dumps%2Fraw/nested` is a directory named
+    "dumps/raw" -- not below the page listing it, so the scope rule throws it away with
+    the breadcrumbs. Every link on the page goes the same way, the page parses as empty,
+    and the crawl stops at the level above with no error anywhere. The scope test has to
+    read the path the way the server wrote it.
+    """
+    listing = parse_index(FILEMANAGER_ENCODED, base)
+
+    assert [e.name for e in listing.directories] == ["nested"]
+    assert [e.name for e in listing.files] == ["part.bin"]
+    assert listing.is_index, f"scored only {listing.confidence}"
+
+
+def test_the_parent_link_survives_the_encoding_too():
+    """The up-link is spelled with real separators; the page's own URL is not.
+
+    Segment counting on the raw text makes `/r/fm/TOK/dumps/raw` look like a *sibling*
+    of the page at `/r/fm/TOK/dumps%2Fraw` rather than its parent, and the strongest
+    signal a file-manager listing carries is lost exactly where it is needed most.
+    """
+    encoded, decoded = FILEMANAGER_ENCODED_BASES[1], FILEMANAGER_ENCODED_BASES[0]
+    assert is_parent_dir("http://examplexyz.onion/r/fm/TOK/dumps", encoded)
+    assert is_parent_dir("http://examplexyz.onion/r/fm/TOK/dumps", decoded)
+
+    listing = parse_index(FILEMANAGER_ENCODED, encoded)
+    urls = {e.url for e in listing.directories} | {e.url for e in listing.files}
+    assert "http://examplexyz.onion/r/fm/TOK/dumps" not in urls
+
+
+def test_a_slash_less_self_link_is_not_an_entry():
+    """A page linking its own URL is a breadcrumb's last element, not a subdirectory.
+
+    Worth its own case because `base` has already been collapsed to the parent by the
+    time the link is classified, so the self-link and the page do not compare equal as
+    strings.
+    """
+    page = FILEMANAGER_ENCODED.replace(
+        '<tr><td><a href="/r/fm/TOK/dumps">Parent directory/</a></td><td>-</td></tr>',
+        '<tr><td><a href="/r/fm/TOK/dumps">dumps</a>'
+        '<a href="/r/fm/TOK/dumps%2Fraw">raw</a></td><td>-</td></tr>',
+    )
+    listing = parse_index(page, FILEMANAGER_ENCODED_BASES[0])
+    assert {e.name for e in listing.directories} == {"nested"}
+    assert "raw" not in {e.name for e in listing.directories}
+
+
+def test_one_directory_spelled_two_ways_by_the_same_server():
+    """`Q1+2019` in the URL, `Q1%202019` in that page's own up-link. One directory.
+
+    An application that encodes the path as a route parameter does not encode it the
+    same way in every link it emits, and a strict reading turns the up-link into a
+    stranger. On the crawl this was found in, that alone skipped 834 pages: each lost
+    its only positive index signal, scored 0.30, and was written off as a leaf.
+    """
+    page = FILEMANAGER_ENCODED.replace("dumps", "Q1+2019").replace(
+        '<a href="/r/fm/TOK/Q1+2019">', '<a href="/r/fm/TOK/Q1%202019">')
+    base = "http://examplexyz.onion/r/fm/TOK/Q1+2019%2FLCC"
+
+    assert is_parent_dir("http://examplexyz.onion/r/fm/TOK/Q1%202019", base)
+    listing = parse_index(page, base)
+    assert listing.is_index, f"scored only {listing.confidence}"
+    assert [e.name for e in listing.directories] == ["nested"]
+
+
+def test_the_faithful_reading_keeps_a_literal_plus():
+    """What gets written down is the path as it is, not as a comparison reads it.
+
+    match_segments() folds `+` to a space so the spellings above meet; path_segments()
+    must not, or a file genuinely named `C++ notes.txt` is recorded under a name it does
+    not have -- and the manifest is evidence.
+    """
+    url = "http://examplexyz.onion/pub/C%2B%2B%20notes.txt"
+    assert path_segments(url) == ["pub", "C++ notes.txt"]
+    assert match_segments(url) == ["pub", "C++ notes.txt"]
+    assert path_segments("http://examplexyz.onion/pub/a+b") == ["pub", "a+b"]
+    assert match_segments("http://examplexyz.onion/pub/a+b") == ["pub", "a b"]
+
+
+def test_is_within_reads_the_tree_not_the_text():
+    """Scope is a question about the tree, so it is asked of the decoded path."""
+    seed = "http://examplexyz.onion/r/fm/TOK/"
+    assert is_within(seed, "http://examplexyz.onion/r/fm/TOK/dumps%2Fraw/part.bin")
+    assert is_within("http://examplexyz.onion/r/fm/TOK/dumps/",
+                     "http://examplexyz.onion/r/fm/TOK/dumps%2Fraw/part.bin")
+    # Out of the subtree even though the raw text shares its prefix.
+    assert not is_within("http://examplexyz.onion/r/fm/TOK/dumps/",
+                         "http://examplexyz.onion/r/fm/TOK/dumpsx%2FLCC/part.bin")
+    assert not is_within(seed, "http://examplexyz.onion/r/fm/OTHER%2Fx")
+
+
+def test_dedup_key_folds_the_spellings_of_one_directory():
+    """One directory, three spellings, one key -- or its subtree is crawled twice."""
+    keys = {dedup_key(u) for u in (
+        "http://examplexyz.onion/r/fm/TOK/dumps%2Fraw",
+        "http://examplexyz.onion/r/fm/TOK/dumps/raw",
+        "http://examplexyz.onion/r/fm/TOK/dumps/raw/",
+    )}
+    assert len(keys) == 1
+    # ...but a query really is a different page, and stays one.
+    assert dedup_key("http://examplexyz.onion/a?p=1") != dedup_key("http://examplexyz.onion/a?p=2")
+
+
+def test_path_segments_splits_an_encoded_separator():
+    """The tree, the depth and the on-disk mirror all come from this one function."""
+    assert path_segments("http://examplexyz.onion/r/fm/TOK/dumps%2Fraw/part.bin") == [
+        "r", "fm", "TOK", "dumps", "raw", "part.bin",
+    ]
+    assert path_segments("http://examplexyz.onion/a/b%20c/d") == ["a", "b c", "d"]
 
 
 def test_score_index_counts_the_parent_link():

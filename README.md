@@ -37,6 +37,9 @@ OnionAccelerator is a multi-functional Python script designed for discovering an
   lighttpd, Caddy, hand-rolled templates and nginx's JSON autoindex all come out as the
   same `directories` / `files` split, because the filtering is structural rather than
   template-matched (see **Open-Directory Crawl** below).
+- Also walks the **file managers** leak sites run, which serve a whole tree from one
+  route and encode the path into it — `/r/filemanager/TOK/dumps%2Fraw/part.bin` — rather
+  than serving the tree at its own paths.
 - Spreads its requests across **many Tor circuits at once** — every SOCKS endpoint × N
   credential-isolated circuits — with per-endpoint failover, circuit rotation and
   exponential backoff for the timeouts, 503s and dropped circuits that Tor guarantees.
@@ -267,9 +270,13 @@ JSON and produce identical entries.
 
 Before recursing, each page is scored on whether it *is* an index: an "Index of" title, a
 server `<address>` footer, column-sort links, a **parent-directory up-link**, an in-scope
-link ratio, and the absence of forms. Below `0.5` it is recorded as a leaf and never
-expanded — the guard that stops a directory walk from turning into an unbounded crawl of
-somebody's forum over Tor. Skips are logged with their score.
+link ratio, and the absence of forms. Below `0.5` it is never expanded — the guard that
+stops a directory walk from turning into an unbounded crawl of somebody's forum over Tor.
+Such a page is written to `dirs.jsonl` with the score that disqualified it, and is
+deliberately *not* written to the file manifest: it was queued because a listing put it in
+its directory column, and answering with HTML does not make it a file. Recording it as one
+would put a directory into `urls.txt`, where `--download` fetches its markup and saves that
+under the directory's name.
 
 The parent-directory up-link (`../` / "Parent Directory", matched structurally as a link
 to the page's immediate parent) carries real weight because it is the one signal a
@@ -279,6 +286,36 @@ scores below the bar the moment a directory holds only a single file or subdirec
 that directory is wrongly abandoned as a leaf, silently pruning whatever is beneath it. An
 application does not gain from the signal: only a link to the *immediate*, segment-aligned
 parent counts, so stray "up" links to `/` or a sibling section do not fire it.
+
+### Paths, as the server spells them
+
+An autoindex serves a tree at the tree's own paths. A **file manager** — the shape leak
+sites run — serves the whole tree from one route and passes the path as a parameter, which
+it then encodes differently in different links:
+
+```
+/r/filemanager/TOK/dumps/raw              the page, served at its own URL
+/r/filemanager/TOK/dumps%2Fraw/part.bin   a child, with the separator folded away
+/r/filemanager/TOK/Q1%202019/photos       an up-link — the page itself is at Q1+2019
+```
+
+Read as raw path text, `dumps%2Fraw` is one directory named "dumps/raw" — below neither
+the page that linked it nor the crawl's scope root. So every link on every page below the
+first nested level is discarded as off-tree navigation, and the crawl stops two levels
+down having reported success. On the onion this was found on it returned **418 files**
+where the site's own index lists 86,992, with no error anywhere in the log. The `%20`/`+`
+mismatch is the same failure a level quieter: the up-link stops looking like a parent, so
+a directory whose only positive signal was that link scores 0.30 and is written off.
+
+So every scope, parent, self-link and deduplication test in the crawler reads the path
+through **one** function, which decodes it *before* splitting on `/` and reads `+` as the
+space a form-style encoder meant by it. What gets fetched is untouched — `%2F` goes back
+out on the wire exactly as the server published it — and what gets *written down* uses the
+strict reading, so a file genuinely named `C++ notes.txt` is recorded under its own name.
+Deduplication is on the decoded identity, so a directory reachable both ways costs one
+crawl of that subtree rather than two. `--download`'s mirror under `downloads/<host>/`
+reads paths the same way, so a folded segment lands as the directories it stands for
+instead of as one directory named `dumps_raw` beside the `dumps` its siblings went into.
 
 ### Concurrency: circuits, not just threads
 
@@ -330,7 +367,7 @@ Everything lands in `crawls/<job_id>/` (gitignored):
 | File | Contents |
 |---|---|
 | `listing.jsonl` | one record per file: `url, host, path, name, size_bytes, mtime_text, depth, parent, http_status, content_type, endpoint, discovered_at` |
-| `dirs.jsonl` | one per directory: `url, depth, parent, status, n_dirs, n_files, is_index, confidence, server, title, elapsed_ms, attempts, endpoint` |
+| `dirs.jsonl` | one per directory: `url, depth, parent, status, n_dirs, n_files, is_index, confidence, server, title, elapsed_ms, attempts, endpoint`. `is_index: false` marks a page that was read and refused by the confidence guard |
 | `failed.jsonl` | `url, depth, attempts, status, verdict, error, endpoint, final` (`final` marks the attempt that exhausted `--retries`) |
 | `stats.json` | totals, per-layer counts, per-endpoint throughput and failures, wall time, why it stopped |
 | `tree.txt` | the tree, rendered for eyeballing |

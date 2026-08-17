@@ -38,7 +38,14 @@ except ImportError:  # pragma: no cover
         """Stand-in for older bs4 releases that don't define it."""
 
 from .config import INDEX_CONFIDENCE_THRESHOLD, JUNK_LINK_TEXT
-from .urlnorm import basename, dir_url, is_parent_dir, is_within, normalize_url
+from .urlnorm import (
+    basename,
+    dir_url,
+    is_parent_dir,
+    is_same_dir,
+    is_within,
+    normalize_url,
+)
 
 logger = logging.getLogger("OnionAccelerator.crawl.parse")
 
@@ -318,9 +325,6 @@ def _classify_href(
     # an entry: sorting, view switching, paging within the same directory.
     if parts.netloc == base_parts.netloc and parts.path == base_parts.path and parts.query:
         return "sort", None
-    # ...and one with neither a query nor a difference is a self-link.
-    if absolute == base:
-        return "drop", None
 
     if not allow_offsite and parts.netloc != base_parts.netloc:
         return "drop", None
@@ -328,8 +332,18 @@ def _classify_href(
     # The up-link to the immediate parent directory. Caught here, before the scope test
     # below drops it for resolving above the page: its *presence* is a strong signal the
     # page is a real listing, even though the link itself is navigation, not an entry.
+    #
+    # Tested before the self-link rule, not after: when the page is a directory served
+    # without a trailing slash, `base` has already been collapsed to that directory's
+    # parent, so the up-link and `base` are the same URL and a self-link test run first
+    # would swallow the signal it exists to detect.
     if is_parent_dir(absolute, pagedir):
         return "parent", None
+
+    # A link to the page's own directory is a self-link: the last breadcrumb, or a
+    # slash-less spelling of this very URL.
+    if is_same_dir(absolute, pagedir):
+        return "drop", None
 
     # The rule that does most of the work: anything resolving above this directory is
     # navigation. On any server, in any markup.

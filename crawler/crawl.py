@@ -163,10 +163,10 @@ class Crawler:
 
         if not listing.is_index:
             # Not an open directory: a landing page, an app, a file served as HTML.
-            # Recording it as a leaf is what stops the crawl turning into a site crawl.
+            # Not expanding it is what stops the crawl turning into a site crawl.
             logger.info("[SKIP] not a directory index (confidence %.2f): %s",
                         listing.confidence, job.url)
-            self.report.record_leaf(job, record)
+            self.report.record_skipped(job, listing, record)
             return
 
         self.report.record_listing(job, listing, record)

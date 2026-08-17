@@ -62,6 +62,39 @@ async def test_a_url_is_queued_once():
 
 
 @async_test
+async def test_an_encoded_separator_is_the_same_directory():
+    """`a%2Fb` and `a/b` are one directory, so they cost one crawl of that subtree.
+
+    A file manager reaches the same path both ways -- children encode the separator,
+    the up-link does not -- and the two spellings are different strings. Deduplicating
+    on the string alone would walk everything below it twice.
+    """
+    frontier = make_frontier()
+    assert await frontier.add(SEED + "a%2Fb", depth=2)
+    assert not await frontier.add(SEED + "a/b", depth=2)
+    assert not await frontier.add(SEED + "a/b/", depth=2)
+    assert frontier.seen == 1
+
+    # The spelling the server published is the one that gets fetched: the decoded form
+    # is a comparison key, not a URL this route would answer.
+    jobs = await drain(frontier)
+    assert [job.url for job in jobs] == [SEED + "a%2Fb"]
+
+
+@async_test
+async def test_an_encoded_separator_stays_in_scope():
+    """Scope is a question about the tree, so it is asked of the decoded path.
+
+    Read literally, `files/a%2Fb` is a single directory named "a/b" and `sub%2F..%2Fx`
+    escapes nothing; read as the tree, the first is inside the seed and the second is
+    still measured against it.
+    """
+    frontier = make_frontier()
+    assert await frontier.add(SEED + "a%2Fb%2Fc", depth=3)
+    assert not await frontier.add("http://examplexyz.onion/other%2Fa", depth=1)
+
+
+@async_test
 async def test_a_symlink_loop_terminates():
     """The failure this exists to prevent: a directory that contains itself."""
     frontier = make_frontier(max_depth=10)
