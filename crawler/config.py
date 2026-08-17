@@ -52,7 +52,12 @@ ENDPOINT_DEATH_STREAK = 3
 
 DEFAULT_CIRCUITS_PER_ENDPOINT = 2
 DEFAULT_PER_HOST = 8
-DEFAULT_MAX_DEPTH = 5
+# None means "no depth cap": crawl the whole tree under each seed. That is the point of
+# the mode -- an open directory is harvested to exhaustion -- and it is bounded anyway by
+# exact URL deduplication (a tree cannot recurse into itself), the index-confidence guard
+# (it will not wander into an app), and the --max-pages / --time-budget brakes. Pass
+# --max-depth N to reinstate a finite cap.
+DEFAULT_MAX_DEPTH: Optional[int] = None
 LANE_WAIT_TIMEOUT = 300.0
 
 # How often the run logs a progress/endpoint-balance line.
@@ -86,7 +91,7 @@ class CrawlConfig:
     """
 
     seeds: list[str]
-    max_depth: int = DEFAULT_MAX_DEPTH
+    max_depth: Optional[int] = DEFAULT_MAX_DEPTH
     order: str = ORDER_BFS
     workers: Optional[int] = None
     circuits_per_endpoint: int = DEFAULT_CIRCUITS_PER_ENDPOINT

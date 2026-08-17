@@ -26,7 +26,7 @@ import logging
 import re
 import warnings
 from typing import Any, Iterable, Optional
-from urllib.parse import urljoin, urlsplit, unquote
+from urllib.parse import urljoin, urlsplit, urlunsplit, unquote
 
 from bs4 import BeautifulSoup
 from bs4.element import Tag
@@ -38,7 +38,7 @@ except ImportError:  # pragma: no cover
         """Stand-in for older bs4 releases that don't define it."""
 
 from .config import INDEX_CONFIDENCE_THRESHOLD, JUNK_LINK_TEXT
-from .urlnorm import basename, dir_url, is_within, normalize_url
+from .urlnorm import basename, dir_url, is_parent_dir, is_within, normalize_url
 
 logger = logging.getLogger("OnionAccelerator.crawl.parse")
 
@@ -144,17 +144,22 @@ def parse_index(
 
     soup = _soup(html)
     base = _effective_base(soup, base_url)
+    pagedir = _page_dir(base_url)
 
     entries: dict[str, Entry] = {}
     total_links = 0
     sort_links = 0
+    has_parent_link = False
 
     for anchor in soup.find_all("a", href=True):
         total_links += 1
         href = str(anchor["href"]).strip()
-        verdict, url = _classify_href(href, base, allow_offsite=allow_offsite)
+        verdict, url = _classify_href(href, base, pagedir=pagedir, allow_offsite=allow_offsite)
         if verdict == "sort":
             sort_links += 1
+            continue
+        if verdict == "parent":
+            has_parent_link = True
             continue
         if verdict != "keep" or url is None:
             continue
@@ -180,6 +185,7 @@ def parse_index(
         n_sort_links=sort_links,
         has_form=soup.find("form") is not None,
         generator=generator,
+        has_parent_link=has_parent_link,
     )
 
     listing = IndexListing(
@@ -192,9 +198,10 @@ def parse_index(
         generator=generator,
     )
     logger.debug(
-        "parsed url=%s links=%d kept=%d dirs=%d files=%d sort=%d conf=%.2f index=%s server=%s",
+        "parsed url=%s links=%d kept=%d dirs=%d files=%d sort=%d parent=%s conf=%.2f "
+        "index=%s server=%s",
         base, total_links, len(entries), len(directories), len(files),
-        sort_links, confidence, listing.is_index, generator,
+        sort_links, has_parent_link, confidence, listing.is_index, generator,
     )
     return listing
 
@@ -221,6 +228,7 @@ def score_index(
     n_sort_links: int,
     has_form: bool,
     generator: Optional[str] = None,
+    has_parent_link: bool = False,
 ) -> float:
     """How confident we are that this page is a directory index, in [0, 1].
 
@@ -228,6 +236,14 @@ def score_index(
     wiki has hundreds of in-scope links too, and recursing into one turns a
     twenty-request directory walk into an unbounded site crawl over Tor. The signals
     are deliberately independent of any one server's markup.
+
+    The failure mode this guards against is a false *positive* -- crawling an app -- but
+    the count-based signals (`n_entries >= 2`, the entry/link ratio) also produce false
+    *negatives*: a real directory holding a single file or a single subdirectory scores
+    below the bar and is abandoned as a leaf, silently pruning whatever is under it. The
+    parent-directory up-link is the structural signal that rescues those cases without
+    lowering the guard against apps, because a listing has one and an application does
+    not.
     """
     score = 0.0
     if title and title.strip().lower().startswith(("index of", "directory listing")):
@@ -238,6 +254,13 @@ def score_index(
         score += 0.2
     if n_sort_links:
         # Column-sorting links are the fingerprint of an autoindex and of nothing else.
+        score += 0.3
+    if has_parent_link:
+        # An up-link to the immediate parent directory is what a filesystem listing has
+        # and an application does not. On a custom autoindex with no "Index of" title and
+        # no server footer it is often the only positive signal a near-empty directory
+        # carries, so without it a directory holding one entry falls below the threshold
+        # and is wrongly recorded as a leaf.
         score += 0.3
     if n_entries >= 2:
         score += 0.2
@@ -251,12 +274,28 @@ def score_index(
 # ---------------------------------------------------------------- href classification
 
 
-def _classify_href(
-    href: str, base: str, *, allow_offsite: bool
-) -> tuple[str, Optional[str]]:
-    """Decide what one href is: 'keep', 'sort', or 'drop' (with a reason logged).
+def _page_dir(url: str) -> str:
+    """The directory the *page itself* represents, as a URL ending in '/'.
 
-    Returns the normalised absolute URL alongside 'keep'.
+    Distinct from _effective_base(): when a directory is served at a URL without a
+    trailing slash and without a redirect -- as some onion file managers do -- the page
+    still *is* that directory. _effective_base() collapses such a URL to its parent so
+    relative hrefs resolve the way a browser resolves them, but the parent-link test has
+    to measure against `/a/b/`, not the `/a/` that resolution happens to use, or it would
+    read the page's own up-link as pointing at the page itself.
+    """
+    parts = urlsplit(normalize_url(url))
+    path = parts.path if parts.path.endswith("/") else parts.path + "/"
+    return urlunsplit((parts.scheme, parts.netloc, path, "", ""))
+
+
+def _classify_href(
+    href: str, base: str, *, pagedir: str, allow_offsite: bool
+) -> tuple[str, Optional[str]]:
+    """Decide what one href is: 'keep', 'sort', 'parent', or 'drop'.
+
+    Returns the normalised absolute URL alongside 'keep'; 'parent' and 'sort' are
+    signals for the index score rather than entries, so they carry no URL.
     """
     if not href or href.startswith("#"):
         return "drop", None
@@ -285,6 +324,12 @@ def _classify_href(
 
     if not allow_offsite and parts.netloc != base_parts.netloc:
         return "drop", None
+
+    # The up-link to the immediate parent directory. Caught here, before the scope test
+    # below drops it for resolving above the page: its *presence* is a strong signal the
+    # page is a real listing, even though the link itself is navigation, not an entry.
+    if is_parent_dir(absolute, pagedir):
+        return "parent", None
 
     # The rule that does most of the work: anything resolving above this directory is
     # navigation. On any server, in any markup.

@@ -95,7 +95,7 @@ class Frontier:
         self,
         *,
         seeds: Sequence[str],
-        max_depth: int,
+        max_depth: Optional[int],
         order: str = ORDER_BFS,
         include: Optional[Pattern[str]] = None,
         exclude: Optional[Pattern[str]] = None,
@@ -163,7 +163,7 @@ class Frontier:
         filter makes it unanswerable.
         """
         normalized = normalize_url(url)
-        if depth > self._max_depth:
+        if self._max_depth is not None and depth > self._max_depth:
             logger.debug("skip depth=%d > max_depth=%d url=%s", depth, self._max_depth, normalized)
             return False
         if not self._in_scope(normalized):

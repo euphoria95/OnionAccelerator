@@ -224,7 +224,7 @@ Every other mode needs to be told what to fetch. This one finds out. Seeds come 
 listing directories and recording files, until it runs out of tree or out of budget.
 
 ```bash
-# Map everything under the seeds in URLs.txt, five levels deep (the default).
+# Map the whole tree under every seed in URLs.txt (depth is unlimited by default).
 python3 OnionAccelerator.py --mode crawl
 
 # A quick reconnaissance pass: two levels, fifty directories, then stop.
@@ -265,10 +265,20 @@ bytes) and modification dates are recovered from the row where they exist and re
 the manifest. `application/json` bodies (nginx `autoindex_format json`, Caddy) are read as
 JSON and produce identical entries.
 
-Before recursing, each page is scored on whether it *is* an index (title, in-scope link
-ratio, absence of forms). Below `0.5` it is recorded as a leaf and never expanded — the
-guard that stops a directory walk from turning into an unbounded crawl of somebody's forum
-over Tor. Skips are logged with their score.
+Before recursing, each page is scored on whether it *is* an index: an "Index of" title, a
+server `<address>` footer, column-sort links, a **parent-directory up-link**, an in-scope
+link ratio, and the absence of forms. Below `0.5` it is recorded as a leaf and never
+expanded — the guard that stops a directory walk from turning into an unbounded crawl of
+somebody's forum over Tor. Skips are logged with their score.
+
+The parent-directory up-link (`../` / "Parent Directory", matched structurally as a link
+to the page's immediate parent) carries real weight because it is the one signal a
+filesystem listing always has and a web application never does. Without it, a custom
+autoindex with no title and no footer — the common shape on a leak-site file manager —
+scores below the bar the moment a directory holds only a single file or subdirectory, and
+that directory is wrongly abandoned as a leaf, silently pruning whatever is beneath it. An
+application does not gain from the signal: only a link to the *immediate*, segment-aligned
+parent counts, so stray "up" links to `/` or a sibling section do not fire it.
 
 ### Concurrency: circuits, not just threads
 
@@ -302,9 +312,12 @@ subdirectory becomes its own schedulable job, so a directory with 50 subdirector
 50 units of work rather than one. `--order bfs` maps the whole tree shallow-first;
 `--order dfs` finishes branches; `--switch-after N` flips from one to the other mid-run,
 which re-orders work that is *already queued* (an `asyncio.PriorityQueue` could not — it
-fixes each item's key when it is pushed). Depth is capped by `--max-depth`, which is also
-what terminates a directory that contains itself: a symlink loop produces a genuinely new
-URL at every level, so deduplication cannot cut it.
+fixes each item's key when it is pushed). Depth is **unlimited by default** — the point of
+the mode is to harvest a whole open directory — and `--max-depth N` reinstates a finite
+cap. A finite tree still terminates on its own, because deduplication means it cannot
+recurse into itself; a directory that *contains* itself does not, since a symlink loop
+produces a genuinely new URL at every level and deduplication cannot cut it, so those
+runs need `--max-depth`, `--max-pages` or `--time-budget` to end.
 
 Stops are `--max-depth`, `--max-pages`, `--time-budget` and `Ctrl-C` — all of them clean.
 The report is streamed and flushed per line, so an interrupted run still leaves a valid,

@@ -71,9 +71,10 @@ class Crawler:
         n_workers = self.config.workers or len(self.pool)
         n_workers = max(1, min(n_workers, len(self.pool)))
         logger.info(
-            "crawl starting: %d seed(s), %d worker(s) over %d circuit(s), max_depth=%d, order=%s",
+            "crawl starting: %d seed(s), %d worker(s) over %d circuit(s), max_depth=%s, order=%s",
             len(self.config.seeds), n_workers, len(self.pool),
-            self.config.max_depth, self.frontier.order,
+            self.config.max_depth if self.config.max_depth is not None else "unlimited",
+            self.frontier.order,
         )
 
         workers = [asyncio.create_task(self._worker(i), name=f"crawl-worker-{i}")

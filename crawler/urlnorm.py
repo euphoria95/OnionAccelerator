@@ -98,6 +98,28 @@ def is_within(base: str, candidate: str) -> bool:
     return cand_parts.path.startswith(base_parts.path)
 
 
+def is_parent_dir(candidate: str, base: str) -> bool:
+    """True if `candidate` is the immediate parent directory of `base`, same host.
+
+    Segment-aligned on purpose: `/a/b` is the parent of `/a/b/c/`, but `/x` is *not* a
+    parent of `/a/` merely because both descend from the root, and `/rules` is not a
+    parent of `/files/sub/`. `candidate` is read as a directory in its own right -- its
+    last segment is kept, not stripped -- because the up-link a listing carries
+    (`/files/`, or a slash-less `/r/filemanager/TOK`) points *at* a directory.
+
+    This is what identifies the "Parent Directory" / "../" up-link, the single most
+    reliable "this page is a filesystem listing" signal after an "Index of" title and
+    the one a web application essentially never emits.
+    """
+    base_parts = urlsplit(normalize_url(base))
+    cand_parts = urlsplit(normalize_url(candidate))
+    if base_parts.netloc != cand_parts.netloc:
+        return False
+    base_segs = [s for s in base_parts.path.split("/") if s]
+    cand_segs = [s for s in cand_parts.path.split("/") if s]
+    return len(cand_segs) == len(base_segs) - 1 and base_segs[: len(cand_segs)] == cand_segs
+
+
 def path_segments(url: str) -> list[str]:
     """Decoded, non-empty path segments -- the pieces of the on-disk tree."""
     return [unquote(seg) for seg in urlsplit(url).path.split("/") if seg]

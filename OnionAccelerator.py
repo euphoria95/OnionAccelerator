@@ -1517,9 +1517,11 @@ def main():
                                  "point the crawler at Tor daemons this script does not "
                                  "manage; the --farm tooling never touches them.")
     crawl_opts.add_argument("--max-depth", type=int,
-                            default=crawler_default("DEFAULT_MAX_DEPTH", 5),
-                            help="How many directory levels below each seed to crawl "
-                                 "(default 5). Seeds are depth 0.")
+                            default=crawler_default("DEFAULT_MAX_DEPTH", None),
+                            help="How many directory levels below each seed to crawl. "
+                                 "Default: unlimited -- crawl the whole tree, which is "
+                                 "the point of the mode. Seeds are depth 0; pass a "
+                                 "positive integer to cap it.")
     crawl_opts.add_argument("--order", choices=["bfs", "dfs"], default="bfs",
                             help="Traversal order: breadth-first (default) maps the whole "
                                  "tree shallow-first; depth-first finishes branches.")
@@ -1542,7 +1544,8 @@ def main():
                                  "host (default 8). Onion services are usually one small "
                                  "process; past this they start refusing connections.")
     crawl_opts.add_argument("--max-pages", type=int, default=None,
-                            help="Stop after listing this many directories.")
+                            help="Stop after listing this many directories. Default: "
+                                 "unlimited -- list every directory under the seeds.")
     crawl_opts.add_argument("--time-budget", type=float, default=None,
                             help="Stop after this many seconds and write the report.")
     crawl_opts.add_argument("--max-page-bytes", type=int,

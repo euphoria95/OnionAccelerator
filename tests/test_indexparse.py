@@ -18,6 +18,26 @@ import os
 import pytest
 
 from crawler.indexparse import parse_index, score_index, _parse_size
+from crawler.urlnorm import is_parent_dir
+
+# A custom file-manager autoindex: no "Index of" title, no server <address> footer, a
+# search <form> on every page, Apache-style column-sort links, and a "Parent directory"
+# up-link whose href carries no trailing slash. This is the shape that scored below the
+# threshold and was wrongly abandoned as a leaf whenever it held only one entry.
+FILEMANAGER_ONE_ENTRY = (
+    '<html><head><meta charset="utf-8"></head><body>'
+    '<form action="/r/fm/TOK/search" method="get"><input name="search"></form>'
+    '<table><thead><tr>'
+    '<th><a href="?C=N&O=A">Name</a><a href="?C=N&O=D">down</a></th>'
+    '<th><a href="?C=S&O=A">Size</a><a href="?C=S&O=D">down</a></th>'
+    '<th><a href="?C=M&O=A">Date</a><a href="?C=M&O=D">down</a></th>'
+    '</tr></thead><tbody>'
+    '<tr><td><a href="/r/fm/TOK">Parent directory/</a></td><td>-</td><td>-</td></tr>'
+    '<tr><td><a href="/r/fm/TOK/IT/report.txt">report.txt</a></td>'
+    '<td>88</td><td>2024-01-01 00:00</td></tr>'
+    '</tbody></table></body></html>'
+)
+FILEMANAGER_BASE = "http://examplexyz.onion/r/fm/TOK/IT"      # note: no trailing slash
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LISTINGS = os.path.join(HERE, "fixtures", "listings")
@@ -184,6 +204,72 @@ def test_duplicate_links_collapse():
     listing = parse_index(html, BASE)
     assert len(listing.directories) == 1
     assert listing.directories[0].name == "archive"
+
+
+# ---------------------------------------------------------------- the parent-link signal
+
+
+def test_single_entry_directory_is_still_an_index():
+    """A directory holding one file must not be abandoned as a leaf.
+
+    Without the parent-directory signal this page scores 0.3 -- one sort-link block and
+    nothing else, because it has no "Index of" title, no server footer, a search form,
+    one entry, and a low entry/link ratio -- and the crawler records it as a leaf,
+    silently dropping the file (or, for a lone subdirectory, the whole subtree). This is
+    also the slash-less-URL case: the page is served at `/r/fm/TOK/IT` with no redirect,
+    so the parent test must measure against `/r/fm/TOK/IT/`, not the `/r/fm/TOK/` that
+    relative hrefs resolve against.
+    """
+    listing = parse_index(FILEMANAGER_ONE_ENTRY, FILEMANAGER_BASE)
+
+    assert listing.is_index, f"scored only {listing.confidence}"
+    assert {e.name for e in listing.files} == {"report.txt"}
+    assert listing.files[0].size_bytes == 88
+
+
+def test_parent_up_link_is_a_signal_not_an_entry():
+    """The up-link contributes to the score but is never itself a listing entry."""
+    listing = parse_index(FILEMANAGER_ONE_ENTRY, FILEMANAGER_BASE)
+    urls = {e.url for e in listing.directories} | {e.url for e in listing.files}
+    assert "http://examplexyz.onion/r/fm/TOK" not in urls
+    assert "http://examplexyz.onion/r/fm/TOK/" not in urls
+    for entry in list(listing.directories) + list(listing.files):
+        assert entry.name.strip().lower() not in {"parent directory", "parent directory/"}
+
+
+def test_parent_link_does_not_rescue_an_application():
+    """The signal is the *immediate* parent, so an app's stray up-links don't fire it.
+
+    not_an_index.html links `/rules` and `/faq`, which sit above `/files/sub/` but are
+    not its parent directory; the guard that keeps a directory walk from becoming a site
+    crawl has to stay shut for them.
+    """
+    listing = parse_index(load("not_an_index.html"),
+                          "http://examplexyz.onion/files/sub/")
+    assert not listing.is_index
+    assert listing.confidence < 0.5
+
+
+def test_is_parent_dir_is_segment_aligned():
+    """Only the immediate, segment-aligned parent counts -- not any shared ancestor."""
+    assert is_parent_dir("http://h.onion/a/b", "http://h.onion/a/b/c/")
+    assert is_parent_dir("http://h.onion/a/b/", "http://h.onion/a/b/c/")
+    assert is_parent_dir("http://h.onion/files/", "http://h.onion/files/sub/")
+    # A grandparent is not the parent.
+    assert not is_parent_dir("http://h.onion/a/", "http://h.onion/a/b/c/")
+    # A sibling branch that merely shares the root is not a parent.
+    assert not is_parent_dir("http://h.onion/rules", "http://h.onion/files/sub/")
+    # Cross-host never counts.
+    assert not is_parent_dir("http://other.onion/a/", "http://h.onion/a/b/")
+
+
+def test_score_index_counts_the_parent_link():
+    """A lone-entry listing clears the bar with the up-link and misses it without."""
+    without = score_index(title=None, n_entries=1, n_links=8, n_sort_links=6,
+                          has_form=True, has_parent_link=False)
+    with_link = score_index(title=None, n_entries=1, n_links=8, n_sort_links=6,
+                            has_form=True, has_parent_link=True)
+    assert without < 0.5 <= with_link
 
 
 # ---------------------------------------------------------------- units
