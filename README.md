@@ -99,9 +99,17 @@ OnionAccelerator is a multi-functional Python script designed for discovering an
 
 ## Usage
 
-### Prepare `URLs.txt`
+### Say what to fetch
 
-- Put the URLs you want to download (one per line) into a file named `URLs.txt`.
+Either way works, and you never need both:
+
+- **`--url URL`** on the command line. Repeat it for several. When `--url` is given at
+  least once it replaces the file entirely — `URLs.txt` is not read and need not exist.
+- **`URLs.txt`** in the working directory, one URL per line, blank lines ignored. This is
+  the fallback when `--url` is absent, and the right shape for a long list.
+
+`--url` puts your targets into shell history and `ps` output; `URLs.txt` does not. On a
+shared or logged host that difference matters.
 
 ### Run the script:
 
@@ -110,13 +118,16 @@ OnionAccelerator is a multi-functional Python script designed for discovering an
 python3 OnionAccelerator.py --farm <up|status|down|destroy> [--count N] [--base-port PORT] [--bootstrap-timeout SEC]
 
 # Download / speedtest through the proxies:
-python3 OnionAccelerator.py --mode <multi|partial|speedtest> [--retries N] [--external] [--test-url URL]
+python3 OnionAccelerator.py --mode <multi|partial|speedtest> [--url URL ...] [--retries N] [--external] [--test-url URL]
 
 # Read a remote archive's file tree without downloading it:
-python3 OnionAccelerator.py --mode tree [--external] -- <rvtree arguments>
+python3 OnionAccelerator.py --mode tree [--url URL] [--external] [-- <rvtree arguments>]
 
 # Recursively map an open directory (and optionally download what it finds):
-python3 OnionAccelerator.py --mode crawl [--max-depth N] [--order bfs|dfs] [--socks host:port,...] [--download]
+python3 OnionAccelerator.py --mode crawl [--url URL ...] [--max-depth N] [--order bfs|dfs] [--socks host:port,...] [--download]
+
+# The per-mode reference: what each mode does and which flags reach it.
+python3 OnionAccelerator.py --full-help [<multi|partial|speedtest|tree|crawl|farm>]
 ```
 
 Exactly one of `--farm` or `--mode` must be given.
@@ -124,22 +135,28 @@ Exactly one of `--farm` or `--mode` must be given.
 - `--farm`: manage a farm of native Tor instances instead of Docker (see **Native Tor Farm** below).
 
 - `--mode`:
-  - `multi`: Parallel download of all URLs in `URLs.txt`, each in a separate worker thread with its own SOCKS5 proxy.
+  - `multi`: Parallel download of every target, each in a separate worker thread with its own SOCKS5 proxy.
   - `partial`: Parallel chunk-based download for each URL, automatically merging chunks.
-  - `speedtest`: Test download speed and basic health for each SOCKS5 proxy using the first URL from `URLs.txt`.
-  - `tree`: List or extract members of a remote archive over the proxy pool without downloading it. Takes its target from the arguments after `--`, not from `URLs.txt` (see **Remote Archive Tree** below).
-  - `crawl`: Recursively walk the open directories seeded from `URLs.txt` and write a manifest of every file found, spread across many Tor circuits at once (see **Open-Directory Crawl** below).
+  - `speedtest`: Test download speed and basic health for each SOCKS5 proxy using the first target.
+  - `tree`: List or extract members of a remote archive over the proxy pool without downloading it. Takes its target from `--url` or from the arguments after `--`, never from `URLs.txt` (see **Remote Archive Tree** below).
+  - `crawl`: Recursively walk the open directories seeded from `--url` or `URLs.txt` and write a manifest of every file found, spread across many Tor circuits at once (see **Open-Directory Crawl** below).
 
+- `--url URL`: A target URL given on the command line instead of in `URLs.txt`. Repeatable, and when present it replaces the file entirely. Under `--mode tree` it becomes rvtree's URL argument wherever that argument belongs, so `--url X -- extract etc/hosts` runs `extract X etc/hosts`; with no `--` block at all, `--mode tree --url X` runs `list X`.
+
+- `--full-help [MODE]`: Print the long-form reference — per mode, what it does, every flag that actually reaches it with its default and the reasoning, worked examples, and the exit codes. Give a mode name (or `farm`) to print just that section. Plain `--help` remains the short flag list.
 
 - `--retries N`: Set how many times to retry if a download fails (default: 3).
 
 - `--external`: Use remote `ip:port` SOCKS5 proxies fetched from a public list instead of local Docker Tor instances (see **External Proxy List** below). Works with any `--mode`.
 
-- `--test-url URL`: URL used **only** to verify external-proxy liveness (overrides the `PROXY_TEST_URL` config constant). Point it at an endpoint you control or trust so that real target URLs are never revealed to proxies that end up discarded. If unset, a random URL from `URLs.txt` is used and a warning is logged. Only relevant with `--external`.
+- `--test-url URL`: URL used **only** to verify external-proxy liveness (overrides the `PROXY_TEST_URL` config constant). Point it at an endpoint you control or trust so that real target URLs are never revealed to proxies that end up discarded. If unset, a random one of your own targets — from `--url` or `URLs.txt` — is used and a warning is logged. Only relevant with `--external`.
 
 ### Examples
 
 ```bash
+# One file, no URLs.txt anywhere in sight:
+python3 OnionAccelerator.py --mode partial --url https://example.onion/backup.iso
+
 # Multi-download mode, retrying up to 3 times:
 python3 OnionAccelerator.py --mode multi --retries 3
 
@@ -158,6 +175,12 @@ python3 OnionAccelerator.py --mode multi --external --test-url http://your-own-s
 
 # Map the open directories in URLs.txt three levels deep:
 python3 OnionAccelerator.py --mode crawl --max-depth 3
+
+# Two seeds on the command line, no file involved:
+python3 OnionAccelerator.py --mode crawl --url https://a.onion/dumps/ --url https://b.onion/
+
+# What does each mode actually take?
+python3 OnionAccelerator.py --full-help crawl
 ```
 
 ## Remote Archive Tree (`--mode tree`)
@@ -168,13 +191,16 @@ runs it over OnionAccelerator's proxy fleet.
 
 ```bash
 # What is in this archive, and what did it cost to find out?
+python3 OnionAccelerator.py --mode tree --url https://example.onion/backup.rar
+
+# The same thing spelled the long way. --url is inserted exactly here.
 python3 OnionAccelerator.py --mode tree -- list https://example.onion/backup.rar
 
 # Server capabilities and archive shape first — about 65 KiB.
 python3 OnionAccelerator.py --mode tree -- probe https://example.onion/backup.tar.xz
 
-# Pull one member out of it.
-python3 OnionAccelerator.py --mode tree -- extract https://example.onion/backup.rar etc/hosts -o hosts
+# Pull one member out of it. --url lands before the member path, where rvtree wants it.
+python3 OnionAccelerator.py --mode tree --url https://example.onion/backup.rar -- extract etc/hosts -o hosts
 
 # Stream a huge tree as it is discovered, so an interrupted run keeps what it had.
 python3 OnionAccelerator.py --mode tree -- list https://example.onion/big.tar.xz -f ndjson > tree.ndjson
@@ -223,11 +249,15 @@ to watch the pipeline, or `-vv` for one line per range request.
 ## Open-Directory Crawl (`--mode crawl`)
 
 Every other mode needs to be told what to fetch. This one finds out. Seeds come from
-`URLs.txt` — one open-directory URL per line — and the crawl walks down from each of them,
-listing directories and recording files, until it runs out of tree or out of budget.
+`--url` (repeatable) or from `URLs.txt` — one open-directory URL per line — and the crawl
+walks down from each of them, listing directories and recording files, until it runs out
+of tree or out of budget.
 
 ```bash
-# Map the whole tree under every seed in URLs.txt (depth is unlimited by default).
+# Map the whole tree under one seed (depth is unlimited by default).
+python3 OnionAccelerator.py --mode crawl --url https://example.onion/dumps/
+
+# Same, seeded from every line of URLs.txt.
 python3 OnionAccelerator.py --mode crawl
 
 # A quick reconnaissance pass: two levels, fifty directories, then stop.
@@ -398,8 +428,9 @@ multi-circuit spread is actually working.
 - `OnionAccelerator.py`: The main script containing all modes (multi-download, partial-download, speedtest, tree, crawl).
 - `remote_viewer/`: The `rvtree` package behind `--mode tree`. Usable on its own too — see its own README.
 - `crawler/`: The asyncio package behind `--mode crawl` — universal listing parser, multi-circuit proxy pool, frontier and reporting. The only async code in the project; the other modes stay on threads over `requests`.
+- `fullhelp.py`: The long-form per-mode reference printed by `--full-help`. Pure prose and stdlib, imported eagerly precisely because it can never fail.
 - `requirements.txt`: Python dependencies.
-- `URLs.txt`: A text file with one URL per line.
+- `URLs.txt`: A text file with one URL per line. Optional — `--url` replaces it.
 - `UserAgents.tsv`: Tab-separated file; first column is the User-Agent string.
 - `logs/`: A directory automatically created to store timestamped log files.
 - `downloads/<host>/`: Output directory for multi mode, organised by hostname. With `--mode crawl --download` the remote directory structure is mirrored underneath it.
@@ -482,7 +513,7 @@ python3 OnionAccelerator.py --mode multi --external
 
 - **Fetched fresh every run.** The list is downloaded from the public source on each invocation and is **never written to disk**, so every execution uses an up-to-date set of proxies.
 - **Capped at 100 proxies.** If the list is larger, a random subset of 100 is selected (this is also the hard limit on worker threads).
-- **Connectivity-checked before any work starts.** Each candidate proxy is tested in parallel against a single connectivity-check URL; only proxies that successfully return data are used. The run aborts if none pass. By default that check URL is a random entry from `URLs.txt` — set `--test-url` (or the `PROXY_TEST_URL` config constant) to a private endpoint you control so real targets are never exposed to discarded proxies.
+- **Connectivity-checked before any work starts.** Each candidate proxy is tested in parallel against a single connectivity-check URL; only proxies that successfully return data are used. The run aborts if none pass. By default that check URL is a random one of your own targets, from `--url` or `URLs.txt` — set `--test-url` (or the `PROXY_TEST_URL` config constant) to a private endpoint you control so real targets are never exposed to discarded proxies. Note also that targets passed with `--url` are visible in shell history and in `ps` output, which a file is not.
 - **Pooled with failover.** Proxies are drawn from a shared, thread-safe pool rather than pinned to a worker or chunk by index. When a download attempt fails, its proxy is parked and the retry lands on a *different* live proxy, so a single dead endpoint no longer sinks a whole file or URL. A proxy that later succeeds is rehabilitated, and if every proxy is parked the pool falls back to reusing them.
 
 ## Contributing
