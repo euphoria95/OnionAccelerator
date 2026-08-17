@@ -29,10 +29,13 @@ CONNECT_TIMEOUT = 30.0
 READ_TIMEOUT = 60.0
 TOTAL_TIMEOUT = 120.0
 
-# A directory listing is text. Anything past this is either not a listing or is a file
-# the crawler was never meant to pull down whole, so the body is abandoned and the URL
-# is recorded as a leaf.
-MAX_PAGE_BYTES = 4 * 1024 * 1024
+# A directory listing is text, but not necessarily small text: one directory of a leaked
+# fileshare routinely holds thousands of entries, and at the ~600 bytes of markup a
+# file-manager template spends per row, ten thousand of them is 6 MB. The cap is high
+# enough that hitting it means "not a listing" rather than "a big listing", because a
+# listing that hits it is a whole subtree lost. Past it the body is abandoned and the
+# fetch recorded as a failure, with the cap named in the error.
+MAX_PAGE_BYTES = 16 * 1024 * 1024
 READ_CHUNK = 64 * 1024
 
 # Backoff: min(cap, base * 2**attempt), then full jitter. The cap matters more than the

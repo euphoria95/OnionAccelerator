@@ -14,13 +14,14 @@ its two "daemons" both dial the same loopback port.
 import asyncio
 import json
 import os
+from urllib.parse import unquote
 
 import aiohttp
 import pytest
 
 from crawler.config import CrawlConfig, ORDER_BFS
 from crawler.crawl import run_crawl
-from indexserver import IndexServer
+from indexserver import FileManagerServer, IndexServer
 
 # Two fake daemons. Nothing dials them; they exist so the pool has more than one
 # endpoint to spread lanes across and to account for separately.
@@ -193,6 +194,82 @@ def test_unlimited_depth_walks_a_finite_tree_to_the_bottom(tree, tmp_path):
     assert stats["config"]["max_depth"] is None
 
 
+# ------------------------------------------------- the file-manager addressing scheme
+
+
+@pytest.fixture
+def deep_tree(tree):
+    """`tree`, one level deeper.
+
+    Three levels are not enough to catch the encoded separator: it first appears on the
+    listing of a directory that is itself two levels down, and a crawl that stops there
+    still returns everything above it and looks like it worked.
+    """
+    bottom = os.path.join(tree, "a", "deep", "deeper")
+    os.mkdir(bottom)
+    with open(os.path.join(bottom, "bottom.txt"), "w", encoding="utf-8") as fh:
+        fh.write("bottom")
+    return tree
+
+
+def test_a_file_manager_tree_is_walked_to_the_bottom(deep_tree, tmp_path):
+    """The crawl must reach the same files whether or not the server encodes separators.
+
+    This is the shape that reported 418 files out of 87,000 on a real onion: every page
+    below the second level listed its children with the parent path percent-encoded into
+    one segment, none of them resolved below the page that carried them, and every one
+    was discarded as navigation. The crawl completed, reported success, and had stopped
+    two levels down.
+    """
+    out = str(tmp_path / "out")
+    with FileManagerServer(deep_tree) as server:
+        stats, urls = crawl(server.seed_url, out, max_depth=None)
+
+    assert sorted(os.path.basename(unquote(u)) for u in urls) == [
+        "bottom.txt", "buried.txt", "readme.txt", "readme.txt", "top.bin",
+    ]
+    assert stats["stopped_because"] == "completed"
+    # The root, a/, a/deep/, a/deep/deeper/, b/ and empty/.
+    assert stats["totals"]["directories"] == 6
+
+
+def test_the_encoded_spelling_is_what_gets_requested(deep_tree, tmp_path):
+    """The crawler asks for the URL the server published, not a tidied-up version.
+
+    `%2F` survives normalisation, the frontier and the HTTP client: decoding is for
+    comparison only. A crawler that helpfully rewrote it to `/` would be requesting a
+    path this route does not serve.
+    """
+    out = str(tmp_path / "out")
+    with FileManagerServer(deep_tree) as server:
+        _, urls = crawl(server.seed_url, out, max_depth=None)
+        requested = list(server.request_log)
+
+    assert "/r/fm/TOK/a%2Fdeep/deeper" in requested, requested
+    assert len(requested) == len(set(requested)), "a directory was fetched twice"
+    keys = [unquote(u) for u in urls]
+    assert len(keys) == len(set(keys)), "a file was recorded under two spellings"
+
+
+def test_a_file_manager_directory_is_not_recorded_as_a_file(deep_tree, tmp_path):
+    """Directories belong in dirs.jsonl, never in the file manifest.
+
+    The two failures compound: a directory whose links were all discarded parses as an
+    empty, low-confidence page, and a low-confidence page used to be written into the
+    manifest as a file -- so `--download` fetched a listing and saved the markup under
+    the directory's name. Both ends are checked here.
+    """
+    out = str(tmp_path / "out")
+    with FileManagerServer(deep_tree) as server:
+        _, urls = crawl(server.seed_url, out, max_depth=None)
+
+    listed = {unquote(d["url"]).rstrip("/").rsplit("/", 1)[-1]
+              for d in records(out, "dirs.jsonl")}
+    assert {"a", "deep", "deeper", "b", "empty"} <= listed
+    assert not any(unquote(u).rstrip("/").endswith(("/a", "/deep", "/deeper", "/empty"))
+                   for u in urls)
+
+
 def test_exclude_keeps_a_subtree_out(tree, tmp_path):
     out = str(tmp_path / "out")
     with IndexServer(tree) as server:
@@ -200,6 +277,27 @@ def test_exclude_keeps_a_subtree_out(tree, tmp_path):
                         exclude=CrawlConfig.compile_filter(r"/a/"))
     assert not any("/a/" in u for u in urls)
     assert any(u.endswith("/b/readme.txt") for u in urls)
+
+
+def test_a_page_that_is_not_a_listing_is_not_a_file(tree, tmp_path):
+    """The confidence guard refuses to expand a page. It must not rename it either.
+
+    `/a/` was queued because the root listing put it in the directory column; answering
+    with an application does not make it a file. Recording it as one lands a directory
+    in urls.txt, and `--download` then fetches its markup and writes that out under the
+    directory's own name. It belongs in dirs.jsonl with the score that disqualified it.
+    """
+    out = str(tmp_path / "out")
+    with IndexServer(tree, applications={"/a/"}) as server:
+        stats, urls = crawl(server.base_url, out)
+
+    assert not any(u.rstrip("/").endswith("/a") for u in urls), urls
+    assert stats["totals"]["skipped"] == 1
+    skipped = [d for d in records(out, "dirs.jsonl") if not d["is_index"]]
+    assert [d["url"].rstrip("/").rsplit("/", 1)[-1] for d in skipped] == ["a"]
+    assert skipped[0]["confidence"] < 0.5
+    # The crawl carries on around it: the rest of the tree is still there.
+    assert sorted(os.path.basename(u) for u in urls) == ["readme.txt", "top.bin"]
 
 
 # ---------------------------------------------------------------- failure handling

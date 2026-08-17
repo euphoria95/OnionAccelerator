@@ -210,9 +210,16 @@ class AsyncFetcher:
 
                 body, nbytes, truncated = await self._read_capped(response)
                 if truncated:
-                    return FetchResult(Verdict.LEAF, url, final_url=current, status=status,
-                                       content_type=content_type, nbytes=nbytes,
-                                       error=f"body exceeded {self._max_page_bytes} bytes")
+                    # Not a leaf: a leaf is recorded as a *file*, and a directory whose
+                    # listing outgrew the cap would then land in the manifest as one --
+                    # its subtree silently missing and --download fetching its HTML. A
+                    # failure says what happened and how to undo it.
+                    return FetchResult(
+                        Verdict.DROP, url, final_url=current, status=status,
+                        content_type=content_type, nbytes=nbytes,
+                        error=f"page over --max-page-bytes ({self._max_page_bytes}); "
+                              f"raise it to read this directory",
+                    )
                 return FetchResult(Verdict.OK, url, final_url=current, status=status,
                                    content_type=content_type, body=body, nbytes=nbytes)
 

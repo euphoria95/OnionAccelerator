@@ -1,27 +1,45 @@
-"""A local directory-listing server for the crawl tests.
+"""Local directory-listing servers for the crawl tests.
 
 `http.server.SimpleHTTPRequestHandler` already generates a real, unmocked autoindex --
 a seventh flavour the parser has never been shown -- so the crawl end-to-end test runs
 against genuinely server-generated HTML rather than a fixture.
 
 What it does not do is fail, and failure is most of what the crawler's control flow is
-about. So this wraps it with two switches:
+about. So `IndexServer` wraps it with two switches:
 
 * ``flaky``   -- paths that answer 503 for their first N requests before serving
                  normally, which is what an overloaded onion looks like;
 * ``request_log`` -- every path served, so a test can assert how many attempts a URL
                  actually took.
+
+`FileManagerServer` is the other shape entirely: an application serving a filesystem,
+which is what the leak sites run and what an autoindex-shaped server cannot stand in
+for. See its docstring.
 """
 
 from __future__ import annotations
 
+import html
+import os
 import threading
-from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
-from typing import Optional
+from http.server import BaseHTTPRequestHandler, SimpleHTTPRequestHandler, ThreadingHTTPServer
+from typing import Iterable, Optional
+from urllib.parse import quote, unquote
 
 
 class IndexServer:
     """A threaded HTTP server serving `directory`, with optional injected failures."""
+
+    # A page with links but none of a listing's structure: no sort controls, no up-link,
+    # a search form, and a title that is not "Index of". This is what the crawler must
+    # refuse to walk into, and it scores well under the confidence threshold.
+    APPLICATION_PAGE = (
+        "<html><head><title>Welcome</title></head><body>"
+        '<form action="/search"><input name="q"></form>'
+        '<a href="/rules">Rules</a><a href="/faq">FAQ</a><a href="/login">Log in</a>'
+        '<a href="topic-1">First topic</a><a href="topic-2">Second topic</a>'
+        "</body></html>"
+    )
 
     def __init__(
         self,
@@ -29,10 +47,13 @@ class IndexServer:
         *,
         flaky: Optional[dict[str, int]] = None,
         retry_after: Optional[str] = "0",
+        applications: Optional[Iterable[str]] = None,
     ) -> None:
         self.directory = directory
         self.flaky = dict(flaky or {})
         self.retry_after = retry_after
+        # Paths that answer 200 with an application instead of a listing.
+        self.applications = set(applications or ())
         self.request_log: list[str] = []
         self._lock = threading.Lock()
         self._server: Optional[ThreadingHTTPServer] = None
@@ -59,6 +80,14 @@ class IndexServer:
                         self.send_header("Retry-After", outer.retry_after)
                     self.send_header("Content-Length", "0")
                     self.end_headers()
+                    return
+                if self.path in outer.applications:
+                    body = outer.APPLICATION_PAGE.encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
                     return
                 super().do_GET()
 
@@ -87,6 +116,148 @@ class IndexServer:
     @property
     def base_url(self) -> str:
         return f"http://127.0.0.1:{self.port}/"
+
+    def hits(self, path: str) -> int:
+        with self._lock:
+            return self.request_log.count(path)
+
+
+class FileManagerServer:
+    """A file manager that addresses a nested directory with an encoded separator.
+
+    Not a variant template: a different *addressing scheme*. An autoindex serves the
+    tree at the tree's own paths, so `/a/deep/` is one URL with three segments. A file
+    manager serves the whole tree from one route and passes the relative path as a
+    parameter, so `a/deep` arrives percent-encoded into a single segment:
+
+        /r/fm/TOK/a%2Fdeep/buried.txt
+
+    Read as raw path text that is a directory literally named `a%2Fdeep`, which is
+    below neither the page that linked it nor the crawl's scope root -- so every link
+    on every page below the first nested level is discarded as off-tree navigation and
+    the crawl stops one level down, having found only the top of the tree. The parent
+    up-link is the same trap in reverse: this route spells it with real separators
+    (`/r/fm/TOK/a/deep`), so the page's own URL and its parent's are encoded
+    differently and only a decoded comparison sees the relationship.
+
+    Everything else is copied from the shape these file managers actually have: no
+    "Index of" title, no server `<address>` footer, a search `<form>` on every page,
+    Apache-style column-sort links, folder icons rather than trailing slashes, and
+    directory URLs served 200 without a redirect to a trailing slash.
+    """
+
+    ROUTE = "/r/fm/TOK"
+
+    def __init__(self, directory: str) -> None:
+        self.directory = directory
+        self.request_log: list[str] = []
+        self._lock = threading.Lock()
+        self._server: Optional[ThreadingHTTPServer] = None
+        self._thread: Optional[threading.Thread] = None
+
+    # ------------------------------------------------------------ lifecycle
+
+    def __enter__(self) -> "FileManagerServer":
+        outer = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):                      # noqa: N802 - stdlib naming
+                raw = self.path.split("?", 1)[0]
+                with outer._lock:
+                    outer.request_log.append(raw)
+                if not raw.startswith(outer.ROUTE):
+                    self.send_error(404)
+                    return
+                # The route's parameter, decoded exactly once -- which is the whole
+                # point: `a%2Fdeep` and `a/deep` name the same directory here.
+                relative = unquote(raw[len(outer.ROUTE):]).strip("/")
+                target = os.path.join(outer.directory, relative)
+                if os.path.isdir(target):
+                    self._respond(outer.render(relative), "text/html; charset=utf-8")
+                elif os.path.isfile(target):
+                    with open(target, "rb") as fh:
+                        self._respond(fh.read(), "application/octet-stream")
+                else:
+                    self.send_error(404)
+
+            def _respond(self, body, content_type: str) -> None:
+                if isinstance(body, str):
+                    body = body.encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):          # keep the test output readable
+                pass
+
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        if self._server is not None:
+            self._server.shutdown()
+            self._server.server_close()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+
+    # ------------------------------------------------------------ the template
+
+    def render(self, relative: str) -> str:
+        """The listing for `relative`, with children addressed the file manager's way."""
+        rows = [self._parent_row(relative)] if relative else []
+        target = os.path.join(self.directory, relative)
+        for name in sorted(os.listdir(target)):
+            is_dir = os.path.isdir(os.path.join(target, name))
+            size = "-" if is_dir else str(os.path.getsize(os.path.join(target, name)))
+            icon = "folder.svg" if is_dir else "file.svg"
+            rows.append(
+                f'<tr><td class="link"><a href="{self.child_url(relative, name)}">'
+                f'<img class="icons" src="/static/icons/{icon}">{html.escape(name)}</a>'
+                f'</td><td class="size">{size}</td><td class="date">2024-01-01 00:00</td></tr>'
+            )
+        return (
+            "<html><head><meta charset='utf-8'></head><body>"
+            f'<form action="{self.ROUTE}/search" method="GET"><input name="search"></form>'
+            '<table id="list"><thead><tr>'
+            '<th><a href="?C=N&amp;O=A">File Name</a><a href="?C=N&amp;O=D">down</a></th>'
+            '<th><a href="?C=S&amp;O=A">File Size</a><a href="?C=S&amp;O=D">down</a></th>'
+            '<th><a href="?C=M&amp;O=A">Date</a><a href="?C=M&amp;O=D">down</a></th>'
+            "</tr></thead><tbody>" + "".join(rows) + "</tbody></table></body></html>"
+        )
+
+    def child_url(self, relative: str, name: str) -> str:
+        """`/r/fm/TOK/<relative, separators encoded>/<name>`.
+
+        At the top level there is no relative path and the result is indistinguishable
+        from an ordinary URL; one level down it still is, because a single segment has
+        no separator to encode. The encoding only appears from the second level, which
+        is exactly why a crawler can look correct against a shallow fixture.
+        """
+        prefix = f"{self.ROUTE}/{quote(relative, safe='')}" if relative else self.ROUTE
+        return f"{prefix}/{quote(name)}"
+
+    def _parent_row(self, relative: str) -> str:
+        """The up-link -- spelled with real separators, unlike every other link here."""
+        parent = relative.rsplit("/", 1)[0] if "/" in relative else ""
+        href = f"{self.ROUTE}/{quote(parent)}" if parent else self.ROUTE
+        return (f'<tr><td class="link"><a href="{href}">'
+                f'<img class="icons" src="/static/icons/home.png">Parent directory/</a>'
+                f'</td><td class="size">-</td><td class="date">-</td></tr>')
+
+    # ------------------------------------------------------------ accessors
+
+    @property
+    def port(self) -> int:
+        assert self._server is not None
+        return self._server.server_address[1]
+
+    @property
+    def seed_url(self) -> str:
+        return f"http://127.0.0.1:{self.port}{self.ROUTE}/"
 
     def hits(self, path: str) -> int:
         with self._lock:

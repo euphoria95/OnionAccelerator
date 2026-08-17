@@ -29,7 +29,7 @@ from .config import (
 )
 from .frontier import Job
 from .indexparse import Entry, IndexListing
-from .urlnorm import host_of, path_segments
+from .urlnorm import dedup_key, host_of, path_segments
 
 logger = logging.getLogger("OnionAccelerator.crawl.report")
 
@@ -40,6 +40,7 @@ class Totals:
 
     directories: int = 0
     files: int = 0
+    skipped: int = 0           # fetched, read, and not a directory listing
     bytes_seen: int = 0        # sum of the sizes the *listings* advertised
     bytes_fetched: int = 0     # what the crawler actually pulled over Tor
     requests: int = 0
@@ -63,8 +64,9 @@ class CrawlReport:
         self._failed: Optional[TextIO] = None
         # File URLs are deduplicated here, not in the frontier: the frontier only ever
         # queues directories, but the same file can legitimately be linked from two of
-        # them, and the manifest should list it once.
-        self._file_urls: set[str] = set()
+        # them, and the manifest should list it once. Keyed by identity rather than by
+        # URL so two spellings of one file collapse; the value is the spelling to fetch.
+        self._file_urls: dict[str, str] = {}
         self._tree: dict[str, dict[str, Any]] = {}
 
     def __enter__(self) -> "CrawlReport":
@@ -121,9 +123,10 @@ class CrawlReport:
         content_type: Optional[str] = None,
     ) -> None:
         """One discovered file. Silently ignored if it was already recorded."""
-        if entry.url in self._file_urls:
+        key = dedup_key(entry.url)
+        if key in self._file_urls:
             return
-        self._file_urls.add(entry.url)
+        self._file_urls[key] = entry.url
         self.totals.files += 1
         if entry.size_bytes:
             self.totals.bytes_seen += entry.size_bytes
@@ -144,11 +147,40 @@ class CrawlReport:
         self._add_to_tree(entry.url, is_dir=False, size=entry.size_bytes,
                           mtime=entry.mtime_text)
 
+    def record_skipped(self, job: Job, listing: IndexListing,
+                       result_record: dict[str, Any]) -> None:
+        """A page that was fetched and read but is not a directory listing.
+
+        Kept out of the file manifest, which is the difference that matters: this URL
+        was queued because a listing put it in its *directory* column, and answering
+        with HTML does not make it a file. Recording it as one puts a directory into
+        urls.txt, where `--download` fetches its markup and saves that under the
+        directory's name. It goes into dirs.jsonl with the score that disqualified it,
+        so "why was this not crawled" has an answer on disk and not only in the log.
+        """
+        self.totals.skipped += 1
+        record = dict(result_record)
+        record.update({
+            "depth": job.depth,
+            "parent": job.parent,
+            "attempts": job.attempt + 1,
+            "n_dirs": len(listing.directories),
+            "n_files": len(listing.files),
+            "is_index": False,
+            "confidence": round(listing.confidence, 2),
+            "server": listing.generator,
+            "title": listing.title,
+            "discovered_at": _now(),
+        })
+        self._write(self._dirs, record)
+        self._add_to_tree(job.url, is_dir=True)
+
     def record_leaf(self, job: Job, result_record: dict[str, Any]) -> None:
         """A URL that was queued as a directory but turned out to be a file.
 
-        Happens when a listing strips its trailing slashes, and when a page scores below
-        the index-confidence threshold -- an application, not an open directory.
+        Happens when a listing strips its trailing slashes: the entry looked like a
+        directory in the markup, and the server answered with a file. Not the same thing
+        as a page that parsed but did not look like a listing -- see record_skipped.
         """
         entry = Entry(
             url=result_record.get("final_url") or job.url,
@@ -202,7 +234,7 @@ class CrawlReport:
         _write_json(os.path.join(self.out_dir, STATS_FILE), stats)
 
         with open(os.path.join(self.out_dir, URLS_FILE), "w", encoding="utf-8") as fh:
-            for url in sorted(self._file_urls):
+            for url in self.file_urls:
                 fh.write(url + "\n")
 
         with open(os.path.join(self.out_dir, TREE_FILE), "w", encoding="utf-8") as fh:
@@ -219,7 +251,7 @@ class CrawlReport:
     @property
     def file_urls(self) -> list[str]:
         """The discovered files, in a stable order -- what `--download` is handed."""
-        return sorted(self._file_urls)
+        return sorted(self._file_urls.values())
 
     # ------------------------------------------------------------ tree building
 

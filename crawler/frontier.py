@@ -31,7 +31,7 @@ import time
 from typing import Optional, Pattern, Sequence
 
 from .config import ORDER_BFS, ORDER_DFS
-from .urlnorm import dir_url, host_of, is_within, normalize_url
+from .urlnorm import dedup_key, dir_url, host_of, is_within, normalize_url
 
 logger = logging.getLogger("OnionAccelerator.crawl.frontier")
 
@@ -176,11 +176,15 @@ class Frontier:
             logger.debug("skip no --include match url=%s", normalized)
             return False
 
+        # Queued under the URL as the server spells it, remembered under an identity
+        # that spelling cannot vary: one directory reachable as both `/a/b` and `/a%2Fb`
+        # is one directory, and crawling it twice doubles a whole subtree.
+        key = dedup_key(normalized)
         async with self._cv:
-            if normalized in self._seen:
+            if key in self._seen:
                 logger.debug("skip already-seen url=%s", normalized)
                 return False
-            self._seen.add(normalized)
+            self._seen.add(key)
             self._push(Job(url=normalized, depth=depth, parent=parent))
             self._cv.notify()
         return True
