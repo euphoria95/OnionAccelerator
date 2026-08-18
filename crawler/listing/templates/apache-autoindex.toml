@@ -1,0 +1,21 @@
+# Apache mod_autoindex, both layouts: the <pre> block (IndexOptions default) and the
+# <table> one (FancyIndexing). The markup differs; the structural reader does not care,
+# so this template exists to *recognise* Apache -- so that a directory holding one file
+# is expanded on the strength of the match rather than refused by the index-confidence
+# guard, which is what a lone entry scores below.
+
+name     = "apache-autoindex"
+title    = "Apache mod_autoindex"
+priority = 60
+status   = "verified"
+
+[match]
+content_type    = ["text/html", "application/xhtml"]
+title_regex     = "^index of "
+generator_regex = "^apache/"
+
+[extract]
+strategy = "anchors"
+
+[navigate]
+kind = "href"

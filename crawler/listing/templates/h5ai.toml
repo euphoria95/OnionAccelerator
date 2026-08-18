@@ -1,0 +1,38 @@
+# h5ai. The one that looks most like an open directory and behaves least like one: the
+# page is a shell, and the listing comes from a form-encoded POST to its own PHP entry
+# point. Its `items` are addressed by href, so once the answer is in hand the rest is
+# ordinary.
+
+name     = "h5ai"
+title    = "h5ai (POST _h5ai/public/index.php)"
+priority = 75
+status   = "unverified"
+
+[match]
+body_regex = "_h5ai|h5ai-"
+
+[probe]
+method = "POST"
+path   = "/_h5ai/public/index.php"
+body   = "action=get&items=%7B%22href%22%3A%22%2F%22%2C%22what%22%3A1%7D"
+expect_regex = "\"items\""
+
+[probe.headers]
+Content-Type = "application/x-www-form-urlencoded"
+
+[extract]
+strategy = "json"
+rows     = "items"
+name     = "href"
+size     = "size"
+date     = "time"
+href     = "href"
+
+[navigate]
+kind   = "api"
+method = "POST"
+url    = "{origin}/_h5ai/public/index.php"
+body   = "action=get&items={\"href\":\"/{path}/\",\"what\":1}"
+
+[navigate.headers]
+Content-Type = "application/x-www-form-urlencoded"

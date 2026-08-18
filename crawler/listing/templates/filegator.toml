@@ -1,0 +1,39 @@
+# FileGator. Vue front end over a JSON API; the directory is a field in the request body.
+
+name     = "filegator"
+title    = "FileGator (POST /api/list)"
+priority = 75
+status   = "unverified"
+
+[match]
+body_regex = "filegator"
+
+[probe]
+method = "POST"
+path   = "/api/list"
+body   = "{\"dir\": \"/\"}"
+expect_regex = "\"files\""
+
+[probe.headers]
+Content-Type = "application/json"
+
+[extract]
+strategy   = "json"
+rows       = "data.files"
+name       = "name"
+size       = "size"
+date       = "time"
+path       = "path"
+type_field = "type"
+
+[navigate]
+kind   = "api"
+method = "POST"
+url    = "{origin}/api/list"
+body   = "{\"dir\": \"/{path}\"}"
+
+[navigate.headers]
+Content-Type = "application/json"
+
+[download]
+url = "{origin}/api/download?name={path}"

@@ -1,0 +1,32 @@
+# UniSharp's laravel-filemanager, and the Laravel admin panels that embed it. The working
+# directory is a query parameter and the listing is rendered client-side from
+# /filemanager/jsonitems -- so the HTML page is a shell and the JSON is the listing.
+#
+# Two profiles would be honest here; one is enough because the API answers a plain GET,
+# which means the same template can match the shell and address the API.
+
+name     = "laravel-filemanager"
+title    = "UniSharp laravel-filemanager (?working_dir=)"
+priority = 70
+status   = "unverified"
+
+[match]
+body_regex = "laravel-filemanager|lfm\\.js|working_dir"
+
+[probe]
+method = "GET"
+path   = "/filemanager/jsonitems?working_dir=/&type=Files"
+expect_regex = "\"items\""
+
+[extract]
+strategy  = "json"
+rows      = "items"
+name      = "name"
+href      = "url"
+date      = "time"
+type_field = "type"
+
+[navigate]
+kind   = "api"
+method = "GET"
+url    = "{origin}/filemanager/jsonitems?working_dir=/{path}&type=Files"

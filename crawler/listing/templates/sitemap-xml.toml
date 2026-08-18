@@ -1,0 +1,18 @@
+# A sitemap. Not a directory listing, but on a site that publishes one it is the same
+# thing by another name -- every URL the operator is willing to admit to, in one request.
+
+name     = "sitemap-xml"
+title    = "sitemap.xml"
+priority = 86
+status   = "verified"
+
+[match]
+content_type = ["application/xml", "text/xml", "text/plain"]
+body_regex   = "<urlset|<sitemapindex"
+
+[extract]
+strategy = "manifest"
+format   = "sitemap"
+
+[navigate]
+kind = "href"

@@ -1,0 +1,20 @@
+# A Nextcloud or ownCloud public share link. The browser view is a single-page app, but
+# the same token authenticates WebDAV, which is a real listing -- so the profile that
+# actually crawls one of these is webdav-propfind, and this exists to say so.
+
+name     = "nextcloud-public-share"
+title    = "Nextcloud / ownCloud public share (use WebDAV)"
+priority = 40
+status   = "unverified"
+notes    = "Crawl with --profile webdav-propfind against /public.php/webdav using the share token as the username."
+
+[match]
+content_type = ["text/html"]
+body_regex   = "nextcloud|owncloud"
+url_regex    = "/s/[A-Za-z0-9]+"
+
+[extract]
+strategy = "anchors"
+
+[navigate]
+kind = "href"

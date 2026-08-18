@@ -1643,6 +1643,64 @@ def resolve_crawl_endpoints(args, urls):
     return []
 
 
+def list_profiles_mode(args):
+    """--list-profiles: print the listing templates and exit. Returns an exit code.
+
+    Deliberately reachable without a live target and without touching the network: the
+    question "what does this thing already know how to read" is one you ask before you
+    have a target, and one you should be able to ask on a laptop with no Tor running.
+    """
+    try:
+        from crawler.listing.registry import describe, load_profiles
+    except ImportError as e:
+        logger.error(f"--list-profiles needs the crawler package ({e}). Install it with "
+                     f"'pip install -r requirements.txt'.")
+        return 1
+    try:
+        profiles = load_profiles(args.templates or [])
+    except Exception as e:                            # a bad template names itself
+        logger.error(f"Cannot load listing templates: {e}")
+        return 1
+    print(describe(profiles))
+    print(f"\n{len(profiles)} template(s). Crawl with --profile NAME, or run --detect "
+          f"against a target to be told which one fits.")
+    return 0
+
+
+def detect_mode(urls, proxies, args):
+    """--detect: one request per seed, then say what the target is. Returns an exit code."""
+    pkg = _import_crawler()
+    if pkg is None:
+        return 1
+    try:
+        config = pkg.CrawlConfig(
+            seeds=list(urls),
+            circuits_per_endpoint=args.circuits_per_endpoint,
+            max_page_bytes=args.max_page_bytes,
+            allow_offsite=args.allow_offsite,
+            profile=args.profile,
+            templates=list(args.templates or []),
+            out_dir="",
+            job_id=JOB_ID,
+        )
+    except ValueError as e:
+        logger.error(f"{e}")
+        return 1
+
+    try:
+        results = pkg.detect_targets(config, proxies, load_user_agents())
+    except ValueError as e:                           # an unknown --profile name
+        logger.error(f"{e}")
+        return 1
+
+    matched = 0
+    for seed, findings in results:
+        print()
+        print(pkg.listing.render(findings, seed))
+        matched += 1 if any(f.usable for f in findings) else 0
+    return 0 if matched else 1
+
+
 def crawl_mode(urls, proxies, args):
     """Run one crawl, then optionally download everything it found. Returns an exit code."""
     pkg = _import_crawler()
@@ -1667,6 +1725,8 @@ def crawl_mode(urls, proxies, args):
             exclude=pkg.CrawlConfig.compile_filter(args.exclude),
             switch_after=args.switch_after,
             download=args.download,
+            profile=args.profile,
+            templates=list(args.templates or []),
             out_dir=out_dir,
             job_id=JOB_ID,
         )
@@ -1674,7 +1734,11 @@ def crawl_mode(urls, proxies, args):
         logger.error(f"Bad --include/--exclude regex: {e}")
         return 1
 
-    stats, file_urls = pkg.crawl(config, proxies, load_user_agents())
+    try:
+        stats, file_urls = pkg.crawl(config, proxies, load_user_agents())
+    except ValueError as e:                           # an unknown --profile, or a bad template
+        logger.error(f"{e}")
+        return 1
     logger.info(f"Crawl manifest: {os.path.abspath(out_dir)} "
                 f"({len(file_urls)} file URL(s) in {pkg.config.URLS_FILE})")
 
@@ -1828,6 +1892,27 @@ def build_parser():
                             help="After crawling, download every discovered file through "
                                  "the same proxies, mirroring the remote directory tree "
                                  f"under {DOWNLOAD_DIR}/<host>/.")
+    crawl_opts.add_argument("--profile", default=None, metavar="NAME",
+                            help="Read every page with this listing template instead of "
+                                 "detecting one per host. Required for API-driven targets "
+                                 "(AList, WebDAV, h5ai): it is what lets the seed itself be "
+                                 "requested in the target's own scheme. "
+                                 "See --list-profiles and --detect.")
+    crawl_opts.add_argument("--list-profiles", action="store_true",
+                            help="Print the listing templates that are available and exit. "
+                                 "'verified' ones are pinned by a fixture in the test suite; "
+                                 "'unverified' ones were written from documented request "
+                                 "shapes and want checking against a live target.")
+    crawl_opts.add_argument("--detect", action="store_true",
+                            help="Fetch each seed once, report which templates match it and "
+                                 "what each one reads out of it, and print the --profile "
+                                 "command to crawl with. Does not crawl. Cheap enough to be "
+                                 "the first thing you run against an unknown target.")
+    crawl_opts.add_argument("--templates", action="append", default=None, metavar="DIR",
+                            help="Load extra listing templates from this directory (repeat "
+                                 "for several). A template of the same name replaces the "
+                                 "built-in one -- which is how a target-specific profile "
+                                 "stays out of the repository.")
     return parser
 
 
@@ -1906,6 +1991,11 @@ def main(argv=None):
     if rv_args and args.mode != "tree":
         parser.error(f"unrecognized arguments: {' '.join(rv_args)}")
 
+    # Listing the templates answers a question about this program, not about a target, so
+    # it runs before the mode check and never opens a socket.
+    if args.list_profiles:
+        sys.exit(list_profiles_mode(args))
+
     if bool(args.farm) == bool(args.mode):
         parser.error("specify exactly one of --farm or --mode")
 
@@ -1949,6 +2039,10 @@ def main(argv=None):
             sys.exit(1)
         logger.info(f"Using {len(proxies)} SOCKS endpoint(s) x "
                     f"{args.circuits_per_endpoint} circuit(s).")
+        if args.detect:
+            code = detect_mode(urls, proxies, args)
+            logger.info(f"OnionAccelerator detection finished (exit {code}).")
+            sys.exit(code)
         code = crawl_mode(urls, proxies, args)
         logger.info(f"OnionAccelerator crawl mode finished (exit {code}).")
         sys.exit(code)

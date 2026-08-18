@@ -1,0 +1,19 @@
+# A bare list of paths: `find . -type f`, a copied urls.txt, an index.txt somebody left
+# behind. One path per line, nothing else -- so it matches last among the manifests, after
+# the formats that have a fingerprint.
+
+name     = "find-dump"
+title    = "Published path list (`find` output, index.txt)"
+priority = 84
+status   = "verified"
+
+[match]
+content_type = ["text/plain"]
+body_regex   = "^\\.?/?[^\\n<>]+/[^\\n<>]+$"
+
+[extract]
+strategy = "manifest"
+format   = "find"
+
+[navigate]
+kind = "href"

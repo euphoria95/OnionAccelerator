@@ -31,6 +31,7 @@ import time
 from typing import Optional, Pattern, Sequence
 
 from .config import ORDER_BFS, ORDER_DFS
+from .listing.model import PageRequest
 from .urlnorm import dedup_key, dir_url, host_of, is_within, normalize_url
 
 logger = logging.getLogger("OnionAccelerator.crawl.frontier")
@@ -38,13 +39,24 @@ logger = logging.getLogger("OnionAccelerator.crawl.frontier")
 
 @dataclasses.dataclass(frozen=True)
 class Job:
-    """One directory to fetch."""
+    """One directory to fetch.
+
+    `request` is how to ask for it. It is None for the overwhelmingly common case -- a
+    plain GET of `url` -- and carries a method, headers and a body for the targets that
+    serve their listings from an API, which cannot be addressed by a URL alone.
+    """
 
     url: str
     depth: int
     parent: Optional[str] = None
     attempt: int = 0
     not_before: float = 0.0
+    request: Optional[PageRequest] = None
+
+    @property
+    def fetch(self) -> PageRequest:
+        """The request to send. Never None, so the fetcher has no special case."""
+        return self.request or PageRequest.get(self.url)
 
     def retry(self, delay: float) -> "Job":
         """The same job, one attempt later, not runnable until `delay` from now."""
@@ -155,7 +167,8 @@ class Frontier:
 
     # ------------------------------------------------------------ producing
 
-    async def add(self, url: str, depth: int, parent: Optional[str] = None) -> bool:
+    async def add(self, url: str, depth: int, parent: Optional[str] = None,
+                  request: Optional[PageRequest] = None) -> bool:
         """Offer a newly discovered directory. True if it was accepted.
 
         Every rejection reason is logged at DEBUG rather than swallowed: "why didn't it
@@ -179,13 +192,21 @@ class Frontier:
         # Queued under the URL as the server spells it, remembered under an identity
         # that spelling cannot vary: one directory reachable as both `/a/b` and `/a%2Fb`
         # is one directory, and crawling it twice doubles a whole subtree.
+        #
+        # For an API target the URL is not the whole identity -- every directory is the
+        # same endpoint, and it is the body that differs -- so the request contributes
+        # what a URL cannot express. It contributes nothing at all for a plain GET, which
+        # is what keeps the folding above working exactly as it did.
         key = dedup_key(normalized)
+        if request is not None and request.identity:
+            key = f"{request.identity}|{key}"
         async with self._cv:
             if key in self._seen:
                 logger.debug("skip already-seen url=%s", normalized)
                 return False
             self._seen.add(key)
-            self._push(Job(url=normalized, depth=depth, parent=parent))
+            self._push(Job(url=normalized, depth=depth, parent=parent,
+                           request=self._pin(request, normalized)))
             self._cv.notify()
         return True
 
@@ -202,6 +223,24 @@ class Frontier:
             logger.debug("requeued url=%s attempt=%d delay=%.1fs",
                          job.url, retried.attempt, delay)
             self._cv.notify_all()
+
+    @staticmethod
+    def _pin(request: Optional[PageRequest], url: str) -> Optional[PageRequest]:
+        """Keep a plain GET in step with the URL the frontier normalised.
+
+        The queue stores the canonical spelling, and a GET that still pointed at the raw
+        one would be fetched twice under two names.
+
+        An API request is left exactly as it is, and the difference is the point: its URL
+        is the endpoint every directory shares, while the job's URL is the directory it
+        stands for. Rewriting the endpoint to the directory would send the crawl to a URL
+        the target does not serve.
+        """
+        if request is None:
+            return None
+        if request.identity:
+            return request
+        return request if request.url == url else request.with_url(url)
 
     def _push(self, job: Job) -> None:
         """Heap insert. Caller holds the condition."""

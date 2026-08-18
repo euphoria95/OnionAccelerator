@@ -1,0 +1,19 @@
+# A themed autoindex: nginx-fancyindex, Apaxy, and the many copies of them. The theme
+# adds a header, a footer, a stylesheet and sometimes a search box -- the search box being
+# the problem, because a <form> costs an unthemed page enough confidence to fall under the
+# bar. Naming the theme is what buys that back.
+
+name     = "fancyindex-theme"
+title    = "Themed autoindex (nginx-fancyindex, Apaxy and friends)"
+priority = 50
+status   = "unverified"
+
+[match]
+content_type = ["text/html"]
+body_regex   = "fancyindex|apaxy"
+
+[extract]
+strategy = "anchors"
+
+[navigate]
+kind = "href"

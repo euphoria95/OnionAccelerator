@@ -1,0 +1,42 @@
+# WebDAV. Every listing is a PROPFIND with Depth: 1, which is the reason the engine
+# learned to send something other than a GET: a WebDAV collection answers a GET with
+# either 405 or somebody's HTML skin, and neither is the listing.
+#
+# Nextcloud, ownCloud, Apache mod_dav, nginx-dav and rclone's serve all answer this.
+
+name     = "webdav-propfind"
+title    = "WebDAV collection (PROPFIND)"
+priority = 70
+status   = "unverified"
+
+[match]
+content_type = ["application/xml", "text/xml"]
+body_regex   = "multistatus"
+
+[probe]
+method = "PROPFIND"
+path   = ""
+body   = "<?xml version=\"1.0\"?><propfind xmlns=\"DAV:\"><allprop/></propfind>"
+expect_regex = "multistatus"
+
+[probe.headers]
+Depth = "1"
+Content-Type = "application/xml"
+
+[extract]
+strategy = "xml"
+rows     = "response"
+href     = "href"
+size     = "getcontentlength"
+date     = "getlastmodified"
+dir_when = "collection"
+
+[navigate]
+kind   = "api"
+method = "PROPFIND"
+url    = "{origin}/{path}"
+body   = "<?xml version=\"1.0\"?><propfind xmlns=\"DAV:\"><allprop/></propfind>"
+
+[navigate.headers]
+Depth = "1"
+Content-Type = "application/xml"

@@ -1,0 +1,18 @@
+# `ls -lR` output: a block per directory, each headed by its path and followed by long
+# format rows. Carries real byte counts, which a `find` dump does not.
+
+name     = "ls-lr-dump"
+title    = "Published `ls -lR` dump"
+priority = 86
+status   = "verified"
+
+[match]
+content_type = ["text/plain"]
+body_regex   = "^[-d][rwxsStT-]{9}[.+]? +[0-9]+ "
+
+[extract]
+strategy = "manifest"
+format   = "ls"
+
+[navigate]
+kind = "href"

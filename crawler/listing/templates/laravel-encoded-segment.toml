@@ -1,0 +1,40 @@
+# The shape a leak-site file manager actually takes: one Laravel route serving a whole
+# tree, with the relative path passed as a parameter and percent-encoded into a single
+# segment.
+#
+#   /r/filemanager/TOK/dumps              a directory, at its own URL
+#   /r/filemanager/TOK/dumps%2Fraw        its child, separator folded away
+#   /r/filemanager/TOK/Q1%202019/photos   an up-link, where the page itself is at Q1+2019
+#
+# Read as raw path text `dumps%2Fraw` is one directory named "dumps/raw", which is below
+# neither the page that linked it nor the crawl's scope root -- so every link below the
+# first nested level looks like off-tree navigation and the crawl stops two levels down
+# reporting success. On the onion this was found on that was 418 files against a published
+# index of 86,992.
+#
+# The links are published in full, so this reads them structurally like any autoindex;
+# what it adds is the recognition, which is what stops a directory holding one file from
+# being written off, and the search form that shape always carries from costing it the
+# confidence it needs.
+
+name     = "laravel-encoded-segment"
+title    = "File manager serving a tree from one route (path as an escaped segment)"
+priority = 65
+status   = "verified"
+
+# The signature is the encoding itself -- a link whose path carries an escaped
+# separator -- and nothing looser. Matching on a route name like /files/ or /fm/ would
+# hijack every Apache listing that happens to be served under one.
+#
+# A manager's *root* page usually links its children with real separators, so it reads
+# structurally and this template engages one level down, where the folding starts. That
+# is why the engine keeps re-matching while a host is still on the fallback.
+[match]
+content_type = ["text/html"]
+body_regex   = "href=\"[^\"]*%2[fF]"
+
+[extract]
+strategy = "anchors"
+
+[navigate]
+kind = "href"

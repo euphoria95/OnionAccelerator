@@ -28,7 +28,8 @@ from .config import (
 )
 from .fetcher import AsyncFetcher, FetchResult, Verdict, backoff_delay
 from .frontier import Frontier, HostLimiter, Job
-from .indexparse import parse_index
+from .listing import Finding, ListingEngine, Page, PageRequest, detect
+from .listing.navigate import seed_request
 from .proxypool import AsyncLanePool, ConnectorFactory, Endpoint
 from .report import CrawlReport
 
@@ -45,12 +46,14 @@ class Crawler:
         frontier: Frontier,
         fetcher: AsyncFetcher,
         report: CrawlReport,
+        listing: ListingEngine,
     ) -> None:
         self.config = config
         self.pool = pool
         self.frontier = frontier
         self.fetcher = fetcher
         self.report = report
+        self.listing = listing
         self.hosts = HostLimiter(config.per_host)
 
         self._pages = 0
@@ -65,7 +68,13 @@ class Crawler:
     async def run(self) -> dict[str, Any]:
         """Seed, spawn workers, wait, and write the report. Always writes a report."""
         for seed in self.config.seeds:
-            if not await self.frontier.add(seed, depth=0, parent=None):
+            # A forced profile addresses the seed the way it addresses everything else:
+            # an API target would otherwise be asked for its root with a GET, answer a
+            # JavaScript shell, and the crawl would end before it started.
+            request = None
+            if self.listing.forced is not None:
+                request = seed_request(self.listing.forced, seed)
+            if not await self.frontier.add(seed, depth=0, parent=None, request=request):
                 logger.warning("seed rejected by the frontier: %s", seed)
 
         n_workers = self.config.workers or len(self.pool)
@@ -153,27 +162,42 @@ class Crawler:
         return await self._retry(job, result, record)
 
     async def _expand(self, job: Job, result: FetchResult, record: dict[str, Any]) -> None:
-        """Parse a fetched page and turn each subdirectory into its own job."""
-        listing = parse_index(
-            result.body or "",
-            result.final_url or job.url,
+        """Read a fetched page and turn each subdirectory into its own job.
+
+        Every decision about *what the page says* belongs to the listing layer; what is
+        left here is what the crawler does about it.
+        """
+        page = Page(
+            url=result.final_url or job.url,
+            body=result.body or "",
+            status=result.status or 0,
             content_type=result.content_type,
-            allow_offsite=self.config.allow_offsite,
+            headers=result.headers,
+            request=job.fetch,
         )
+        listing = self.listing.parse(page)
 
         if not listing.is_index:
             # Not an open directory: a landing page, an app, a file served as HTML.
             # Not expanding it is what stops the crawl turning into a site crawl.
-            logger.info("[SKIP] not a directory index (confidence %.2f): %s",
-                        listing.confidence, job.url)
+            logger.info("[SKIP] not a directory index (confidence %.2f, profile %s): %s",
+                        listing.confidence, listing.profile, job.url)
             self.report.record_skipped(job, listing, record)
             return
 
         self.report.record_listing(job, listing, record)
         self._pages += 1
 
-        for entry in listing.directories:
-            await self.frontier.add(entry.url, depth=job.depth + 1, parent=job.url)
+        if listing.expandable:
+            for entry in listing.directories:
+                await self.frontier.add(entry.url, depth=job.depth + 1, parent=job.url,
+                                        request=entry.listing_request())
+
+        # Another page of *this* directory, not a level below it: queued at the same
+        # depth, or a manager with forty pages would grow a tree forty levels deep.
+        for following in listing.more:
+            await self.frontier.add(following.url, depth=job.depth, parent=job.parent,
+                                    request=following)
 
         await self._check_layer_switch()
         await self._check_page_budget()
@@ -292,6 +316,8 @@ class Crawler:
             "allow_offsite": self.config.allow_offsite,
             "include": self.config.include.pattern if self.config.include else None,
             "exclude": self.config.exclude.pattern if self.config.exclude else None,
+            "profile": self.config.profile,
+            "templates": list(self.config.templates),
         }
 
 
@@ -325,14 +351,80 @@ async def run_crawl(
         allow_offsite=config.allow_offsite,
     )
     fetcher = AsyncFetcher(pool, max_page_bytes=config.max_page_bytes)
+    listing = ListingEngine.build(
+        forced=config.profile,
+        templates=config.templates,
+        allow_offsite=config.allow_offsite,
+    )
 
     try:
         with CrawlReport(config.out_dir, config.job_id, config.seeds) as report:
-            crawler = Crawler(config, pool, frontier, fetcher, report)
+            crawler = Crawler(config, pool, frontier, fetcher, report, listing)
             stats = await crawler.run()
             return stats, report.file_urls
     finally:
         await pool.close()
+
+
+async def run_detect(
+    config: CrawlConfig,
+    endpoints: Sequence[str],
+    user_agents: Sequence[str],
+    *,
+    connector_factory: Optional[ConnectorFactory] = None,
+) -> list[tuple[str, list[Finding]]]:
+    """Fetch each seed once and report which templates read it, without crawling.
+
+    One request per seed, plus one per probe. That is the whole cost of finding out what
+    a target is, against the thousands a crawl spends discovering the same thing by
+    failing -- and failing quietly, because a target nothing can read looks exactly like
+    a target with nothing in it.
+    """
+    pool = await AsyncLanePool.create(
+        endpoints,
+        circuits_per_endpoint=config.circuits_per_endpoint,
+        user_agents=list(user_agents),
+        connector_factory=connector_factory,
+    )
+    fetcher = AsyncFetcher(pool, max_page_bytes=config.max_page_bytes)
+    engine = ListingEngine.build(
+        forced=config.profile,
+        templates=config.templates,
+        allow_offsite=config.allow_offsite,
+    )
+
+    async def fetch(request: PageRequest) -> Optional[Page]:
+        result = await fetcher.fetch(Job(url=request.url, depth=0, request=request))
+        if result.verdict is not Verdict.OK or result.body is None:
+            logger.debug("detect: %s %s -> %s (%s)", request.method, request.url,
+                         result.status, result.error or result.verdict.value)
+            return None
+        return Page(
+            url=result.final_url or request.url,
+            body=result.body,
+            status=result.status or 0,
+            content_type=result.content_type,
+            headers=result.headers,
+            request=request,
+        )
+
+    try:
+        return [(seed, await detect(engine, seed, fetch)) for seed in config.seeds]
+    finally:
+        await pool.close()
+
+
+def detect_targets(
+    config: CrawlConfig,
+    endpoints: Sequence[str],
+    user_agents: Sequence[str],
+    *,
+    connector_factory: Optional[ConnectorFactory] = None,
+) -> list[tuple[str, list[Finding]]]:
+    """Synchronous wrapper around run_detect(), for the CLI."""
+    return asyncio.run(run_detect(
+        config, endpoints, user_agents, connector_factory=connector_factory
+    ))
 
 
 def crawl(

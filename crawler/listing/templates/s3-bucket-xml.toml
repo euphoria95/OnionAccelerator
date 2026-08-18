@@ -1,0 +1,35 @@
+# An S3-compatible bucket listed anonymously: AWS, MinIO, Ceph, Garage. Objects are keys,
+# not links, and "directories" are the CommonPrefixes the delimiter produced -- so both
+# halves of the listing come from different elements, and both are full paths from the
+# bucket root rather than names relative to the page.
+#
+# Paging is a continuation token rather than a page number, and it is not optional: a
+# bucket answers 1000 keys at a time and the rest is silence without it.
+
+name     = "s3-bucket-xml"
+title    = "S3-compatible bucket listing (ListBucketResult)"
+priority = 80
+status   = "unverified"
+
+[match]
+content_type = ["application/xml", "text/xml"]
+body_regex   = "<ListBucketResult"
+
+[extract]
+strategy     = "xml"
+rows         = "Contents"
+name         = "Key"
+size         = "Size"
+date         = "LastModified"
+dir_rows     = "CommonPrefixes"
+dir_name     = "Prefix"
+path_is_name = true
+cursor_field = "NextContinuationToken"
+more_field   = "IsTruncated"
+
+[navigate]
+kind = "href"
+
+[paginate]
+kind  = "cursor"
+param = "continuation-token"

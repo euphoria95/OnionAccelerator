@@ -1,0 +1,21 @@
+# Caddy's `file_server browse` answering Accept: application/json. Same shape as nginx's
+# JSON autoindex plus a per-entry `url`, which is worth using: Caddy escapes it correctly
+# for names the crawler would otherwise have to re-encode itself.
+
+name     = "caddy-json"
+title    = "Caddy file_server browse (JSON)"
+priority = 82
+status   = "unverified"
+
+[match]
+content_type = ["application/json"]
+body_regex   = "\"is_dir\""
+
+[extract]
+strategy  = "json"
+href      = "url"
+date      = "mod_time"
+dir_field = "is_dir"
+
+[navigate]
+kind = "href"

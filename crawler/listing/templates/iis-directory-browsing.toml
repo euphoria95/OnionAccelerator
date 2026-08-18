@@ -1,0 +1,19 @@
+# IIS directory browsing. Its listing is a <pre> block where directories are marked by a
+# literal "<dir>" column rather than by a trailing slash, and the up-link is spelled
+# "[To Parent Directory]" -- the structural reader handles both, this only names the
+# target so a thin directory is not written off.
+
+name     = "iis-directory-browsing"
+title    = "Microsoft IIS directory browsing"
+priority = 55
+status   = "unverified"
+
+[match]
+content_type = ["text/html"]
+body_regex   = "\\[To Parent Directory\\]"
+
+[extract]
+strategy = "anchors"
+
+[navigate]
+kind = "href"

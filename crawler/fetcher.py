@@ -36,6 +36,7 @@ from .config import (
     READ_CHUNK,
 )
 from .frontier import Job
+from .listing.model import PageRequest
 from .proxypool import AsyncLanePool, Endpoint, Lane
 from .urlnorm import normalize_url
 
@@ -55,7 +56,8 @@ MAX_REDIRECTS = 5
 
 # Bodies worth handing to the parser. Anything else is a file that happened to be
 # linked from a listing, and reading it whole over Tor would be a waste of a circuit.
-_PARSEABLE = ("text/html", "application/xhtml", "text/plain", "application/json", "text/json")
+_PARSEABLE = ("text/html", "application/xhtml", "text/plain", "application/json",
+              "text/json", "application/xml", "text/xml")
 
 # Statuses that mean "the server is there, but not now".
 _TRANSIENT_STATUS = frozenset({408, 425, 429, 502, 503, 504, 522, 523, 524})
@@ -91,6 +93,10 @@ class FetchResult:
     endpoint: Optional[Endpoint] = None
     lane_index: Optional[int] = None
     retry_budget: Optional[int] = None
+    # Kept for the listing layer, not for the report: a template may identify its target
+    # by `Server:` or by a framework's own header, and by the time the body is parsed the
+    # response object is long closed.
+    headers: dict[str, str] = dataclasses.field(default_factory=dict)
 
     @property
     def ok(self) -> bool:
@@ -118,7 +124,7 @@ class AsyncFetcher:
         self._max_page_bytes = max_page_bytes
 
     async def fetch(self, job: Job, *, exclude: Optional[Endpoint] = None) -> FetchResult:
-        """Fetch `job.url`, following same-host redirects, and classify the outcome.
+        """Fetch `job`, following same-host redirects, and classify the outcome.
 
         `exclude` is the endpoint that failed this job last time; the pool will avoid
         it if it can, which is the difference between retrying a dead daemon three times
@@ -127,7 +133,7 @@ class AsyncFetcher:
         started = time.monotonic()
         async with self._pool.lease(exclude=exclude) as lane:
             try:
-                result = await self._request(lane, job.url)
+                result = await self._request(lane, job.fetch)
             except Exception as exc:                      # noqa: BLE001 - classified below
                 result = self._classify_exception(exc, job.url)
             result.elapsed = time.monotonic() - started
@@ -158,11 +164,24 @@ class AsyncFetcher:
 
     # ------------------------------------------------------------ the request
 
-    async def _request(self, lane: Lane, url: str) -> FetchResult:
-        """GET `url`, following redirects by hand so every hop is visible and checked."""
+    async def _request(self, lane: Lane, request: PageRequest) -> FetchResult:
+        """Send `request`, following redirects by hand so every hop is visible and checked.
+
+        Not `session.get`: a listing is not always a GET. A WebDAV collection is a
+        PROPFIND, and half the file managers worth crawling answer a POST whose body says
+        which directory is wanted. The redirect handling, the size cap and the verdict
+        taxonomy below are the same either way -- only the verb and the body change, and a
+        redirect is re-sent with both, because a 307 that turned a POST into a GET would
+        fetch the wrong thing and report success.
+        """
+        url = request.url
         current = url
+        headers = request.header_dict() or None
         for hop in range(MAX_REDIRECTS + 1):
-            async with lane.session.get(current, allow_redirects=False) as response:
+            async with lane.session.request(
+                request.method, current, headers=headers,
+                data=request.body, allow_redirects=False,
+            ) as response:
                 status = response.status
                 content_type = (response.headers.get("Content-Type") or "").split(";")[0].strip()
 
@@ -221,7 +240,8 @@ class AsyncFetcher:
                               f"raise it to read this directory",
                     )
                 return FetchResult(Verdict.OK, url, final_url=current, status=status,
-                                   content_type=content_type, body=body, nbytes=nbytes)
+                                   content_type=content_type, body=body, nbytes=nbytes,
+                                   headers=dict(response.headers))
 
         return FetchResult(Verdict.DROP, url, final_url=current,
                            error=f"more than {MAX_REDIRECTS} redirects")

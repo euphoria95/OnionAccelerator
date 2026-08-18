@@ -1,0 +1,11 @@
+[4.0K]  .
+├── [4.0K]  ./files
+│   ├── [4.0K]  ./files/archive
+│   │   └── [ 512]  ./files/archive/old.tar
+│   ├── [4.0K]  ./files/incoming
+│   ├── [512M]  ./files/dump.sql.gz
+│   └── [4.1K]  ./files/README.txt
+└── [4.0K]  ./pub
+    └── [1.2G]  ./pub/leak.7z
+
+4 directories, 4 files

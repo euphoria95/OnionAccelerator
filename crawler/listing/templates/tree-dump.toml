@@ -1,0 +1,29 @@
+# A published `tree` dump, read instead of crawled.
+#
+# The onion this crawler was built against serves `List_of_leaked_files.txt` in its root:
+# an 11 MB `tree -h -f` of 94,228 entries, "7237 directories, 86992 files". Reading it is
+# one request; walking the same tree is seven and a half thousand over Tor. It is also the
+# only sound way to measure recall -- what the crawl found, against what the server says
+# it has.
+#
+# Point --url straight at the dump:
+#   --mode crawl --url http://host/List_of_leaked_files.txt --profile tree-dump
+#
+# Paths resolve against the dump's own directory, so a dump served beside the tree it
+# describes needs no configuration; one served elsewhere needs [extract].strip_prefix.
+
+name     = "tree-dump"
+title    = "Published `tree -f` dump (one request for a whole subtree)"
+priority = 90
+status   = "verified"
+
+[match]
+content_type = ["text/plain"]
+body_regex   = "(├──|└──|`--|\\|--)"
+
+[extract]
+strategy = "manifest"
+format   = "tree"
+
+[navigate]
+kind = "href"

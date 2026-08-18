@@ -1,0 +1,22 @@
+# The profile that needs no profile.
+#
+# Every <a href> on the page, filtered by where it points: anything resolving above the
+# directory being listed is navigation, anything with the page's own path plus a query is
+# a sort control. That is enough for Apache, nginx, lighttpd, Caddy, IIS, http.server and
+# the hand-rolled templates onion operators actually run -- which is why it is the
+# fallback, and why a target no other template matches is still crawled exactly as it was
+# before templates existed.
+#
+# It has no [match] section on purpose: it matches everything, at priority 0, so any
+# template that knows something specific outranks it.
+
+name     = "generic-structural"
+title    = "Any open directory, read structurally"
+priority = 0
+status   = "verified"
+
+[extract]
+strategy = "anchors"
+
+[navigate]
+kind = "href"
