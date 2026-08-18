@@ -40,6 +40,10 @@ OnionAccelerator is a multi-functional Python script designed for discovering an
 - Also walks the **file managers** leak sites run, which serve a whole tree from one
   route and encode the path into it — `/r/filemanager/TOK/dumps%2Fraw/part.bin` — rather
   than serving the tree at its own paths.
+- Reads targets whose listing is **not links at all** — a path in `?p=`, a JSON API behind
+  a JavaScript shell, a WebDAV collection, an S3 bucket, or the site's own published
+  `tree` dump — through **listing templates**: one small TOML file per known logic.
+  `--detect` says which one fits a target before you spend a crawl finding out.
 - Spreads its requests across **many Tor circuits at once** — every SOCKS endpoint × N
   credential-isolated circuits — with per-endpoint failover, circuit rotation and
   exponential backoff for the timeouts, 503s and dropped circuits that Tor guarantees.
@@ -125,6 +129,10 @@ python3 OnionAccelerator.py --mode tree [--url URL] [--external] [-- <rvtree arg
 
 # Recursively map an open directory (and optionally download what it finds):
 python3 OnionAccelerator.py --mode crawl [--url URL ...] [--max-depth N] [--order bfs|dfs] [--socks host:port,...] [--download]
+
+# Ask what a target is before crawling it, and see what can be read:
+python3 OnionAccelerator.py --mode crawl --detect [--url URL ...]
+python3 OnionAccelerator.py --list-profiles
 
 # The per-mode reference: what each mode does and which flags reach it.
 python3 OnionAccelerator.py --full-help [<multi|partial|speedtest|tree|crawl|farm>]
@@ -276,11 +284,32 @@ python3 OnionAccelerator.py --mode crawl --socks 127.0.0.1:9050,127.0.0.1:9052 -
 python3 OnionAccelerator.py --mode crawl --max-depth 3 --download
 ```
 
-### A parser with no server templates
+### Reading is separate from crawling
 
-Open directories are rendered by at least half a dozen web servers and any number of
-hand-rolled templates, so matching markup per server is a losing game. The parser reads
-*every* `<a href>` on the page and then discards junk by **structure**:
+The crawler is two halves. The **engine** — frontier, circuit pool, fetcher, report —
+moves bytes and knows nothing about what a listing looks like. The **listing layer**
+(`crawler/listing/`) decides what a fetched page means, and is driven by **templates**:
+one small TOML file per known open-directory logic.
+
+That split exists because the two halves change for different reasons. The transport is
+the same for every onion; the reading is different for every file manager. Keeping them
+together is what made *"this target is unsupported"* indistinguishable from *"this
+directory is empty"* — both produced a run that reported success and stopped early.
+
+```bash
+# What is this target, and how should it be read? One request per seed.
+python3 OnionAccelerator.py --mode crawl --detect --url https://example.onion/
+
+# What does it already know how to read?
+python3 OnionAccelerator.py --list-profiles
+```
+
+### A parser with no server *markup* templates
+
+The default reading has no per-server templates and never will. Open directories are
+rendered by at least half a dozen web servers and any number of hand-rolled templates, so
+matching markup per server is a losing game. The parser reads *every* `<a href>` on the
+page and then discards junk by **structure**:
 
 - Anything that does not resolve strictly *below* the directory being listed is
   navigation. That single rule kills `../`, `/`, "Parent Directory" and every breadcrumb
@@ -316,6 +345,90 @@ scores below the bar the moment a directory holds only a single file or subdirec
 that directory is wrongly abandoned as a leaf, silently pruning whatever is beneath it. An
 application does not gain from the signal: only a link to the *immediate*, segment-aligned
 parent counts, so stray "up" links to `/` or a sibling section do not fire it.
+
+### Templates: addressing, not markup
+
+What a template describes is the axis the structural reading cannot express — **how a
+listing is addressed and fetched**. Is a child directory a path segment, a query
+parameter, a percent-encoded segment, or a field in a JSON request? Where are the rows,
+if they are not links? Where does a file's *bytes* live, if not at the URL its row points
+to? None of that is knowable from markup, and all of it decides whether a crawl goes
+anywhere at all.
+
+The built-in set covers five logics. `--list-profiles` prints them all:
+
+| Logic | Templates |
+|---|---|
+| Path-addressed HTML autoindex | `generic-structural` (the fallback, priority 0), `apache-autoindex`, `nginx-autoindex`, `lighttpd-dirlisting`, `caddy-browse`, `iis-directory-browsing`, `python-http-server`, `fancyindex-theme`, `directory-lister` |
+| Machine-readable over GET | `nginx-json`, `caddy-json`, `s3-bucket-xml` |
+| Query / param-addressed managers | `tiny-file-manager` (`?p=`), `laravel-filemanager`, `laravel-encoded-segment`, `nextcloud-public-share` |
+| API-driven (a POST per directory) | `alist`, `filebrowser`, `filegator`, `h5ai`, `elfinder`, `webdav-propfind` |
+| The target's own published index | `tree-dump`, `ls-lr-dump`, `find-dump`, `sitemap-xml` |
+
+A template is four short sections — recognise, extract, navigate, download:
+
+```toml
+name     = "tiny-file-manager"
+title    = "Tiny File Manager (path in ?p=)"
+priority = 70
+
+[match]                                  # every rule present must hold
+content_type = ["text/html"]
+body_regex   = "tinyfilemanager"
+
+[extract]                                # where the rows are
+strategy = "rows"
+row      = "table#main-table tbody tr"
+link     = "td a.link"
+dir_when = "i.fa-folder-o"
+
+[navigate]                               # how a child is addressed
+kind  = "query"
+param = "p"
+
+[download]                               # where the bytes are, if not the row's URL
+url = "{root}?p={path}&dl={name}"
+```
+
+Two properties make this safe to rely on:
+
+- **A target no template matches is crawled exactly as it was before templates existed.**
+  `generic-structural` has no match rules, sits at priority 0, and is the fallback. The
+  whole existing test suite runs through it unchanged.
+- **A template that fails to load is a fatal error naming the file.** A silently ignored
+  typo is a rule that stopped applying, which produces precisely the quiet failure this
+  design exists to remove.
+
+`status = "verified"` in `--list-profiles` means a fixture in the test suite pins that
+template against a real listing. `unverified` means it was written from documented request
+shapes with no live target to check against — `--detect` says so rather than presenting a
+guess as a fact.
+
+Templates you write live wherever you like:
+
+```bash
+python3 OnionAccelerator.py --mode crawl --templates ~/profiles \
+    --profile my-target --url https://example.onion/
+```
+
+A template in `--templates` replaces a built-in of the same name, so a profile for one
+engagement's target never has to be committed. **How to write one:
+[`crawler/listing/templates/README.md`](crawler/listing/templates/README.md)** — three
+worked examples and the full key reference.
+
+### The target's own index, instead of a crawl
+
+Leak sites publish these. Where a target serves a `tree`, `find` or `ls -lR` dump of what
+it holds, reading it is *one request* against the thousands the same tree costs over Tor
+— and it is the only sound way to measure what a crawl missed:
+
+```bash
+python3 OnionAccelerator.py --mode crawl \
+    --profile tree-dump --url https://example.onion/List_of_files.txt
+```
+
+Directories from a dump are recorded and never fetched: the dump already said what is
+under them.
 
 ### Paths, as the server spells them
 
@@ -427,7 +540,8 @@ multi-circuit spread is actually working.
 
 - `OnionAccelerator.py`: The main script containing all modes (multi-download, partial-download, speedtest, tree, crawl).
 - `remote_viewer/`: The `rvtree` package behind `--mode tree`. Usable on its own too — see its own README.
-- `crawler/`: The asyncio package behind `--mode crawl` — universal listing parser, multi-circuit proxy pool, frontier and reporting. The only async code in the project; the other modes stay on threads over `requests`.
+- `crawler/`: The asyncio package behind `--mode crawl` — multi-circuit proxy pool, frontier, fetcher and reporting. The only async code in the project; the other modes stay on threads over `requests`.
+- `crawler/listing/`: The scraping layer, with no crawl in it: the structural reader, the JSON/XML/row/manifest strategies, the addressing rules, and the template engine behind `--profile` and `--detect`. Adding support for a target is a file in `crawler/listing/templates/`, not a change to the crawler — see that directory's [README](crawler/listing/templates/README.md).
 - `fullhelp.py`: The long-form per-mode reference printed by `--full-help`. Pure prose and stdlib, imported eagerly precisely because it can never fail.
 - `requirements.txt`: Python dependencies.
 - `URLs.txt`: A text file with one URL per line. Optional — `--url` replaces it.
@@ -439,7 +553,7 @@ multi-circuit spread is actually working.
 
 ## Requirements
 
-- Python 3.7+ (3.8+ for `--mode crawl`, which is `aiohttp`'s own floor)
+- Python 3.7+ (3.8+ for `--mode crawl`, which is `aiohttp`'s own floor; 3.11+ for its listing templates, which are TOML read with the standard library's `tomllib` — on 3.8–3.10 install `tomli`)
 - `requests[socks]` or `PySocks` for SOCKS5 support
 - `tqdm` for progress bars
 - `aiohttp`, `aiohttp-socks`, `beautifulsoup4`, `lxml` — `--mode crawl` only; the other modes run without them

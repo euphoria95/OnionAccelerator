@@ -1,0 +1,18 @@
+# lighttpd mod_dirlisting. Serves XHTML with an XML declaration and puts its version in a
+# <div class="foot"> rather than the <address> footer Apache uses, so the generator rule
+# other templates lean on finds nothing here -- the body signature is what is left.
+
+name     = "lighttpd-dirlisting"
+title    = "lighttpd mod_dirlisting"
+priority = 60
+status   = "verified"
+
+[match]
+content_type = ["text/html", "application/xhtml"]
+body_regex   = "lighttpd/[0-9]"
+
+[extract]
+strategy = "anchors"
+
+[navigate]
+kind = "href"

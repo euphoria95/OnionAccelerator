@@ -108,6 +108,12 @@ class CrawlConfig:
     exclude: Optional[Pattern[str]] = None
     switch_after: Optional[int] = None
     download: bool = False
+    # Which listing template to read pages with. None lets the engine pick one per host
+    # from the built-in set, falling back to the structural reader; a name forces one,
+    # which is also what makes an API target crawlable at all -- its seed has to be
+    # addressed in the target's own scheme before there is a page to match against.
+    profile: Optional[str] = None
+    templates: list[str] = dataclasses.field(default_factory=list)
     out_dir: str = ""
     job_id: str = ""
 

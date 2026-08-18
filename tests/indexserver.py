@@ -20,6 +20,7 @@ for. See its docstring.
 from __future__ import annotations
 
 import html
+import json
 import os
 import threading
 from http.server import BaseHTTPRequestHandler, SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -120,6 +121,144 @@ class IndexServer:
     def hits(self, path: str) -> int:
         with self._lock:
             return self.request_log.count(path)
+
+
+class ApiServer:
+    """A file manager that has no listings at all -- only a JSON API.
+
+    The shape AList, FileGator and h5ai have, and the one the old crawler could not touch:
+    every directory is the *same URL*, answered only to a POST whose body says which
+    directory is wanted. A GET of any browse URL returns a JavaScript shell with no links
+    in it, so a structural reader finds nothing, scores zero, and records the target as a
+    single empty page -- with no error anywhere.
+
+    Kept deliberately minimal: one endpoint, one body field, an AList-shaped answer. What
+    is being tested is the engine's ability to carry a method and a body from a template
+    all the way through the frontier and the fetcher, not anybody's exact API.
+    """
+
+    ENDPOINT = "/api/fs/list"
+
+    def __init__(self, directory: str) -> None:
+        self.directory = directory
+        self.request_log: list[str] = []      # the *paths asked for*, not the URLs
+        self.method_log: list[str] = []
+        self._lock = threading.Lock()
+        self._server: Optional[ThreadingHTTPServer] = None
+        self._thread: Optional[threading.Thread] = None
+
+    def __enter__(self) -> "ApiServer":
+        outer = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):                      # noqa: N802 - stdlib naming
+                with outer._lock:
+                    outer.method_log.append("GET")
+                raw = unquote(self.path.split("?", 1)[0]).strip("/")
+                target = os.path.join(outer.directory, raw)
+                if os.path.isfile(target):
+                    # Files really are served over HTTP; only listings are API-only.
+                    with open(target, "rb") as fh:
+                        self._respond(fh.read(), "application/octet-stream")
+                    return
+                # Every browse URL answers the same shell, exactly like the real thing.
+                self._respond(
+                    "<!doctype html><html><head><title>files</title></head>"
+                    "<body><div id='root'></div><script src='/assets/alist.js'>"
+                    "</script></body></html>",
+                    "text/html; charset=utf-8")
+
+            def do_POST(self):                     # noqa: N802 - stdlib naming
+                with outer._lock:
+                    outer.method_log.append("POST")
+                if self.path.split("?", 1)[0] != outer.ENDPOINT:
+                    self.send_error(404)
+                    return
+                length = int(self.headers.get("Content-Length") or 0)
+                body = self.rfile.read(length).decode("utf-8") if length else "{}"
+                try:
+                    asked = str(json.loads(body).get("path", "")).strip("/")
+                except ValueError:
+                    self.send_error(400)
+                    return
+                with outer._lock:
+                    outer.request_log.append(asked)
+
+                target = os.path.join(outer.directory, asked)
+                if not os.path.isdir(target):
+                    self._respond(json.dumps({"code": 500, "message": "object not found"}),
+                                  "application/json")
+                    return
+                content = []
+                for name in sorted(os.listdir(target)):
+                    full = os.path.join(target, name)
+                    is_dir = os.path.isdir(full)
+                    content.append({
+                        "name": name,
+                        "is_dir": is_dir,
+                        "size": 0 if is_dir else os.path.getsize(full),
+                        "modified": "2024-01-01T00:00:00Z",
+                    })
+                self._respond(
+                    json.dumps({"code": 200, "data": {"content": content,
+                                                      "total": len(content)}}),
+                    "application/json")
+
+            def _respond(self, body, content_type: str) -> None:
+                if isinstance(body, str):
+                    body = body.encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):          # keep the test output readable
+                pass
+
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        if self._server is not None:
+            self._server.shutdown()
+            self._server.server_close()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+
+    @property
+    def port(self) -> int:
+        assert self._server is not None
+        return self._server.server_address[1]
+
+    @property
+    def seed_url(self) -> str:
+        return f"http://127.0.0.1:{self.port}/"
+
+    def template(self) -> str:
+        """A profile for this server, as an operator would write it for a real one."""
+        return (
+            'name = "test-api"\n'
+            'title = "The local API test server"\n'
+            'priority = 95\n'
+            '[match]\n'
+            'body_regex = "alist"\n'
+            '[extract]\n'
+            'strategy = "json"\n'
+            'rows = "data.content"\n'
+            'dir_field = "is_dir"\n'
+            '[navigate]\n'
+            'kind = "api"\n'
+            'method = "POST"\n'
+            f'url = "{{origin}}{self.ENDPOINT}"\n'
+            'body = \'{"path": "/{path}"}\'\n'
+            '[navigate.headers]\n'
+            'Content-Type = "application/json"\n'
+            '[download]\n'
+            'url = "{origin}/{path}"\n'
+        )
 
 
 class FileManagerServer:

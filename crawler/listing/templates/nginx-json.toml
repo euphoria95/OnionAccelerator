@@ -1,0 +1,17 @@
+# nginx's `autoindex_format json;` -- the same directory the HTML variant serves, without
+# any markup at all. An array of {name, type, mtime, size}: unambiguous, so nothing here
+# has to be guessed and the entries carry exact byte counts rather than "512M".
+
+name     = "nginx-json"
+title    = "nginx autoindex (JSON)"
+priority = 80
+status   = "verified"
+
+[match]
+content_type = ["application/json", "text/json"]
+
+[extract]
+strategy = "json"
+
+[navigate]
+kind = "href"

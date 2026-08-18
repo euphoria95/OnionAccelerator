@@ -28,7 +28,7 @@ from .config import (
     URLS_FILE,
 )
 from .frontier import Job
-from .indexparse import Entry, IndexListing
+from .listing import Entry, Listing
 from .urlnorm import dedup_key, host_of, path_segments
 
 logger = logging.getLogger("OnionAccelerator.crawl.report")
@@ -84,7 +84,7 @@ class CrawlReport:
 
     # ------------------------------------------------------------ recording
 
-    def record_listing(self, job: Job, listing: IndexListing, result_record: dict[str, Any]) -> None:
+    def record_listing(self, job: Job, listing: Listing, result_record: dict[str, Any]) -> None:
         """One successfully parsed directory, plus every file it contained."""
         self.totals.directories += 1
         record = dict(result_record)
@@ -96,6 +96,7 @@ class CrawlReport:
             "n_files": len(listing.files),
             "is_index": listing.is_index,
             "confidence": round(listing.confidence, 2),
+            "profile": listing.profile,
             "server": listing.generator,
             "title": listing.title,
             "discovered_at": _now(),
@@ -126,7 +127,10 @@ class CrawlReport:
         key = dedup_key(entry.url)
         if key in self._file_urls:
             return
-        self._file_urls[key] = entry.url
+        # What goes in urls.txt is what `--download` will fetch, which on a target that
+        # browses at one URL and serves bytes at another is not the URL that identifies
+        # the file. The identity stays the browse URL; only the spelling handed on differs.
+        self._file_urls[key] = entry.fetch_url
         self.totals.files += 1
         if entry.size_bytes:
             self.totals.bytes_seen += entry.size_bytes
@@ -137,6 +141,7 @@ class CrawlReport:
             "name": entry.name,
             "size_bytes": entry.size_bytes,
             "mtime_text": entry.mtime_text,
+            "download_url": entry.download_url,
             "depth": depth,
             "parent": parent,
             "http_status": status,
@@ -147,7 +152,7 @@ class CrawlReport:
         self._add_to_tree(entry.url, is_dir=False, size=entry.size_bytes,
                           mtime=entry.mtime_text)
 
-    def record_skipped(self, job: Job, listing: IndexListing,
+    def record_skipped(self, job: Job, listing: Listing,
                        result_record: dict[str, Any]) -> None:
         """A page that was fetched and read but is not a directory listing.
 
@@ -168,6 +173,7 @@ class CrawlReport:
             "n_files": len(listing.files),
             "is_index": False,
             "confidence": round(listing.confidence, 2),
+            "profile": listing.profile,
             "server": listing.generator,
             "title": listing.title,
             "discovered_at": _now(),

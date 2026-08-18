@@ -1,0 +1,21 @@
+# nginx's `autoindex on;` -- a <pre> block with no table, no icons and no footer. The
+# Server header is what identifies it; the content type keeps this off the JSON variant,
+# which the same daemon serves from the same directive.
+
+name     = "nginx-autoindex"
+title    = "nginx autoindex (HTML)"
+priority = 60
+status   = "verified"
+
+[match]
+content_type = ["text/html"]
+title_regex  = "^index of "
+
+[match.header]
+Server = "^nginx"
+
+[extract]
+strategy = "anchors"
+
+[navigate]
+kind = "href"

@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Name>leaks</Name>
+  <Prefix>files/</Prefix>
+  <Delimiter>/</Delimiter>
+  <IsTruncated>true</IsTruncated>
+  <NextContinuationToken>1ueGcxLPRx1Tr</NextContinuationToken>
+  <Contents>
+    <Key>files/dump.sql.gz</Key>
+    <LastModified>2023-11-02T14:29:41.000Z</LastModified>
+    <Size>536870912</Size>
+  </Contents>
+  <Contents>
+    <Key>files/README.txt</Key>
+    <LastModified>2023-11-02T14:28:03.000Z</LastModified>
+    <Size>4198</Size>
+  </Contents>
+  <CommonPrefixes><Prefix>files/archive/</Prefix></CommonPrefixes>
+  <CommonPrefixes><Prefix>files/incoming/</Prefix></CommonPrefixes>
+</ListBucketResult>

@@ -234,6 +234,12 @@ SECTIONS = {
             "dedup test reads the path through one function that decodes before splitting "
             "on '/', so a folded separator is not mistaken for a directory literally "
             "named 'dumps/raw' and written off as off-tree.",
+            "Where a target's listing is not links at all -- a path in ?p=, a JSON API "
+            "behind a JavaScript shell, a WebDAV collection, an S3 bucket, or the target's "
+            "own published 'tree' dump -- a listing template says so, and the crawler asks "
+            "for each directory the way that target expects, up to and including a POST "
+            "whose body names the directory. Run --detect against an unknown target to be "
+            "told which template fits and what to pass; --list-profiles shows them all.",
             "Concurrency is circuits, not just threads. Each endpoint is opened "
             "--circuits-per-endpoint times and each circuit gets its own SOCKS "
             "username/password, which is what makes them separate Tor circuits rather "
@@ -298,11 +304,37 @@ SECTIONS = {
              "stack is threads over requests and running it alongside the event loop "
              "would put two unrelated concurrency models on the same daemons at once. "
              "Paths are always preserved under downloads/<host>/, never flattened."),
+            ("--detect",
+             "Fetch each seed once, report which listing templates match it and what each "
+             "one reads out of it, print the --profile command to crawl with, and stop. "
+             "One request against thousands: run this first on a target you do not know."),
+            ("--profile NAME",
+             "Read every page with this template instead of detecting one per host. "
+             "Required for API-driven targets (AList, WebDAV, h5ai, FileGator): it is "
+             "what lets the seed itself be requested in the target's own scheme, rather "
+             "than fetched as a page that has no listing in it."),
+            ("--list-profiles",
+             "Print the available templates and exit -- name, priority, status, strategy. "
+             "'verified' means a fixture in the test suite pins that template against a "
+             "real listing; 'unverified' means it was written from documented request "
+             "shapes and wants checking against a live target."),
+            ("--templates DIR",
+             "Load extra templates from DIR (repeatable). One of the same name replaces a "
+             "built-in, which is how a profile for one engagement's target stays out of "
+             "the repository."),
             _RETRY_FLAG,
         ] + _PROXY_FLAGS + _FARM_RANGE_FLAGS,
         "examples": [
             ("python3 OnionAccelerator.py --mode crawl --url https://example.onion/dumps/",
              "one seed, whole tree"),
+            ("python3 OnionAccelerator.py --mode crawl --detect --url https://example.onion/",
+             "what is this target, and how is it read?"),
+            ("python3 OnionAccelerator.py --mode crawl --url https://example.onion/ \\\n"
+             "    --profile tiny-file-manager",
+             "a manager whose paths live in ?p="),
+            ("python3 OnionAccelerator.py --mode crawl --profile tree-dump \\\n"
+             "    --url https://example.onion/List_of_files.txt",
+             "read the target's own index: one request, whole tree"),
             ("python3 OnionAccelerator.py --mode crawl --max-depth 2 --max-pages 50",
              "a quick reconnaissance pass"),
             ("python3 OnionAccelerator.py --mode crawl --order bfs --switch-after 200",
@@ -317,6 +349,12 @@ SECTIONS = {
              "map it, then pull it all down"),
         ],
         "notes": [
+            "Reading a page and crawling it are separate: the engine moves bytes, and a "
+            "listing template decides what they mean. A template is a small TOML file "
+            "saying how to recognise a target, where its rows are, and how a child "
+            "directory is addressed -- a path, a query parameter, an escaped segment, or "
+            "a field in an API request. Targets nothing matches are read structurally, "
+            "exactly as before templates existed.",
             "Output lands in crawls/<job_id>/ : listing.jsonl (one record per file), "
             "dirs.jsonl (one per directory, where is_index=false marks a page that was "
             "read and refused by the confidence guard), failed.jsonl, stats.json, "

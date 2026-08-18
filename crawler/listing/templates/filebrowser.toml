@@ -1,0 +1,36 @@
+# File Browser (filebrowser/filebrowser). Another SPA; its API is a plain GET, but the
+# path is in the URL path rather than in a link, so navigation still has to build it.
+#
+# Anonymous access needs the instance to have a public share or a guest account -- an
+# authenticated one needs a token this template cannot carry, which is what --templates is
+# for: copy it, add the header, keep it out of the repository.
+
+name     = "filebrowser"
+title    = "File Browser (/api/resources)"
+priority = 75
+status   = "unverified"
+
+[match]
+body_regex = "filebrowser|File Browser"
+
+[probe]
+method = "GET"
+path   = "/api/resources/"
+expect_regex = "\"items\""
+
+[extract]
+strategy  = "json"
+rows      = "items"
+name      = "name"
+size      = "size"
+date      = "modified"
+dir_field = "isDir"
+path      = "path"
+
+[navigate]
+kind   = "api"
+method = "GET"
+url    = "{origin}/api/resources/{path}"
+
+[download]
+url = "{origin}/api/raw/{path}"

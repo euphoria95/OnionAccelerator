@@ -1,0 +1,18 @@
+# Python's `http.server`. Common on an onion because it is one command, and worth naming
+# because its listings are frequently a single file -- the exact case the confidence
+# guard refuses and a match rescues.
+
+name     = "python-http-server"
+title    = "Python http.server directory listing"
+priority = 55
+status   = "unverified"
+
+[match]
+content_type = ["text/html"]
+title_regex  = "^directory listing for "
+
+[extract]
+strategy = "anchors"
+
+[navigate]
+kind = "href"

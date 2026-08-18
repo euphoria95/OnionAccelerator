@@ -1,0 +1,31 @@
+# Tiny File Manager (prasathmani/tinyfilemanager): one PHP file, extremely common on a
+# quickly-stood-up onion. The path lives in ?p= and nothing links into the tree, so the
+# structural reader sees every row resolve to the page itself and discards the lot as sort
+# controls -- this is the template that exists to prove the point of the redesign.
+
+name     = "tiny-file-manager"
+title    = "Tiny File Manager (path in ?p=)"
+priority = 70
+status   = "verified"
+
+[match]
+content_type = ["text/html"]
+body_regex   = "tinyfilemanager|tiny file manager"
+
+# No size/date selectors: the column order moved between Tiny File Manager releases
+# (the checkbox column comes and goes), and the shared row-text scan reads "271 KB" out of
+# the row wherever it sits. The folder icon is the one thing every version emits, and it
+# is the only signal that separates a directory from a file here -- both are `?p=` links.
+[extract]
+strategy = "rows"
+row      = "table#main-table tbody tr"
+link     = "td a.link, td a"
+dir_when = "i.fa-folder, i.fa-folder-o, td a.folder"
+
+[navigate]
+kind  = "query"
+param = "p"
+join  = "/"
+
+[download]
+url = "{root}?p={path}&dl={name}"

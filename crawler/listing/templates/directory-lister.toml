@@ -1,0 +1,17 @@
+# Directory Lister (PHP). Path-addressed like an autoindex, but with sort and search
+# controls on every page and no server footer at all.
+
+name     = "directory-lister"
+title    = "Directory Lister (PHP)"
+priority = 55
+status   = "unverified"
+
+[match]
+content_type = ["text/html"]
+body_regex   = "directory ?lister|dirlister"
+
+[extract]
+strategy = "anchors"
+
+[navigate]
+kind = "href"

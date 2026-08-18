@@ -1,0 +1,43 @@
+# AList. A single-page app: every directory answers the same JavaScript shell, so nothing
+# can be read from the HTML and passive matching can only spot the shell. The listing is
+# a POST whose body carries the path -- the case the engine's non-GET plumbing exists for.
+#
+# per_page = 0 asks for the whole directory in one answer, which is the right trade over
+# Tor: one large response beats twenty small round trips.
+
+name     = "alist"
+title    = "AList (POST /api/fs/list)"
+priority = 75
+status   = "unverified"
+
+[match]
+body_regex = "window\\.ALIST|alist_|/assets/.*alist"
+
+[probe]
+method = "POST"
+path   = "/api/fs/list"
+body   = "{\"path\": \"/\", \"password\": \"\", \"page\": 1, \"per_page\": 0, \"refresh\": false}"
+expect_regex = "\"content\""
+
+[probe.headers]
+Content-Type = "application/json"
+
+[extract]
+strategy  = "json"
+rows      = "data.content"
+name      = "name"
+size      = "size"
+date      = "modified"
+dir_field = "is_dir"
+
+[navigate]
+kind   = "api"
+method = "POST"
+url    = "{origin}/api/fs/list"
+body   = "{\"path\": \"/{path}\", \"password\": \"\", \"page\": 1, \"per_page\": 0, \"refresh\": false}"
+
+[navigate.headers]
+Content-Type = "application/json"
+
+[download]
+url = "{origin}/d/{path}"

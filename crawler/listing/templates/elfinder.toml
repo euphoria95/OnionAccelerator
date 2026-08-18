@@ -1,0 +1,36 @@
+# elFinder's connector -- the file manager Laravel admin panels most often embed.
+#
+# Marked unverified and left deliberately incomplete: elFinder addresses a directory by an
+# opaque, volume-prefixed base64 hash (`l1_L2R1bXBz`), not by a path, so a template cannot
+# build a child's address without first reading the parent's answer. The listing reads
+# correctly with this profile; walking below the seed needs the hash carried from each
+# response, which is a strategy, not a template. Use it with --detect to confirm what the
+# target is, then --templates a copy with the volume hash you observed.
+
+name     = "elfinder"
+title    = "elFinder connector (cmd=open) -- listing only"
+priority = 65
+status   = "unverified"
+notes    = "Directories are addressed by opaque hash; children below the seed are not walkable from a template alone."
+
+[match]
+body_regex = "elfinder"
+
+[probe]
+method = "GET"
+path   = "/elfinder/connector?cmd=open&init=1&target="
+expect_regex = "\"files\""
+
+[extract]
+strategy   = "json"
+rows       = "files"
+name       = "name"
+size       = "size"
+date       = "ts"
+dir_field  = "mime"
+dir_value  = "directory"
+
+[navigate]
+kind   = "api"
+method = "GET"
+url    = "{origin}/elfinder/connector?cmd=open&target={path}"

@@ -1,0 +1,13 @@
+{
+  "code": 200,
+  "message": "success",
+  "data": {
+    "content": [
+      {"name": "archive", "size": 0, "is_dir": true, "modified": "2023-11-02T14:31:02Z"},
+      {"name": "incoming", "size": 0, "is_dir": true, "modified": "2024-01-17T03:02:55Z"},
+      {"name": "dump.sql.gz", "size": 536870912, "is_dir": false, "modified": "2023-11-02T14:29:41Z"},
+      {"name": "README.txt", "size": 4198, "is_dir": false, "modified": "2023-11-02T14:28:03Z"}
+    ],
+    "total": 4
+  }
+}

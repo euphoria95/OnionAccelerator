@@ -1,0 +1,17 @@
+# Caddy's `file_server browse` HTML template. Modern, JavaScript-decorated, and still a
+# plain list of links underneath -- which is the whole argument for reading structurally.
+
+name     = "caddy-browse"
+title    = "Caddy file_server browse (HTML)"
+priority = 55
+status   = "unverified"
+
+[match]
+content_type = ["text/html"]
+body_regex   = "caddyserver\\.com|id=\"filelist\""
+
+[extract]
+strategy = "anchors"
+
+[navigate]
+kind = "href"

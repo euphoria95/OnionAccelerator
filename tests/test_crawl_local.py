@@ -20,8 +20,9 @@ import aiohttp
 import pytest
 
 from crawler.config import CrawlConfig, ORDER_BFS
-from crawler.crawl import run_crawl
-from indexserver import FileManagerServer, IndexServer
+from crawler.crawl import run_crawl, run_detect
+from crawler.listing import render
+from indexserver import ApiServer, FileManagerServer, IndexServer
 
 # Two fake daemons. Nothing dials them; they exist so the pool has more than one
 # endpoint to spread lanes across and to account for separately.
@@ -268,6 +269,101 @@ def test_a_file_manager_directory_is_not_recorded_as_a_file(deep_tree, tmp_path)
     assert {"a", "deep", "deeper", "b", "empty"} <= listed
     assert not any(unquote(u).rstrip("/").endswith(("/a", "/deep", "/deeper", "/empty"))
                    for u in urls)
+
+
+# ------------------------------------------------- a target with no listings at all
+
+
+def test_an_api_only_target_is_crawled_through_its_api(tree, tmp_path):
+    """The whole point of teaching the engine requests instead of URLs.
+
+    Every directory on this server is the same URL, answered only to a POST whose body
+    says which directory is wanted; a GET of anything returns a JavaScript shell. Before
+    the listing layer existed this target produced one empty page and a successful-looking
+    run. Now it produces the tree, and the frontier keeps forty POSTs to one endpoint
+    apart because a body is part of a job's identity.
+    """
+    out = str(tmp_path / "out")
+    templates = tmp_path / "templates"
+    templates.mkdir()
+
+    with ApiServer(tree) as server:
+        (templates / "test-api.toml").write_text(server.template(), encoding="utf-8")
+        stats, urls = crawl(server.seed_url, out, max_depth=None,
+                            profile="test-api", templates=[str(templates)])
+
+    assert sorted(os.path.basename(unquote(u)) for u in urls) == [
+        "buried.txt", "readme.txt", "readme.txt", "top.bin",
+    ]
+    # The root, a/, a/deep/, b/ and empty/.
+    assert stats["totals"]["directories"] == 5
+    assert stats["stopped_because"] == "completed"
+
+    # Every listing was a POST, and each directory was asked for exactly once.
+    assert set(server.method_log) == {"POST"}, "a listing was fetched with the wrong verb"
+    assert sorted(server.request_log) == ["", "a", "a/deep", "b", "empty"]
+    assert len(server.request_log) == len(set(server.request_log)), \
+        "one directory was listed twice"
+
+
+def test_an_api_only_target_read_without_its_profile_finds_nothing(tree, tmp_path):
+    """The failure this replaces: no error, no entries, a run that looks like success."""
+    out = str(tmp_path / "out")
+    with ApiServer(tree) as server:
+        stats, urls = crawl(server.seed_url, out, max_depth=None)
+
+    assert urls == []
+    assert stats["totals"]["directories"] == 0
+    assert stats["totals"]["skipped"] == 1, "the shell page should be refused, not expanded"
+
+
+def test_detect_names_the_profile_and_costs_one_request(tree, tmp_path):
+    """--detect end to end, over the same pool a crawl uses.
+
+    Against a server whose listings are API-only, the passive half sees a shell and the
+    probe is what identifies it -- which is the whole reason probes exist and are opt-in.
+    """
+    templates = tmp_path / "templates"
+    templates.mkdir()
+
+    with ApiServer(tree) as server:
+        (templates / "test-api.toml").write_text(
+            server.template().replace(
+                '[extract]',
+                '[probe]\nmethod = "POST"\npath = "/api/fs/list"\n'
+                'body = \'{"path": "/"}\'\nexpect_regex = "content"\n'
+                '[probe.headers]\nContent-Type = "application/json"\n\n[extract]'),
+            encoding="utf-8")
+        config = CrawlConfig(seeds=[server.seed_url], templates=[str(templates)],
+                             out_dir="", job_id="test")
+        results = asyncio.run(run_detect(
+            config, ENDPOINTS, UAS, connector_factory=direct_connector))
+
+    (seed, findings) = results[0]
+    best = next(f for f in findings if f.usable)
+    assert best.profile.name == "test-api"
+    assert best.probed, "a shell-only target can only be identified by probing"
+    assert best.directories == 3 and best.files == 1
+
+    text = render(findings, seed)
+    assert "--profile test-api" in text
+    # One GET for the seed, one POST for the probe. Nothing was crawled.
+    assert server.method_log == ["GET", "POST"]
+
+
+def test_detect_says_when_no_profile_is_needed(tree, tmp_path):
+    with IndexServer(tree) as server:
+        config = CrawlConfig(seeds=[server.base_url], out_dir="", job_id="test")
+        results = asyncio.run(run_detect(
+            config, ENDPOINTS, UAS, connector_factory=direct_connector))
+
+    seed, findings = results[0]
+    # The test server really is Python's http.server, and being recognised as it is
+    # correct -- but that profile reads the page exactly as the default does, so the
+    # advice must still be "you do not need a --profile for this".
+    assert findings[0].profile.name == "python-http-server"
+    assert findings[0].usable
+    assert "no --profile needed" in render(findings, seed)
 
 
 def test_exclude_keeps_a_subtree_out(tree, tmp_path):
