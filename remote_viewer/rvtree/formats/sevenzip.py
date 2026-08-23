@@ -18,7 +18,7 @@ import struct
 import zlib
 from typing import Any, Optional
 
-from ..model import DIR, FILE, Entry
+from ..model import DIR, FILE, SYMLINK, Entry
 from ..util import human_bytes
 
 log = logging.getLogger(__name__)
@@ -64,6 +64,10 @@ CODEC_AES = b"\x06\xf1\x07\x01"
 
 FILE_ATTRIBUTE_DIRECTORY = 0x10
 FILE_ATTRIBUTE_UNIX_EXTENSION = 0x8000
+
+# With the unix extension set, the attribute word's high 16 bits are st_mode.
+S_IFMT = 0xF000
+S_IFLNK = 0xA000
 
 
 class SevenZipError(RuntimeError):
@@ -568,6 +572,12 @@ def _assemble(
                 mode = (attr >> 16) & 0xFFFF
             if attr & FILE_ATTRIBUTE_DIRECTORY:
                 kind = DIR
+            if mode is not None and (mode & S_IFMT) == S_IFLNK:
+                # 7z marks a symlink only by S_IFLNK in the unix extension and keeps
+                # the target in the member's data, so the entry otherwise looks like a
+                # small regular file. Checked after the directory bit because a link to
+                # a directory can carry both, and the link is the more specific fact.
+                kind = SYMLINK
 
         entries.append(
             Entry(
