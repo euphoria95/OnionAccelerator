@@ -9,7 +9,7 @@ import subprocess
 import pytest
 
 from rvtree import archive
-from rvtree.formats import detect
+from rvtree.formats import detect, sevenzip
 
 ARCHIVES = [
     ("test.zip", detect.ZIP),
@@ -24,6 +24,10 @@ RARS = ["test.rar4.rar", "test.rar5.rar"]
 
 needs_unrar = pytest.mark.skipif(
     shutil.which("unrar") is None, reason="ground truth needs the unrar binary"
+)
+
+needs_7z = pytest.mark.skipif(
+    shutil.which("7z") is None, reason="the fixture is built by the 7z binary"
 )
 
 
@@ -105,6 +109,34 @@ def test_7z_directory_and_mode_decoding(transport, server):
     assert by_path["payload/file_1.txt"].kind == "file"
     # 7z carries the Unix mode in the high 16 bits when 0x8000 is set.
     assert by_path["payload/file_1.txt"].mode is not None
+
+
+@needs_7z
+def test_7z_symlink_is_not_reported_as_a_file(tmp_path):
+    """A 7z symlink is a member whose data is the target, marked only by S_IFLNK.
+
+    Built here rather than read from tests/fixtures because ``7z a`` follows symlinks
+    unless it is given ``-snl``, so the standing fixture holds the target's contents
+    and cannot show this.
+    """
+    tree = tmp_path / "p"
+    (tree / "sub").mkdir(parents=True)
+    (tree / "file.txt").write_text("payload")
+    (tree / "sub" / "link.txt").symlink_to("../file.txt")
+    arc = tmp_path / "link.7z"
+    subprocess.run(
+        ["7z", "a", "-snl", "-bso0", "-bsp0", str(arc), "p"],
+        cwd=tmp_path, capture_output=True, check=True,
+    )
+
+    with open(arc, "rb") as fh:
+        entries = {e.path: e for e in sevenzip.read_archive(fh).entries}
+
+    link = entries["p/sub/link.txt"]
+    assert link.kind == "symlink"
+    assert link.mode_string() == "lrwxrwxrwx"   # what 7z l -slt prints as Attributes
+    assert entries["p/file.txt"].kind == "file"
+    assert entries["p/sub"].kind == "dir"
 
 
 def _unrar_truth(path: str) -> dict[str, int]:
