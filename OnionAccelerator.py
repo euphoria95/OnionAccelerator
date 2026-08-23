@@ -8,6 +8,7 @@ import time
 import socket
 import shutil
 import random
+import shlex
 import string
 import threading
 import queue
@@ -1693,10 +1694,14 @@ def detect_mode(urls, proxies, args):
         logger.error(f"{e}")
         return 1
 
+    # The command --detect prints has to be one that runs. A profile loaded from
+    # --templates does not exist without it, so the flag has to travel with the advice.
+    extra_flags = "".join(f" --templates {shlex.quote(d)}" for d in (args.templates or []))
+
     matched = 0
     for seed, findings in results:
         print()
-        print(pkg.listing.render(findings, seed))
+        print(pkg.listing.render(findings, seed, extra_flags=extra_flags))
         matched += 1 if any(f.usable for f in findings) else 0
     return 0 if matched else 1
 

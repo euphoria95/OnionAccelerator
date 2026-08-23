@@ -12,6 +12,7 @@ over Tor. Two things have to be right for that trade to be worth taking:
     is the entire cost the manifest exists to avoid.
 """
 
+import dataclasses
 import os
 
 import pytest
@@ -124,3 +125,39 @@ def test_the_dump_resolves_against_its_own_directory():
 def test_the_format_is_recognised_without_being_told(fixture, expected):
     """`format = "auto"` exists so a dump of an unexpected shape still reads."""
     assert detect_format(load(fixture)) == expected
+
+
+def test_a_dotfile_keeps_its_dot():
+    """`./.env` is a dotfile, not `env`.
+
+    Stripping the `./` prefix with `lstrip("./")` strips a character *set*, so it ate the
+    leading dot of every hidden path: `.git/config` came back as `git/config`. A dump of a
+    leak site is full of both, and a wrong path is worse than a missing one -- it points
+    `--download` at a URL that does not exist while claiming the file was found.
+    """
+    # Only leaves: `find` was given a file list, so `.git` appears solely as a parent.
+    body = "./.env\n./.git/config.ini\n./files/.htaccess\n"
+    page = Page(url="http://h.onion/list.txt", body=body, content_type="text/plain")
+    listing = ListingEngine(PROFILES).parse(page, profile=BY_NAME["find-dump"])
+
+    assert {e.url for e in listing.entries} == {
+        "http://h.onion/.env",
+        "http://h.onion/.git/config.ini",
+        "http://h.onion/files/.htaccess",
+    }
+
+
+def test_the_entry_that_reaches_max_entries_keeps_its_size():
+    """The cap truncates the list; it must not corrupt the last row it let through."""
+    page = Page(url="http://h.onion/manifest.txt", body=load("tree_dump.txt"),
+                content_type="text/plain")
+    profile = dataclasses.replace(
+        BY_NAME["tree-dump"],
+        extract=dataclasses.replace(BY_NAME["tree-dump"].extract,
+                                    options={"format": "tree", "max_entries": 3}),
+    )
+    listing = ListingEngine(PROFILES).parse(page, profile=profile)
+
+    assert listing.total == 3
+    sizes = {e.name: e.size_bytes for e in listing.entries}
+    assert sizes.get("old.tar") == 512, sizes

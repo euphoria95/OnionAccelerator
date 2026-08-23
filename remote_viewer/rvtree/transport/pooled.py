@@ -39,17 +39,22 @@ from urllib.parse import urlsplit, urlunsplit
 import requests
 
 from ..util import human_bytes
+from . import gate
 from .tor import (
     CHUNK,
     DEFAULT_UA,
     DEFAULT_VERIFY,
     Circuit,
     RangeNotHonoured,
+    Stream,
     TransportError,
     Verify,
     _check_proxy,
+    _no_ranges,
+    _read_head,
     _request_error,
     _silence_insecure_warnings,
+    _stream_from,
     _validate_content_range,
 )
 
@@ -488,10 +493,10 @@ class PooledTransport:
         self._enter_transfer()
         t0 = time.monotonic()
         try:
-            r = circuit.session.get(
+            r, effective = gate.get(
+                circuit.session,
                 url,
                 headers={"Range": f"bytes={start}-{end}"},
-                stream=True,
                 timeout=timeout or circuit.timeout,
                 # On every call rather than only on the session: merge_environment_settings
                 # lets REQUESTS_CA_BUNDLE re-enable verification behind a session-level False.
@@ -502,10 +507,7 @@ class PooledTransport:
                     # The server ignored Range and the whole entity is coming. On a 2.4 GB
                     # archive that is catastrophic, and with several spans in flight it is
                     # catastrophic several times over, so bail out before touching the body.
-                    raise RangeNotHonoured(
-                        f"server returned 200 for a Range request ({url}); "
-                        f"it does not support partial content"
-                    )
+                    raise RangeNotHonoured(_no_ranges(url, effective))
                 if r.status_code != 206:
                     raise TransportError(f"HTTP {r.status_code} for range {start}-{end}")
                 _validate_content_range(r.headers.get("Content-Range"), start, end)
@@ -858,41 +860,64 @@ class PooledTransport:
         # tests are stated in. A capability probe is not part of that story.
         circuit = lane.circuit
         try:
-            r = circuit.session.get(
+            r, effective = gate.get(
+                circuit.session,
                 url,
                 headers={"Range": "bytes=0-0"},
-                stream=True,
                 timeout=circuit.timeout,
                 verify=circuit.verify,
             )
         except requests.RequestException as exc:
             raise _request_error(exc, url, circuit.verify) from exc
         try:
-            headers = {k.lower(): v for k, v in r.headers.items()}
-            if r.status_code == 206:
-                cr = headers.get("content-range", "")
-                total = cr.rsplit("/", 1)[-1].strip()
-                if not total.isdigit():
-                    raise TransportError(f"unparseable Content-Range: {cr!r}")
-                # Drained but not accounted, as ``Transport`` does: a one-byte probe is
-                # not transfer, and counting one per racer would make the byte budgets
-                # the tests assert depend on how many lanes happened to be free.
-                r.content
-                log.info(
-                    "%s: %s, ranges honoured, server %s",
-                    url,
-                    human_bytes(int(total)),
-                    headers.get("server", "-"),
-                )
-                return int(total), headers
-            if r.status_code == 200:
-                length = headers.get("content-length")
-                if not length or not length.isdigit():
-                    raise TransportError("server ignored Range and gave no Content-Length")
-                return int(length), headers
-            raise TransportError(f"HTTP {r.status_code} probing {url}")
+            # Drained but not accounted, as ``Transport`` does: a one-byte probe is not
+            # transfer, and counting one per racer would make the byte budgets the tests
+            # assert depend on how many lanes happened to be free.
+            return _read_head(r, url, effective)
         finally:
             r.close()
+
+    def open_stream(self, url: str) -> Stream:
+        """Open the whole entity as one forward stream. See ``Transport.open_stream``.
+
+        No hedging and no splitting: there is nothing to split, and a duplicate of a
+        transfer this size is not a hedge, it is a second download. One lane carries it,
+        and stays checked out until the stream is closed.
+        """
+        lane = self._pool.acquire()
+        try:
+            r, effective = gate.get(
+                lane.circuit.session,
+                url,
+                timeout=lane.circuit.timeout,
+                verify=lane.circuit.verify,
+            )
+        except requests.RequestException as exc:
+            self._pool.release(lane)
+            raise _request_error(exc, url, lane.circuit.verify) from exc
+        except BaseException:
+            self._pool.release(lane)
+            raise
+        try:
+            return _stream_from(r, effective, lambda: self._pool.release(lane), self)
+        except BaseException:
+            r.close()
+            self._pool.release(lane)
+            raise
+
+    def _stream_open(self) -> None:
+        self._count_request()
+        self._enter_transfer()
+
+    def _stream_progress(self, delta: int) -> None:
+        self._inflight(delta)
+
+    def _stream_done(self, nbytes: int, seconds: float) -> None:
+        # ``seconds`` is ignored here on purpose: this transport times transfers by the
+        # wall clock kept between ``_enter_transfer`` and ``_leave_transfer``, so that a
+        # rate stays a rate the caller would observe no matter how many lanes are busy.
+        self._account_bytes(nbytes)
+        self._leave_transfer()
 
     def supports_multirange(self, url: str, size: int) -> bool:
         """Opportunistic check for multipart/byteranges.

@@ -87,6 +87,21 @@ def _str_tuple(value: Any, field: str, source: str) -> tuple[str, ...]:
     raise TemplateError(f"{source}: {field} must be a string or a list of strings")
 
 
+def _int(value: Any, field: str, source: str, default: int) -> int:
+    """A whole number, or a TemplateError naming the file.
+
+    Bare `int()` raises a ValueError that says only what it could not convert, which for a
+    file dropped in a --templates directory mid-engagement is the one thing already known
+    and the file name is the thing wanted.
+    """
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise TemplateError(f"{source}: {field} must be a whole number, got {value!r}") from None
+
+
 # ---------------------------------------------------------------- [match]
 
 
@@ -125,7 +140,7 @@ class Match:
             content_type=tuple(
                 v.lower() for v in _str_tuple(data.get("content_type"), "content_type", source)
             ),
-            status=tuple(int(s) for s in status),
+            status=tuple(_int(s, "[match].status", source, 0) for s in status),
             title_regex=_regex(data.get("title_regex"), "title_regex", source),
             generator_regex=_regex(data.get("generator_regex"), "generator_regex", source),
             body_regex=_regex(data.get("body_regex"), "body_regex", source),
@@ -286,8 +301,8 @@ class Paginate:
         return cls(
             kind=kind,
             param=str(data.get("param", "page")),
-            start=int(data.get("start", 1)),
-            max_pages=int(data.get("max_pages", 500)),
+            start=_int(data.get("start"), "[paginate].start", source, 1),
+            max_pages=_int(data.get("max_pages"), "[paginate].max_pages", source, 500),
             cursor_field=str(data.get("cursor_field", "")),
             more_field=str(data.get("more_field", "")),
         )
@@ -304,9 +319,10 @@ class Paginate:
 class Download:
     """Where a file's bytes are, when that is not where its listing links.
 
-    `url` is a template over `{origin}`, `{base}`, `{path}`, `{name}` and `{href}`. A
-    manager that browses at `?p=dir` and serves at `?dl=dir/file` needs this; an autoindex
-    does not, and leaves the section out.
+    `url` is a template over `{origin}`, `{root}`, `{base}`, `{path}`, `{parent}`,
+    `{name}` and `{href}`. `{path}` is the file's own path and `{parent}` the directory it
+    was listed in, which is the distinction a manager that browses at `?p=dir` and serves
+    at `?p=dir&dl=file` turns on. An autoindex needs none of it and leaves the section out.
     """
 
     url: str = ""
@@ -366,7 +382,7 @@ class Profile:
         return cls(
             name=str(name),
             title=str(data.get("title", "")),
-            priority=int(data.get("priority", 50)),
+            priority=_int(data.get("priority"), "priority", source, 50),
             status=status,
             notes=str(data.get("notes", "")),
             match=Match.from_dict(data.get("match") or {}, source),

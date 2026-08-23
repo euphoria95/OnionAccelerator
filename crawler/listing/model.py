@@ -41,6 +41,11 @@ class PageRequest:
     # one endpoint carries its path in the body, so the URL alone cannot say where the
     # answer came from -- and the next level down is built from exactly this.
     path: Optional[str] = None
+    # True when `url` is the target's own listing endpoint rather than the directory's
+    # address. Everything that rewrites a URL has to leave those alone: the frontier
+    # queues a job under the directory it stands for, and pointing the request at that
+    # would send the crawl to a URL the target does not serve.
+    endpoint: bool = False
 
     @staticmethod
     def get(url: str, *, profile: Optional[str] = None) -> "PageRequest":
@@ -60,13 +65,18 @@ class PageRequest:
 
         The URL half is deliberately *not* computed here: `urlnorm.dedup_key()` owns that,
         and it folds the encoded-separator spellings one file manager hands out for a
-        single directory. This adds only what a URL cannot express -- the method and the
-        body -- so that two POSTs to one endpoint asking for different directories are two
-        jobs, and two spellings of one GET remain one.
+        single directory. This adds only what a URL cannot express -- the method, the body,
+        and the directory an endpoint request asks for -- so that two calls to one endpoint
+        for different directories are two jobs, and two spellings of one GET remain one.
+
+        An endpoint request contributes an identity even when it is a plain GET, because
+        that is exactly the case where the URL is shared across directories and the path
+        is the only thing telling them apart.
         """
-        if self.method == DEFAULT_METHOD and not self.body:
+        if self.method == DEFAULT_METHOD and not self.body and not self.endpoint:
             return ""
-        digest = hashlib.sha1((self.body or "").encode("utf-8")).hexdigest()[:16]
+        material = f"{self.path or ''}\x00{self.body or ''}"
+        digest = hashlib.sha1(material.encode("utf-8")).hexdigest()[:16]
         return f"{self.method}:{digest}"
 
     def __str__(self) -> str:                       # pragma: no cover - logging aid

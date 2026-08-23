@@ -26,6 +26,12 @@ OnionAccelerator is a multi-functional Python script designed for discovering an
 - Backed by [`remote_viewer/rvtree`](remote_viewer/), driven over the same `host:port`
   SOCKS5 pool the download modes use — so a `--farm` of independent Tor daemons, or an
   `--external` proxy list, gives it real parallelism.
+- Solves the **proof-of-work gates** some services put in front of a download, and says
+  so — a challenge page answered with 200 otherwise looks like the archive itself, and
+  every size and range it reports is a fact about the wrong entity.
+- Falls back to `--spool` when a server refuses ranges outright, which is the one case
+  the whole premise does not survive: it costs a full transfer, so it is offered with a
+  time estimate rather than taken (see **Gates, and servers that refuse ranges** below).
 - Everything after `--` is passed straight to rvtree, so the full `list` / `extract` /
   `probe` surface is available with no flags to keep in sync.
 
@@ -215,6 +221,10 @@ python3 OnionAccelerator.py --mode tree -- list https://example.onion/big.tar.xz
 
 # Through the external proxy list instead of a local farm.
 python3 OnionAccelerator.py --mode tree --external --test-url http://your-own/ping -- list https://example.onion/a.7z
+
+# A target behind a proof-of-work gate that then refuses ranges: pay for one full pass
+# and keep the file (--spool-temp throws it away once the listing is printed).
+python3 OnionAccelerator.py --mode tree --url https://example.onion/DEADBEEF/addresses.7z -- list --spool addresses.7z
 ```
 
 **Why the farm matters here.** rvtree's own default is a single Tor daemon with several
@@ -253,6 +263,37 @@ python3 OnionAccelerator.py --mode tree -- list https://example.onion/backup.rar
 
 rvtree writes its own full debug log to `logs/rvtree_<job_id>.log` for every run. Add `-v`
 to watch the pipeline, or `-vv` for one line per range request.
+
+### Gates, and servers that refuse ranges
+
+Some services do not serve a download directly. The first GET of `file.7z` answers **200
+with an HTML challenge page** — a proof-of-work interstitial that hands out an input and a
+difficulty and only produces the file once a client hashes its way to a nonce and posts it
+back. Nothing about that response says "this is not your archive": it is a 200, it has a
+Content-Length, and every capability read off it describes the challenge page. rvtree
+solves the challenge — it is a cost function, not a secret, and spending the CPU is
+exactly what the gate asks of any client — and then reports that it did:
+
+```console
+$ python3 OnionAccelerator.py --mode tree -- probe http://example.onion/DEADBEEF/addresses.7z
+size           1,877,268,564 bytes (1.7 GiB)
+gate           proof-of-work — solved; the size above is the real entity
+accept-ranges  NO — only --spool can read this archive, at a full download
+```
+
+Passing the gate is the easy half. The URL it grants is served by the application rather
+than the web server, so it is single-use, non-resumable, and answers a `Range` request
+with 200 and the whole body. That removes the premise this mode is built on, because a 7z
+end header, a zip central directory and an xz index all live at the *far end* of the
+stream — there is no way to reach them but to receive everything before them.
+
+So `list` refuses, exits **3**, and prints what the alternative costs: 1.7 GiB at the
+throughput it just measured, with no resume if the circuit dies. `--spool FILE` accepts
+that — one stream to disk, then the archive is read locally at local speed. The file is
+kept and a complete one is reused rather than fetched twice, which matters precisely
+because a broken transfer restarts at zero. `--spool-temp` deletes it afterwards, for when
+the listing was all you wanted. More endpoints do not help: every stream starts at byte
+zero, so a second lane would only fetch the same bytes again.
 
 ## Open-Directory Crawl (`--mode crawl`)
 
@@ -304,6 +345,12 @@ python3 OnionAccelerator.py --mode crawl --detect --url https://example.onion/
 python3 OnionAccelerator.py --list-profiles
 ```
 
+`--detect` reports one row per template that could apply, ranked. A seed that could not be
+*fetched* produces no rows at all and says so — every template is tried against a page that
+was read, and the fallback matches unconditionally, so "no rows" can only ever mean the
+request failed. Naming a profile there would read as though that template had been tried
+and rejected.
+
 ### A parser with no server *markup* templates
 
 The default reading has no per-server templates and never will. Open directories are
@@ -336,6 +383,10 @@ deliberately *not* written to the file manifest: it was queued because a listing
 its directory column, and answering with HTML does not make it a file. Recording it as one
 would put a directory into `urls.txt`, where `--download` fetches its markup and saves that
 under the directory's name.
+
+The score is a *guess*, and it is asked for only where nothing better is available: on a
+page a named template matched, the template has already answered the question and the
+threshold is not applied at all — see **Templates** below.
 
 The parent-directory up-link (`../` / "Parent Directory", matched structurally as a link
 to the page's immediate parent) carries real weight because it is the one signal a
@@ -387,17 +438,28 @@ kind  = "query"
 param = "p"
 
 [download]                               # where the bytes are, if not the row's URL
-url = "{root}?p={path}&dl={name}"
+url = "{root}?p={parent}&dl={name}"      # {parent} is the row's directory, not the row
 ```
 
-Two properties make this safe to rely on:
+Three properties make this safe to rely on:
 
 - **A target no template matches is crawled exactly as it was before templates existed.**
   `generic-structural` has no match rules, sits at priority 0, and is the fallback. The
   whole existing test suite runs through it unchanged.
-- **A template that fails to load is a fatal error naming the file.** A silently ignored
-  typo is a rule that stopped applying, which produces precisely the quiet failure this
-  design exists to remove.
+- **A template that fails to load is a fatal error naming the file** — including a
+  `priority`, `status` or `max_pages` that is not a number, which names the file and the
+  key rather than raising a bare conversion error. A silently ignored typo is a rule that
+  stopped applying, which produces precisely the quiet failure this design exists to
+  remove.
+- **A matched template is believed, per page.** The confidence threshold exists because
+  the structural reader has to guess; a template that fired has said what the target is,
+  so a directory holding a single file is a directory rather than a leaf. That trust is
+  re-checked against *each* page — a server that autoindexes most of its paths and runs an
+  application at one of them is ordinary, and waiving the guard for the whole host on the
+  strength of the root page would walk straight into it. A page the rules do not fire on
+  gets the structural guard back, and a strategy can still veto outright: an empty WebDAV
+  `multistatus` or a JSON error page scores zero and is not expanded, because "unreadable"
+  and "empty" are different facts and the crawl acts on both.
 
 `status = "verified"` in `--list-profiles` means a fixture in the test suite pins that
 template against a real listing. `unverified` means it was written from documented request
@@ -412,7 +474,9 @@ python3 OnionAccelerator.py --mode crawl --templates ~/profiles \
 ```
 
 A template in `--templates` replaces a built-in of the same name, so a profile for one
-engagement's target never has to be committed. **How to write one:
+engagement's target never has to be committed. `--detect` carries the flag into the command
+it suggests, because a profile loaded from a directory does not exist without it and advice
+that does not run is worse than none. **How to write one:
 [`crawler/listing/templates/README.md`](crawler/listing/templates/README.md)** — three
 worked examples and the full key reference.
 
@@ -429,6 +493,14 @@ python3 OnionAccelerator.py --mode crawl \
 
 Directories from a dump are recorded and never fetched: the dump already said what is
 under them.
+
+Paths out of a dump are cleaned one prefix at a time, not with a character set: stripping
+`"./"` as a set of characters eats the dot that makes a dotfile a dotfile, so `./.env` came
+back as `env` and `.git/config` as `git/config` — and a dump of a leak site is full of
+both. A wrong path in a manifest is worse than a missing one, because `--download` will
+fetch it and save something under the wrong name. The bare `.` that `tree` prints for the
+root it was run in is the page itself, and is recorded as such rather than as a child named
+`.`.
 
 ### Paths, as the server spells them
 
@@ -489,9 +561,18 @@ service is usually one small process, and past that it starts refusing connectio
 
 The frontier is a depth-ordered heap with exact URL deduplication — every discovered
 subdirectory becomes its own schedulable job, so a directory with 50 subdirectories becomes
-50 units of work rather than one. `--order bfs` maps the whole tree shallow-first;
-`--order dfs` finishes branches; `--switch-after N` flips from one to the other mid-run,
-which re-orders work that is *already queued* (an `asyncio.PriorityQueue` could not — it
+50 units of work rather than one. For a target whose listing lives at **one endpoint**, the
+URL is not the whole identity: every directory is the same address, differing only in the
+path it asks for, so the request's path joins the dedup key and the frontier stops folding
+a whole tree into a single job. That holds for a plain `GET` of an endpoint as much as for
+a `POST` — half the file-manager APIs worth crawling spell the directory into a GET — so
+the test is whether the URL is the target's own endpoint, not whether the method is GET.
+Those requests are also the ones nothing may re-point at the job's own URL, which is the
+directory they stand for and an address the server does not serve.
+
+`--order bfs` maps the whole tree shallow-first; `--order dfs` finishes branches;
+`--switch-after N` flips from one to the other mid-run, which re-orders work that is
+*already queued* (an `asyncio.PriorityQueue` could not — it
 fixes each item's key when it is pushed). Depth is **unlimited by default** — the point of
 the mode is to harvest a whole open directory — and `--max-depth N` reinstates a finite
 cap. A finite tree still terminates on its own, because deduplication means it cannot

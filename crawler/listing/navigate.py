@@ -257,6 +257,10 @@ def _api_request(location: Location, values: dict[str, str]) -> PageRequest:
         body=_fill(nav.body, values, encode="json") if nav.body else None,
         path=values.get("path_raw", ""),
         profile=location.profile.name,
+        # The URL here is the template's endpoint, not the directory's address, and the
+        # two are different even when the endpoint spells the path into itself. Saying so
+        # is what stops the frontier re-pointing this request at the job's own URL.
+        endpoint=True,
     )
 
 
@@ -306,6 +310,11 @@ def _placeholders(location: Location, *, path: str = "", href: str = "",
         "base": location.page_url,
         "path": path,
         "path_raw": path,
+        # The directory the row was listed in, which is not derivable from anything else
+        # here: a manager that browses at `?p=DIR` and serves at `?p=DIR&dl=NAME` needs
+        # the parent, and `{path}` is the child -- passing that as `?p=` asks the target
+        # for a directory named after the file and gets an error page instead of bytes.
+        "parent": location.path,
         "name": name,
         "href": href,
         "cursor": cursor,

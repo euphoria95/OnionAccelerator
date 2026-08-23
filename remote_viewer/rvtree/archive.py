@@ -15,7 +15,7 @@ from . import progress
 from .formats import detect as detect_mod
 from .formats import rar, sevenzip, tarwalk, xz, zipfmt
 from .model import FILE, Entry, Listing
-from .transport import HttpRangeFile, Transport
+from .transport import Capabilities, HttpRangeFile, Transport, probe, spool
 from .util import human_bytes, human_duration
 
 log = logging.getLogger(__name__)
@@ -66,6 +66,41 @@ class SingleBlockWarning(ArchiveError):
             f"At the observed {human_bytes(self.throughput)}/s that is about "
             f"{human_duration(secs)}.\n"
             f"Re-run with --force to do it anyway."
+        )
+
+
+@dataclasses.dataclass
+class RangelessWarning(ArchiveError):
+    """Raised when the server will only serve the entity whole, from byte zero.
+
+    Not a failure of rvtree so much as the removal of the thing it is for. A server that
+    answers ``Range`` with 200 — an application handing the file out itself, which is
+    what a proof-of-work download gate always is — leaves exactly one way to reach the
+    metadata at the end of an archive: pull all of it. That is a decision with a price
+    on it, so it is offered rather than taken.
+    """
+
+    url: str
+    size: int
+    throughput: float
+    gated: bool
+
+    def __str__(self) -> str:
+        secs = self.size / max(self.throughput, 1.0)
+        why = (
+            "it is behind a proof-of-work gate, and the URL that gate grants serves the "
+            "file in one stream"
+            if self.gated
+            else "it does not support partial content"
+        )
+        return (
+            f"this server will not serve byte ranges: {why}.\n"
+            f"Nothing can be read out of order, so listing this archive means "
+            f"transferring all {human_bytes(self.size)} of it — about "
+            f"{human_duration(secs)} at the observed {human_bytes(self.throughput)}/s, "
+            f"with no resume if it breaks.\n"
+            f"Re-run with --spool FILE to do it anyway and keep the download, or "
+            f"--spool-temp to throw it away afterwards."
         )
 
 
@@ -121,15 +156,28 @@ class Archive:
         return self._rar_members[path]
 
 
-def open_archive(transport: Transport, url: str, fmt: Optional[str] = None) -> Archive:
+def open_archive(
+    transport: Transport,
+    url: str,
+    fmt: Optional[str] = None,
+    spool_to: Optional[str] = None,
+    allow_spool: bool = False,
+) -> Archive:
     """Open a URL and identify what it holds, without over-fetching.
 
     ``fmt`` forces a parser and skips detection entirely, for the cases where the bytes
-    and the server both mislead.
+    and the server both mislead. ``allow_spool`` is the caller saying it accepts a whole
+    download if the server turns out to refuse ranges; ``spool_to`` names where to keep it.
     """
     bar = progress.get()
     bar.stage("probe", url)
-    source = HttpRangeFile(transport, url)
+    caps = probe(transport, url)
+    if caps.accepts_ranges:
+        # The probe already learned both, so this reader starts warm rather than
+        # spending a second round trip on a question just answered.
+        source = HttpRangeFile(transport, url, size=caps.size, headers=caps.headers)
+    else:
+        source = _spooled(transport, url, caps, spool_to, allow_spool, bar)
 
     bar.stage("detect", human_bytes(source.size))
     det = detect_mod.identify(source, url, headers=source.headers, override=fmt)
@@ -142,6 +190,41 @@ def open_archive(transport: Transport, url: str, fmt: Optional[str] = None) -> A
             bar.stage("sniff", "is there a tar inside?")
             _sniff_tar_in_xz(arc, det)
     return arc
+
+
+def _spooled(
+    transport: Transport,
+    url: str,
+    caps: Capabilities,
+    spool_to: Optional[str],
+    allow_spool: bool,
+    bar,
+):
+    """Fall back to a local copy, once the caller has agreed to pay for one."""
+    if not allow_spool:
+        raise RangelessWarning(
+            url=url, size=caps.size, throughput=transport.throughput, gated=caps.gated
+        )
+    log.info(
+        "%s serves no ranges; spooling all %s to disk in one stream",
+        url,
+        human_bytes(caps.size),
+    )
+    bar.stage("spool", f"{human_bytes(caps.size)}, no ranges — one pass, no resume")
+    written = {"n": 0}
+
+    def advance(n: int) -> None:
+        written["n"] = n
+
+    bar.track_bytes(lambda: written["n"], caps.size)
+    return spool(
+        transport,
+        url,
+        path=spool_to,
+        expected_size=caps.size,
+        headers=caps.headers,
+        on_progress=advance,
+    )
 
 
 def _sniff_tar_in_xz(arc: Archive, det: detect_mod.Detection) -> None:

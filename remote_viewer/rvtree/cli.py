@@ -41,8 +41,9 @@ EXIT_CODES = (
     (2, "bad arguments, or a proxy setting that would leak the target hostname"),
     (
         3,
-        "refused pending your decision — a single-block .xz, or an extraction over\n"
-        "       --max-fetch. Re-run with --force, or raise --max-fetch",
+        "refused pending your decision — a single-block .xz, a server with no\n"
+        "       ranges, or an extraction over --max-fetch. Re-run with --force,\n"
+        "       --spool, or a higher --max-fetch",
     ),
     (4, "encrypted headers: the file list itself needs the password"),
     (130, "interrupted (Ctrl-C)"),
@@ -222,6 +223,23 @@ def _common_parser() -> argparse.ArgumentParser:
         + " | ".join(("auto",) + detect_mod.SUPPORTED)
         + " (default: auto, which reads the magic bytes, then Content-Disposition, "
         "Content-Type and the URL). Unrelated to -f/--format, which is the output shape.",
+    )
+
+    slow = common.add_argument_group("rangeless servers")
+    slow.add_argument(
+        "--spool",
+        metavar="FILE",
+        help="If the server refuses byte ranges, stream the whole entity to FILE and "
+        "read the archive from there. The only thing that works against a download gate "
+        "that hands the file out itself, and it costs a full transfer with no resume. "
+        "FILE is kept, and an existing one of the right size is reused instead of "
+        "fetching again.",
+    )
+    slow.add_argument(
+        "--spool-temp",
+        action="store_true",
+        help="Same as --spool, into a temporary file that is deleted afterwards. Only "
+        "worth it when the listing is all you wanted.",
     )
 
     dbg = common.add_argument_group("diagnostics")
@@ -583,7 +601,7 @@ def main(argv: Optional[list[str]] = None, transport=None) -> int:
             if args.command == "probe":
                 return _cmd_probe(args, transport)
             return 2
-    except archive.SingleBlockWarning as exc:
+    except (archive.SingleBlockWarning, archive.RangelessWarning) as exc:
         log.error("%s", exc, exc_info=args.debug)
         return 3
     except (sevenzip.EncryptedHeader, rar.EncryptedArchive) as exc:
@@ -614,7 +632,13 @@ def main(argv: Optional[list[str]] = None, transport=None) -> int:
 
 def _open(args, transport: Transport) -> archive.Archive:
     fmt = None if args.archive_type == "auto" else args.archive_type
-    return archive.open_archive(transport, args.url, fmt=fmt)
+    return archive.open_archive(
+        transport,
+        args.url,
+        fmt=fmt,
+        spool_to=args.spool,
+        allow_spool=bool(args.spool or args.spool_temp),
+    )
 
 
 def _counted(
@@ -758,7 +782,12 @@ def _cmd_probe(args, transport: Transport) -> int:
     caps = probe(transport, args.url, check_multirange=args.multirange)
     print(f"url            {caps.url}")
     print(f"size           {caps.size:,} bytes ({human_bytes(caps.size)})")
-    print(f"accept-ranges  {'yes' if caps.accepts_ranges else 'NO — rvtree cannot work here'}")
+    if caps.gated:
+        print("gate           proof-of-work — solved; the size above is the real entity")
+    ranges = "yes"
+    if not caps.accepts_ranges:
+        ranges = "NO — only --spool can read this archive, at a full download"
+    print(f"accept-ranges  {ranges}")
     if args.multirange:
         print(f"multi-range    {'yes' if caps.multirange else 'no (single ranges only)'}")
     print(f"server         {caps.server or '-'}")
@@ -769,7 +798,7 @@ def _cmd_probe(args, transport: Transport) -> int:
         state = "verified" if transport.verify else "not verified (default; --verify-tls to enforce)"
         print(f"tls            {state}")
 
-    if caps.accepts_ranges:
+    if caps.accepts_ranges or args.spool or args.spool_temp:
         try:
             arc = _open(args, transport)
             det = arc.detection

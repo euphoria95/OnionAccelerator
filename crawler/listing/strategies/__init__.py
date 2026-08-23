@@ -69,10 +69,16 @@ class ExtractContext:
     it for exactly one reason: whether "this link points below the page" is a question
     that means anything. On a path-addressed server it is the filter that removes every
     breadcrumb; on a manager that keeps the path in `?p=` every row would fail it.
+
+    `trusted` says a named template matched this page, so a strategy that would otherwise
+    *guess* whether it is a listing should not. Only the structural reader guesses, and
+    its guess is what refuses a directory holding one file -- which is a false negative
+    the template was written to prevent.
     """
 
     allow_offsite: bool = False
     address_kind: str = "href"
+    trusted: bool = False
 
 
 @dataclasses.dataclass(frozen=True)

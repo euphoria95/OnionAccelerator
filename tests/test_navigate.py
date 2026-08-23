@@ -226,3 +226,60 @@ def test_a_target_without_pagination_never_queues_a_second_page():
 def test_kind_is_inferred_only_when_the_page_did_not_say(raw, expected):
     location = at(profile(kind="href"), "http://h.onion/f/")
     assert resolve(location, raw).is_dir is expected
+
+
+# ---------------------------------------------------------------- the frontier's copy
+
+
+@pytest.mark.parametrize("name,method,url", [
+    ("filebrowser", "GET", "http://h.onion/api/resources/pub"),
+    ("laravel-filemanager", "GET",
+     "http://h.onion/filemanager/jsonitems?working_dir=/pub&type=Files"),
+    ("elfinder", "GET", "http://h.onion/elfinder/connector?cmd=open&target=pub"),
+    ("alist", "POST", "http://h.onion/api/fs/list"),
+    ("webdav-propfind", "PROPFIND", "http://h.onion/pub"),
+])
+def test_the_frontier_does_not_repoint_an_endpoint_request(name, method, url):
+    """A queued API job must still ask the API, not the directory it stands for.
+
+    The frontier queues a job under the URL that *identifies* the directory, and keeps a
+    plain GET in step with the spelling it normalised. An endpoint request is the case
+    where those are two different URLs on purpose, and rewriting it sends the crawl to a
+    URL the target does not serve -- which the three GET-addressed managers here did,
+    because "is this a GET" is not the same question as "is this an endpoint".
+    """
+    import asyncio
+
+    from crawler.frontier import Frontier
+    from crawler.listing.registry import find, load_profiles
+
+    prof = find(load_profiles(), name)
+    location = Location.of(prof, "http://h.onion/", PageRequest(url="http://h.onion/", path=""))
+    entry = resolve(location, RawEntry(name="pub", is_dir=True))
+
+    async def queued():
+        frontier = Frontier(seeds=["http://h.onion/"], max_depth=None)
+        assert await frontier.add(entry.url, depth=1, request=entry.listing_request())
+        return await frontier.get()
+
+    job = asyncio.run(queued())
+    assert (job.fetch.method, job.fetch.url) == (method, url)
+
+
+def test_two_directories_behind_one_endpoint_are_two_jobs():
+    """Dedup folds URL spellings; it must not fold two directories sharing an endpoint."""
+    import asyncio
+
+    from crawler.frontier import Frontier
+    from crawler.listing.registry import find, load_profiles
+
+    prof = find(load_profiles(), "alist")          # every directory is POST /api/fs/list
+    location = Location.of(prof, "http://h.onion/", PageRequest(url="http://h.onion/", path=""))
+    rows = [RawEntry(name="pub", is_dir=True), RawEntry(name="dumps", is_dir=True)]
+
+    async def accepted():
+        frontier = Frontier(seeds=["http://h.onion/"], max_depth=None)
+        return [await frontier.add(e.url, depth=1, request=e.listing_request())
+                for e in (resolve(location, raw) for raw in rows)]
+
+    assert all(asyncio.run(accepted()))

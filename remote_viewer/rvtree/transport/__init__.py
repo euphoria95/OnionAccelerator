@@ -1,5 +1,6 @@
 """HTTP-over-Tor transport primitives."""
 
+from .gate import Challenge, GateError
 from .httpfile import HttpRangeFile
 from .pooled import (
     MIN_SPLIT,
@@ -11,11 +12,27 @@ from .pooled import (
     split_spans,
 )
 from .probe import Capabilities, probe
-from .tor import DEFAULT_PROXY, DEFAULT_VERIFY, RangeNotHonoured, Transport, TransportError
+from .spoolfile import SpoolError, SpooledFile, spool
+from .tor import (
+    DEFAULT_PROXY,
+    DEFAULT_VERIFY,
+    GATE_HEADER,
+    RangeNotHonoured,
+    Stream,
+    Transport,
+    TransportError,
+)
 
 __all__ = [
     "HttpRangeFile",
     "Capabilities",
+    "Challenge",
+    "GateError",
+    "GATE_HEADER",
+    "Stream",
+    "SpooledFile",
+    "SpoolError",
+    "spool",
     "probe",
     "DEFAULT_PROXY",
     "DEFAULT_VERIFY",

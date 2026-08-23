@@ -70,12 +70,16 @@ def read(page: Page, spec: Mapping[str, Any], ctx: ExtractContext) -> ExtractRes
     sizes: dict[str, Optional[int]] = {}
     order: list[str] = []
     for path, size in _parse(page.body, fmt, strip):
-        if path not in sizes:
-            order.append(path)
+        known = path in sizes
+        if not known:
+            # Checked before the append, not after, so the entry that reaches the cap is
+            # a whole entry: breaking afterwards left the last path in `order` with its
+            # size still unrecorded.
             if len(order) >= max_entries:
                 logger.warning("manifest %s: stopping at max_entries=%d", page.url, max_entries)
                 break
-        if size is not None or path not in sizes:
+            order.append(path)
+        if size is not None or not known:
             sizes[path] = size
 
     parents = _parents(order)
@@ -198,14 +202,21 @@ def _parse_sitemap(body: str, strip: str) -> Iterator[tuple[str, Optional[int]]]
 
 
 def _clean(path: str, strip: str) -> str:
-    """One entry's path, as a relative path with no decoration."""
+    """One entry's path, as a relative path with no decoration.
+
+    The `./` prefixes are removed one at a time rather than with `lstrip("./")`, which
+    strips a *set* of characters and so eats the dot that makes a dotfile a dotfile:
+    `./.env` came back as `env` and `.git/config` as `git/config`. A dump of a leak site
+    is full of both, and a wrong path in a manifest is worse than a missing one.
+    """
     path = unquote(path.strip().strip('"'))
     if strip and path.startswith(strip):
         path = path[len(strip):]
-    path = path.lstrip("./").lstrip("/")
     while path.startswith("./"):
         path = path[2:]
-    return path.rstrip("/")
+    path = path.lstrip("/").rstrip("/")
+    # `tree` names the root it was run in as a bare '.', which is the page itself.
+    return "" if path == "." else path
 
 
 def _parents(paths: list[str]) -> set[str]:
