@@ -28,4 +28,8 @@ param = "p"
 join  = "/"
 
 [download]
-url = "{root}?p={path}&dl={name}"
+# `p` is the *directory* the file was listed in and `dl` is its name -- that is what
+# Tiny File Manager serves from. Passing the file's own path as `p` asks for a
+# directory that does not exist, and every URL in the manifest comes back as an
+# error page.
+url = "{root}?p={parent}&dl={name}"

@@ -103,7 +103,11 @@ def read(page: Page, spec: Mapping[str, Any], ctx: ExtractContext) -> ExtractRes
     )
     return ExtractResult(
         entries=list(entries.values()),
-        is_index=confidence >= threshold,
+        # The threshold is the guess, and a template that matched has already answered the
+        # question it guesses at. Asking it anyway is what turned an Apache directory
+        # holding one file into a leaf -- the confidence is still reported, and the engine
+        # still refuses a page that scored nothing at all.
+        is_index=True if ctx.trusted else confidence >= threshold,
         confidence=confidence,
         title=title,
         generator=generator,

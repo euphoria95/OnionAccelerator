@@ -81,8 +81,10 @@ async def detect(
     """Fetch the seed, rank the profiles, then probe the ones that ask for it."""
     page = await fetch(PageRequest.get(seed))
     if page is None:
-        return [Finding(profile=p, score=0.0, error="seed could not be fetched")
-                for p in engine.profiles[:1]]
+        # No findings at all, which is a state nothing else can produce: the fallback
+        # matches every page, so a page that was read yields at least one row. Naming an
+        # arbitrary profile here instead read as though that template had been tried.
+        return []
 
     findings = rank(engine, page)
     if not probe:
@@ -194,7 +196,9 @@ def _order(finding: Finding) -> tuple:
 def render(findings: Sequence[Finding], seed: str, *, extra_flags: str = "") -> str:
     """The report `--detect` prints, ending in the command to run next."""
     if not findings:
-        return f"{seed}\n  nothing matched, and the structural reader found no entries.\n"
+        # The only way to get here: every profile is tried against a page that was read,
+        # and the fallback matches unconditionally.
+        return f"{seed}\n  the seed could not be fetched; nothing was read.\n"
 
     width = max(len(f.profile.name) for f in findings)
     lines = [seed, ""]

@@ -27,6 +27,8 @@ import requests
 from requests.adapters import HTTPAdapter
 
 from ..util import human_bytes
+from . import gate
+from .errors import TransportError
 
 log = logging.getLogger(__name__)
 
@@ -50,12 +52,15 @@ Verify = Union[bool, str]
 _warnings_silenced = False
 
 
-class TransportError(RuntimeError):
-    pass
-
-
 class RangeNotHonoured(TransportError):
     """The server answered a Range request with the whole entity."""
+
+
+# Written into the headers ``head_like`` returns when the entity turned out to sit behind
+# a proof-of-work gate. rvtree's own annotation rather than anything the server sent —
+# namespaced so it cannot collide with a real header — and the one piece of evidence
+# ``probe`` needs to explain why a URL that looks like a download behaves like a webpage.
+GATE_HEADER = "x-rvtree-gate"
 
 
 def _check_proxy(proxy: Optional[str]) -> Optional[str]:
@@ -94,6 +99,22 @@ def _silence_insecure_warnings() -> None:
         _warnings_silenced = True
 
 
+def _no_ranges(url: str, effective: str) -> str:
+    """Why a Range request came back 200, said as precisely as the evidence allows."""
+    if effective != url:
+        return (
+            f"{url} is behind a proof-of-work gate, and the URL it grants "
+            f"({effective.split('?')[0]}) serves the whole entity in one stream: it "
+            f"answered a Range request with 200. Gates of this shape hand the file out "
+            f"through the application rather than the web server, so there is no partial "
+            f"content to ask for and no way to resume."
+        )
+    return (
+        f"server returned 200 for a Range request ({url}); "
+        f"it does not support partial content"
+    )
+
+
 def _request_error(exc: Exception, url: str, verify: Verify) -> TransportError:
     """Turn a requests-level failure into something the CLI can print without a traceback."""
     if isinstance(exc, requests.exceptions.SSLError):
@@ -105,6 +126,112 @@ def _request_error(exc: Exception, url: str, verify: Verify) -> TransportError:
             )
         return TransportError(f"TLS handshake failed for {url}: {exc}")
     return TransportError(f"could not reach {url}: {exc}")
+
+
+class Stream:
+    """One open forward-only transfer of a whole entity.
+
+    What a rangeless server leaves you with. It exists so the caller can read bytes
+    without knowing which transport, circuit or gate produced them, and so releasing the
+    circuit is tied to closing the stream rather than to remembering to.
+    """
+
+    def __init__(
+        self,
+        response: requests.Response,
+        url: str,
+        size: int,
+        headers: dict[str, str],
+        release,
+        transport: "Transport",
+    ):
+        self.response = response
+        self.url = url
+        self.size = size
+        self.headers = headers
+        self._release = release
+        self._transport = transport
+        self._closed = False
+
+    def chunks(self, chunk: int = CHUNK) -> Iterator[bytes]:
+        """Yield the body, booking every byte against the transport as it lands."""
+        t0 = time.monotonic()
+        fetched = 0
+        self._transport._stream_open()
+        try:
+            for block in self.response.iter_content(chunk):
+                fetched += len(block)
+                self._transport._stream_progress(len(block))
+                yield block
+        finally:
+            # These bytes stop being in flight either way: on success the accounting
+            # below takes them over, and on failure they were never delivered.
+            self._transport._stream_progress(-fetched)
+            self._transport._stream_done(fetched, max(time.monotonic() - t0, 1e-6))
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self.response.close()
+        finally:
+            self._release()
+
+    def __enter__(self) -> "Stream":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+
+def _stream_from(response, url: str, release, transport) -> Stream:
+    """Validate a streamed 200 and wrap it, or explain why it cannot be read."""
+    if response.status_code != 200:
+        raise TransportError(f"HTTP {response.status_code} streaming {url}")
+    headers = {k.lower(): v for k, v in response.headers.items()}
+    length = headers.get("content-length")
+    if not length or not length.isdigit():
+        raise TransportError(
+            f"{url} streams without a Content-Length, so there is no way to know how "
+            f"much is coming or whether it all arrived"
+        )
+    return Stream(response, url, int(length), headers, release, transport)
+
+
+def _read_head(response, url: str, effective: str) -> tuple[int, dict[str, str]]:
+    """Turn the answer to a one-byte Range probe into a size and the entity's headers."""
+    headers = {k.lower(): v for k, v in response.headers.items()}
+    if effective != url:
+        headers[GATE_HEADER] = "proof-of-work"
+    if response.status_code == 206:
+        cr = headers.get("content-range", "")
+        total = cr.rsplit("/", 1)[-1].strip()
+        if not total.isdigit():
+            raise TransportError(f"unparseable Content-Range: {cr!r}")
+        response.content
+        log.info(
+            "%s: %s, ranges honoured, server %s",
+            url,
+            human_bytes(int(total)),
+            headers.get("server", "-"),
+        )
+        return int(total), headers
+    if response.status_code == 200:
+        length = headers.get("content-length")
+        if not length or not length.isdigit():
+            raise TransportError(
+                f"{effective} ignored Range and gave no Content-Length either, so "
+                f"nothing can be learned about it without downloading it"
+            )
+        log.info(
+            "%s: %s, ranges NOT honoured, server %s",
+            effective,
+            human_bytes(int(length)),
+            headers.get("server", "-"),
+        )
+        return int(length), headers
+    raise TransportError(f"HTTP {response.status_code} probing {url}")
 
 
 class Circuit:
@@ -201,6 +328,18 @@ class Transport:
         with self._lock:
             self.bytes_inflight += delta
 
+    # -- accounting for a whole-entity stream ----------------------------------
+    # Split into three because the two transports keep their clocks differently, and a
+    # ``Stream`` should not have to know which one made it.
+    def _stream_open(self) -> None:
+        """Nothing to do: ``_account`` below counts the request when the stream ends."""
+
+    def _stream_progress(self, delta: int) -> None:
+        self._inflight(delta)
+
+    def _stream_done(self, nbytes: int, seconds: float) -> None:
+        self._account(nbytes, seconds)
+
     @property
     def throughput(self) -> float:
         """Observed bytes/second, used to decide seek-versus-read-through."""
@@ -240,10 +379,10 @@ class Transport:
                 # merge_environment_settings lets REQUESTS_CA_BUNDLE and CURL_CA_BUNDLE
                 # override a session-level False, which would silently re-enable
                 # verification for anyone who has either set.
-                r = circuit.session.get(
+                r, effective = gate.get(
+                    circuit.session,
                     url,
                     headers=headers,
-                    stream=True,
                     timeout=circuit.timeout,
                     verify=circuit.verify,
                 )
@@ -252,10 +391,7 @@ class Transport:
                         # The server ignored Range and is about to hand us the entire
                         # entity. On a 100 GB archive that is catastrophic, so bail out
                         # before touching the body.
-                        raise RangeNotHonoured(
-                            f"server returned 200 for a Range request ({url}); "
-                            f"it does not support partial content"
-                        )
+                        raise RangeNotHonoured(_no_ranges(url, effective))
                     if r.status_code != 206:
                         raise TransportError(f"HTTP {r.status_code} for range {start}-{end}")
                     _validate_content_range(r.headers.get("Content-Range"), start, end)
@@ -338,10 +474,10 @@ class Transport:
         circuit = self._acquire()
         try:
             try:
-                r = circuit.session.get(
+                r, effective = gate.get(
+                    circuit.session,
                     url,
                     headers={"Range": "bytes=0-0"},
-                    stream=True,
                     timeout=circuit.timeout,
                     verify=circuit.verify,
                 )
@@ -351,30 +487,37 @@ class Transport:
                 # requests exception reach the top level as a traceback.
                 raise _request_error(exc, url, circuit.verify) from exc
             try:
-                headers = {k.lower(): v for k, v in r.headers.items()}
-                if r.status_code == 206:
-                    cr = headers.get("content-range", "")
-                    total = cr.rsplit("/", 1)[-1].strip()
-                    if not total.isdigit():
-                        raise TransportError(f"unparseable Content-Range: {cr!r}")
-                    r.content
-                    log.info(
-                        "%s: %s, ranges honoured, server %s",
-                        url,
-                        human_bytes(int(total)),
-                        headers.get("server", "-"),
-                    )
-                    return int(total), headers
-                if r.status_code == 200:
-                    length = headers.get("content-length")
-                    if not length or not length.isdigit():
-                        raise TransportError("server ignored Range and gave no Content-Length")
-                    return int(length), headers
-                raise TransportError(f"HTTP {r.status_code} probing {url}")
+                return _read_head(r, url, effective)
             finally:
                 r.close()
         finally:
             self._release(circuit)
+
+    def open_stream(self, url: str) -> Stream:
+        """Open the whole entity as one forward stream, for servers that refuse ranges.
+
+        The escape hatch from ``RangeNotHonoured``: no seeking, no resuming, one shot
+        from byte zero. The circuit stays checked out for as long as the stream lives,
+        because that is exactly how long the connection under it is in use — so the
+        caller must close what it gets back.
+        """
+        circuit = self._acquire()
+        try:
+            r, effective = gate.get(
+                circuit.session, url, timeout=circuit.timeout, verify=circuit.verify
+            )
+        except requests.RequestException as exc:
+            self._release(circuit)
+            raise _request_error(exc, url, circuit.verify) from exc
+        except BaseException:
+            self._release(circuit)
+            raise
+        try:
+            return _stream_from(r, effective, lambda: self._release(circuit), self)
+        except BaseException:
+            r.close()
+            self._release(circuit)
+            raise
 
     def supports_multirange(self, url: str, size: int) -> bool:
         """Opportunistic check for multipart/byteranges.

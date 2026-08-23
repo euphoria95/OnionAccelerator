@@ -70,10 +70,11 @@ random access  yes — 23.7 MiB granularity
 fetched        64.7 KiB in 6 requests
 ```
 
-Two lines decide everything. `accept-ranges: no` means the server cannot serve partial
-content and rvtree cannot work against it at all. `random access: NO` means the archive
-is a single-block `.xz`, and `list` will refuse with a time estimate until you pass
-`--force` — see [The case with no shortcut](#the-case-with-no-shortcut).
+Two lines decide everything. `accept-ranges: NO` means the server will only serve the
+whole entity from byte zero, and the only thing that reads an archive there is `--spool`
+— see [Servers that refuse ranges](#servers-that-refuse-ranges). `random access: NO`
+means the archive is a single-block `.xz`, and `list` will refuse with a time estimate
+until you pass `--force` — see [The case with no shortcut](#the-case-with-no-shortcut).
 
 `format ... via` says what identified the archive, and `tls` says whether the
 certificate was checked — see [Knowing what it is](#knowing-what-it-is) and [TLS](#tls).
@@ -86,6 +87,8 @@ certificate was checked — see [Knowing what it is](#knowing-what-it-is) and [T
 | `-f ndjson` | Stream entries as they are found; survives interruption, suits millions of files |
 | `-f tree \| long \| json` | Other output shapes; `long` is `ls -l`-like |
 | `--circuits N` | xz block prefetch depth (default 4) |
+| `--spool FILE` | For a server that refuses ranges: stream the whole entity to `FILE` and read it from there. Kept, and reused if it is already complete |
+| `--spool-temp` | The same, into a temporary file that is deleted afterwards |
 | `--proxy none` | Direct connection with no Tor, for local testing |
 | `--endpoints LIST` | `host:port[,host:port…]` — one independent Tor daemon each. This is where parallelism actually comes from; see [Endpoints](#endpoints) |
 | `--endpoint-file PATH` | The same list, one per line |
@@ -174,7 +177,7 @@ rvtree list https://example.onion/backup.tar.xz --log-file rv.log
 | 0 | success |
 | 1 | the archive or the transfer failed — unreachable, unreadable, unparseable |
 | 2 | bad arguments, or a proxy setting that would leak the target hostname |
-| 3 | refused pending your decision — a single-block `.xz`, or an extraction over `--max-fetch`. Re-run with `--force`, or raise `--max-fetch` |
+| 3 | refused pending your decision — a single-block `.xz`, a server that serves no ranges, or an extraction over `--max-fetch`. Re-run with `--force`, `--spool`, or a higher `--max-fetch` |
 | 4 | encrypted headers: the file list itself needs the password |
 | 130 | interrupted (Ctrl-C) |
 
@@ -275,6 +278,45 @@ headers need fetching:
   some and a full listing costs roughly the whole file.
 
 `rvtree probe` reports the block map before you commit to anything.
+
+## Servers that refuse ranges
+
+Some hosts put a **proof-of-work gate** in front of a download: the first GET of
+`file.7z` answers 200 with an HTML challenge page instead of the file, and the archive
+only appears after the client hashes its way to a nonce and posts it back. rvtree solves
+the challenge — it is a cost function, not a secret, and paying it is what the gate is
+asking for — and `probe` reports it:
+
+```console
+$ rvtree probe http://example.onion/DEADBEEF/addresses.7z
+url            http://example.onion/DEADBEEF/addresses.7z
+size           1,877,268,564 bytes (1.7 GiB)
+gate           proof-of-work — solved; the size above is the real entity
+accept-ranges  NO — only --spool can read this archive, at a full download
+content-type   application/octet-stream
+```
+
+Passing the gate is the easy half. The URL it grants is served by the application rather
+than the web server, so it comes back `Accept-Ranges: none`, is **single-use**, and
+**cannot be resumed**. Downgrading to HTTP/1.0 does not change any of that: the server
+answers a Range request with 200 and the full Content-Length under both versions.
+
+That removes rvtree's whole premise, because a 7z end header, a zip central directory
+and an xz index all live at the far end of the stream. What is left is one pass:
+
+```console
+$ rvtree list http://example.onion/DEADBEEF/addresses.7z --spool addresses.7z
+```
+
+`--spool FILE` streams the entity to `FILE`, then reads the archive from disk. It costs a
+full download — 1.7 GiB at 812 KiB/s on one circuit is about 38 minutes — so `list`
+refuses with that estimate and exits 3 until you ask for it explicitly. The file is kept,
+and a second run reuses one of the right size instead of fetching again, which matters
+precisely because there is no resume. `--spool-temp` throws it away afterwards.
+
+More circuits do not help here. Every stream starts at byte zero, so reaching an offset
+means receiving every byte before it on one circuit, and a second lane would only fetch
+the same bytes twice.
 
 ### The case with no shortcut
 
@@ -420,6 +462,9 @@ rvtree/
   transport/
     tor.py              circuit pool, SOCKS5h isolation, response validation
     httpfile.py         seekable file over Range, adaptive readahead
+    pooled.py           many independent endpoints: hedge, split, failover
+    gate.py             proof-of-work interstitials, solved rather than evaded
+    spoolfile.py        the fallback for a rangeless server: one stream to disk
     probe.py            capability probe
   formats/
     detect.py           magic sniffing, then filename/header fallbacks

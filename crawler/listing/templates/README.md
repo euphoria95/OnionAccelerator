@@ -98,7 +98,7 @@ kind  = "query"
 param = "p"
 
 [download]
-url = "{root}?p={path}&dl={name}"    # bytes live somewhere the row does not point
+url = "{root}?p={parent}&dl={name}"  # bytes live somewhere the row does not point
 ```
 
 Note what is *not* there: no size or date selectors. The shared row-text reader finds
@@ -299,8 +299,13 @@ them wrong.
 | `encoded` | `prefix` + the whole path as one escaped segment | `prefix`, `join` |
 | `api` | whatever `url` renders to, sent with `method`/`body`/`headers` | `url` (required), `method`, `body`, `headers`, `prefix` |
 
-Placeholders: `{origin}`, `{root}`, `{base}`, `{path}`, `{path_raw}`, `{name}`, `{href}`,
-`{cursor}`.
+Placeholders: `{origin}`, `{root}`, `{base}`, `{path}`, `{path_raw}`, `{parent}`,
+`{name}`, `{href}`, `{cursor}`.
+
+`{path}` is the entry's own path; `{parent}` is the directory it was listed in. The
+two are the same for a directory's own URL and different for a row inside it, which
+is the distinction a manager that browses at `?p=dir` and serves at `?p=dir&dl=file`
+turns on — passing `{path}` there asks for a directory named after the file.
 
 ### `[paginate]` — the rest of *this* directory
 

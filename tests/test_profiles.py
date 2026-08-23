@@ -19,6 +19,7 @@ import os
 
 import pytest
 
+from crawler.config import INDEX_CONFIDENCE_THRESHOLD
 from crawler.listing import ListingEngine, Page
 from crawler.listing.profile import TemplateError
 from crawler.listing.navigate import seed_request
@@ -186,9 +187,12 @@ def test_tiny_file_manager_addresses_children_by_query_parameter():
     assert sizes["dump.sql.gz"] == 512 * 1024 * 1024
     assert sizes["README.txt"] == int(4.1 * 1024)
 
-    # A file's bytes live at a different URL than its listing row.
+    # A file's bytes live at a different URL than its listing row: `p` is the *directory*
+    # it was listed in and `dl` is its name. Passing the file's own path as `p` asks for a
+    # directory that does not exist, and every URL in the manifest comes back an error.
     dump = next(e for e in listing.files if e.name == "dump.sql.gz")
-    assert dump.download_url and "dl=dump.sql.gz" in dump.download_url
+    assert dump.download_url == (
+        "http://examplexyz.onion/index.php?p=files&dl=dump.sql.gz")
     assert dump.fetch_url == dump.download_url
 
     # Structurally, the same page is empty -- which is the point.
@@ -252,3 +256,73 @@ def test_a_bucket_listing_pages_on_its_continuation_token():
     # silence, so the next page has to be queued from this one.
     assert listing.more, "a truncated bucket listing queued no continuation"
     assert "1ueGcxLPRx1Tr" in listing.more[0].url
+
+
+# ---------------------------------------------------------------- the guard and the match
+
+
+# A themed autoindex holding one file: the title is the directory name rather than
+# "Index of", there is no server footer, no sort controls and no up-link, and a search box
+# costs it the last point. Everything the index-confidence heuristic counts is absent --
+# which is what a real directory holding a single entry looks like, and why the heuristic
+# refuses it. The theme's own name is the only thing identifying the software.
+_ONE_FILE = (
+    "<html><head><title>archive</title>"
+    '<link rel="stylesheet" href="/theme/apaxy/style.css"></head><body>'
+    '<form action="/search"><input name="q"></form>'
+    "<table><tr><td><a href=\"old.tar\">old.tar</a></td><td>512</td></tr></table>"
+    "</body></html>"
+)
+
+# The same server answering with an application at one of its paths. The theme's name is
+# not on this page, so the template does not match it -- which is the only thing separating
+# a directory walk from a crawl of somebody's forum.
+_APPLICATION = (
+    "<html><head><title>Welcome</title></head><body>"
+    '<form action="/search"><input name="q"></form>'
+    '<a href="/rules">Rules</a><a href="/faq">FAQ</a><a href="/login">Log in</a>'
+    '<a href="topic-1">First topic</a><a href="topic-2">Second topic</a>'
+    "</body></html>"
+)
+
+
+def _page(body: str, url: str) -> Page:
+    return Page(url=url, body=body, content_type="text/html", status=200)
+
+
+def test_a_matched_template_expands_a_directory_holding_one_file():
+    """The template's match is the evidence; the heuristic is not asked again.
+
+    A directory with a single file scores below the index-confidence threshold, and being
+    refused makes it a leaf -- silently pruning whatever is under it. That false negative
+    is the reason the plain-autoindex templates exist at all, so a page one of them
+    matches must be expanded on the strength of the match.
+    """
+    page = _page(_ONE_FILE, "http://h.onion/files/archive/")
+    listing = engine().parse(page, profile=BY_NAME["fancyindex-theme"])
+
+    assert listing.confidence < INDEX_CONFIDENCE_THRESHOLD, "the fixture must be a hard one"
+    assert listing.is_index, f"refused its own target at confidence {listing.confidence}"
+    assert [e.name for e in listing.files] == ["old.tar"]
+
+
+def test_the_structural_reader_still_refuses_the_same_page():
+    """With no template there is nothing to trust, so the guard stays on."""
+    page = _page(_ONE_FILE, "http://h.onion/files/archive/")
+    assert not engine().parse(page, profile=BY_NAME[FALLBACK]).is_index
+
+
+def test_a_locked_profile_does_not_vouch_for_every_page_on_the_host():
+    """The lock says which template reads the host, not that every page is a listing.
+
+    A server that autoindexes most of its paths and answers with an application at one of
+    them is common. Waiving the guard for the whole host on the strength of the root page
+    would walk straight into it, so the match rules are re-checked per page.
+    """
+    shared = engine()
+    root = _page(_ONE_FILE, "http://h.onion/")
+    assert shared.profile_for(root).name == "fancyindex-theme", "the host should lock"
+
+    app = _page(_APPLICATION, "http://h.onion/a/")
+    assert shared.profile_for(app).name == "fancyindex-theme", "the lock should hold"
+    assert not shared.parse(app).is_index, "but the application must still be refused"

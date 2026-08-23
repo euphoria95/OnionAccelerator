@@ -193,10 +193,11 @@ class Frontier:
         # that spelling cannot vary: one directory reachable as both `/a/b` and `/a%2Fb`
         # is one directory, and crawling it twice doubles a whole subtree.
         #
-        # For an API target the URL is not the whole identity -- every directory is the
-        # same endpoint, and it is the body that differs -- so the request contributes
-        # what a URL cannot express. It contributes nothing at all for a plain GET, which
-        # is what keeps the folding above working exactly as it did.
+        # For an API target the URL is not the whole identity -- every directory may be
+        # the same endpoint, differing only in the body or the path asked for -- so the
+        # request contributes what a URL cannot express. It contributes nothing at all
+        # for a plain GET of a directory's own URL, which is what keeps the folding above
+        # working exactly as it did.
         key = dedup_key(normalized)
         if request is not None and request.identity:
             key = f"{request.identity}|{key}"
@@ -231,14 +232,16 @@ class Frontier:
         The queue stores the canonical spelling, and a GET that still pointed at the raw
         one would be fetched twice under two names.
 
-        An API request is left exactly as it is, and the difference is the point: its URL
-        is the endpoint every directory shares, while the job's URL is the directory it
+        An endpoint request is left exactly as it is, and the difference is the point: its
+        URL is the target's own listing endpoint, while the job's URL is the directory it
         stands for. Rewriting the endpoint to the directory would send the crawl to a URL
-        the target does not serve.
+        the target does not serve -- which is what `request.endpoint` is for, and why the
+        test cannot be "is this a GET": half the file-manager APIs worth crawling are
+        addressed by a GET of an endpoint that spells the path into itself.
         """
         if request is None:
             return None
-        if request.identity:
+        if request.endpoint:
             return request
         return request if request.url == url else request.with_url(url)
 

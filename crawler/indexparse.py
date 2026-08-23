@@ -16,7 +16,6 @@ from __future__ import annotations
 
 from typing import Iterable
 
-from .config import INDEX_CONFIDENCE_THRESHOLD
 from .listing.model import Entry, Listing, PageRequest, dedupe, split_entries
 from .listing.navigate import Location, resolve
 from .listing.page import Page

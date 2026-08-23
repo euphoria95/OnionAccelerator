@@ -192,18 +192,36 @@ class ListingEngine:
         ctx = ExtractContext(
             allow_offsite=self.allow_offsite,
             address_kind=profile.navigate.kind,
+            trusted=self._trusts(profile, page),
         )
         return strategy.read(page, profile.extract.options, ctx)
+
+    def _trusts(self, profile: Profile, page: Page) -> bool:
+        """Does this template's own evidence cover *this* page?
+
+        Deliberately not "is this host locked to a template". The lock is a decision made
+        from one page, and a server that autoindexes most of its paths and answers with an
+        application at one of them is common; waiving the guard for the whole host on the
+        strength of the root page would walk straight into it. So the rules are re-checked
+        per page, against the one profile already chosen -- which is a regex or two, not a
+        ranking -- and a page they do not fire on gets the structural guard back.
+        """
+        if profile.name == FALLBACK:
+            return False
+        return self.score(profile, page) is not None
 
     def _is_index(self, profile: Profile, result: ExtractResult) -> bool:
         """May this page be expanded?
 
         For the structural reader it is the confidence score against its threshold -- the
         guard that keeps a directory walk from becoming a crawl of somebody's forum. For a
-        page a named profile matched, the match is the evidence and the heuristic is not
-        asked: a template said this is that target, and a target's listing is a listing
-        even when it holds one file. A strategy can still veto with a zero confidence,
-        which is how "this JSON is an error page, not an empty directory" is expressed.
+        page a named profile matched, the threshold is not applied at all (the strategy is
+        told so, and stops guessing): a template said this is that target, and a target's
+        listing is a listing even when it holds one file.
+
+        What survives for a matched page is the strategies' own veto -- an empty
+        `D:multistatus` says "not a listing", a JSON error page scores zero -- because
+        "unreadable" and "empty" are different facts and the crawler acts on both.
         """
         if profile.name == FALLBACK:
             return result.is_index

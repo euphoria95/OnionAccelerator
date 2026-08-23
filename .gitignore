@@ -15,3 +15,6 @@ rv.log
 # URLs.txt is the operator's own target list, and crawl mode makes it the seed
 # list too. It names live onion services; it is local input, not source.
 URLs.txt
+
+# Recon output: every line names a live onion service. Local evidence, not source.
+*.jsonl
