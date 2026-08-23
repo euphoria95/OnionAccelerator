@@ -18,3 +18,8 @@ URLs.txt
 
 # Recon output: every line names a live onion service. Local evidence, not source.
 *.jsonl
+
+# rvtree-test/ is a local conformance stack: a multi-GiB archive corpus, docker
+# images, a RARLAB trial binary, and (under the onion profile) a hidden service
+# private key. All generated, none of it source.
+rvtree-test/
