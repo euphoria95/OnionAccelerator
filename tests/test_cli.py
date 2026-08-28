@@ -362,3 +362,141 @@ def test_main_takes_argv_so_it_can_be_driven_from_a_test():
     """rvtree's main(argv) is called this way from tree_mode(); ours now matches."""
     import inspect
     assert "argv" in inspect.signature(oa.main).parameters
+
+
+# ----------------------------------------------------------------- the streaming flags
+
+
+def test_stream_defaults_to_loopback_and_takes_an_optional_bind():
+    _, args, _ = _parse(["--mode", "crawl", "--stream"])
+    assert args.stream == oa.STREAM_BIND
+
+    _, args, _ = _parse(["--mode", "crawl", "--stream", "127.0.0.1:9999"])
+    assert args.stream == "127.0.0.1:9999"
+
+    _, args, _ = _parse(["--mode", "crawl"])
+    assert args.stream is None
+
+
+def test_the_streaming_flags_do_not_leak_into_rvtrees_arguments():
+    """Tree mode passes everything after '--' through; these are parsed before it."""
+    _, args, rv_args = _parse(
+        ["--mode", "tree", "--stream", "--stream-wait", "--", "list", "http://a.onion/x.rar"])
+    assert args.stream == oa.STREAM_BIND and args.stream_wait is True
+    assert rv_args == ["list", "http://a.onion/x.rar"]
+
+
+def test_every_streaming_flag_is_documented_in_the_reference():
+    """A flag the long-form help does not mention is a flag nobody finds."""
+    documented = fullhelp.render()
+    for flag in _options(oa.build_parser()):
+        if flag.startswith("--stream"):
+            assert flag in documented, flag
+
+
+@pytest.mark.parametrize("mode", ["multi", "partial", "speedtest"])
+def test_stream_is_refused_for_the_modes_that_discover_nothing(mode, tmp_path, monkeypatch):
+    """--stream mirrors what a run *finds*; these consume a URL list rather than make one."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "URLs.txt").write_text("http://a.onion/x\n")
+    with pytest.raises(SystemExit) as excinfo:
+        oa.main(["--mode", mode, "--stream"])
+    assert excinfo.value.code == 2
+
+
+def test_the_no_stream_sink_answers_everything_and_is_falsy():
+    """Call sites pass it straight to a producer without asking whether streaming is on."""
+    assert not oa.NO_STREAM
+    assert oa.NO_STREAM("crawl.file", {"url": "u"}) is None
+    assert oa.NO_STREAM.publish("run.stop") is None
+
+
+def test_streaming_yields_the_no_op_sink_when_the_flag_is_absent():
+    _, args, _ = _parse(["--mode", "crawl"])
+    with oa.streaming(args, "crawl", ["http://a.onion/"]) as stream:
+        assert stream is oa.NO_STREAM
+
+
+def test_streaming_serves_the_run_and_stops_when_it_ends():
+    """Port 0 so the suite never fights the operator's own 8787 for the socket."""
+    _, args, _ = _parse(["--mode", "crawl", "--stream", "127.0.0.1:0"])
+    with oa.streaming(args, "crawl", ["http://a.onion/"]) as stream:
+        assert stream
+        stream("crawl.file", {"url": "http://a.onion/found.txt"})
+        assert stream.counts["crawl.file"] == 1
+        # run.start is published before the run is handed the bus, so a consumer that
+        # attached first knows what it is watching.
+        assert stream.counts["run.start"] == 1
+    assert stream.counts["run.stop"] == 1
+
+
+def test_a_bind_that_cannot_be_honoured_stops_the_run():
+    """Somebody asked for this run to be watched; running it unwatched is not the fix."""
+    _, args, _ = _parse(["--mode", "crawl", "--stream", "0.0.0.0:8787"])
+    with pytest.raises(SystemExit) as excinfo:
+        with oa.streaming(args, "crawl", ["http://a.onion/"]):
+            pass
+    assert excinfo.value.code == 1
+
+
+def test_tree_mode_hands_the_sink_to_rvtree_and_closes_the_run(monkeypatch):
+    """The passthrough is the whole integration; rvtree's own suite tests what it does."""
+    seen = {}
+
+    class FakeCli:
+        @staticmethod
+        def main(argv, transport=None, sink=None):
+            seen["argv"] = argv
+            seen["sink"] = sink
+            sink("tree.entry", {"path": "etc/hosts", "size": 12})
+            return 0
+
+    class FakeTransport:
+        lanes = 2
+        bytes_fetched = 4096
+        requests_made = 7
+
+        def __init__(self, **kwargs):
+            pass
+
+        def close(self):
+            seen["closed"] = True
+
+    monkeypatch.setattr(oa, "_import_rvtree", lambda: (FakeCli, FakeTransport))
+
+    published = []
+    code = oa.tree_mode(["list", "http://a.onion/x.rar"], ["127.0.0.1:9050"],
+                        sink=lambda kind, data: published.append((kind, data)))
+
+    assert code == 0
+    assert seen["sink"] is not None and seen["closed"]
+    kinds = [kind for kind, _ in published]
+    assert kinds == ["tree.entry", "run.stop"]
+    assert published[-1][1]["exit_code"] == 0
+    assert published[-1][1]["bytes_fetched"] == 4096
+
+
+def test_tree_mode_without_a_stream_passes_rvtree_no_sink(monkeypatch):
+    seen = {}
+
+    class FakeCli:
+        @staticmethod
+        def main(argv, transport=None, sink=None):
+            seen["sink"] = sink
+            return 0
+
+    class FakeTransport:
+        lanes = 1
+        bytes_fetched = 0
+        requests_made = 0
+
+        def __init__(self, **kwargs):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(oa, "_import_rvtree", lambda: (FakeCli, FakeTransport))
+    assert oa.tree_mode(["list", "http://a.onion/x.rar"], ["127.0.0.1:9050"],
+                        sink=oa.NO_STREAM) == 0
+    assert seen["sink"] is None
