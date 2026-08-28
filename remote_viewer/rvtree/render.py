@@ -91,7 +91,7 @@ def render_long(entries: Iterable[Entry], out: TextIO = sys.stdout) -> None:
 
 
 def render_json(entries: Iterable[Entry], out: TextIO = sys.stdout, meta: Optional[dict] = None) -> None:
-    payload = {"entries": [_as_dict(e) for e in entries]}
+    payload = {"entries": [as_dict(e) for e in entries]}
     if meta:
         payload["meta"] = meta
     json.dump(payload, out, indent=2)
@@ -101,13 +101,19 @@ def render_json(entries: Iterable[Entry], out: TextIO = sys.stdout, meta: Option
 def render_ndjson(entries: Iterator[Entry], out: TextIO = sys.stdout) -> int:
     count = 0
     for entry in entries:
-        out.write(json.dumps(_as_dict(entry), separators=(",", ":")) + "\n")
+        out.write(json.dumps(as_dict(entry), separators=(",", ":")) + "\n")
         out.flush()
         count += 1
     return count
 
 
-def _as_dict(entry: Entry) -> dict:
+def as_dict(entry: Entry) -> dict:
+    """One entry as the object every JSON shape emits.
+
+    Public because it is the wire format: ``-f json``, ``-f ndjson`` and the live event
+    stream all have to describe a member the same way, and the way to guarantee that is
+    for all three to call this.
+    """
     d = {
         "path": entry.path,
         "size": entry.size,
