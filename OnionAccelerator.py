@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import contextlib
 import os
 import re
 import sys
@@ -1467,8 +1468,13 @@ def resolve_tree_endpoints(args, urls):
     return []
 
 
-def tree_mode(rv_args, proxies, retries=DEFAULT_RETRIES):
-    """Run one rvtree invocation over the resolved endpoints. Returns rvtree's exit code."""
+def tree_mode(rv_args, proxies, retries=DEFAULT_RETRIES, sink=None):
+    """Run one rvtree invocation over the resolved endpoints. Returns rvtree's exit code.
+
+    `sink` is handed straight to rvtree, which publishes each archive member to it as the
+    walk finds it. Listing a multi-gigabyte archive by range requests over Tor is an
+    hour's work; this is what makes that hour searchable while it passes.
+    """
     imported = _import_rvtree()
     if imported is None:
         return 1
@@ -1496,13 +1502,160 @@ def tree_mode(rv_args, proxies, retries=DEFAULT_RETRIES):
         return 1
 
     logger.info(f"rvtree over {transport.lanes} lane(s): {' '.join(rv_args)}")
+    code = 1
     try:
-        return rvtree_cli.main(rv_args, transport=transport)
+        code = rvtree_cli.main(rv_args, transport=transport, sink=sink or None)
+        return code
     except Exception as e:
         logger.error(f"rvtree failed: {e}")
         return 1
     finally:
         transport.close()
+        if sink:
+            sink("run.stop", {"mode": "tree", "exit_code": code,
+                              "stopped_because": "finished" if code == 0 else "failed",
+                              "bytes_fetched": transport.bytes_fetched,
+                              "requests": transport.requests_made})
+
+
+# =========== STREAMING API (--stream) ===========
+
+# --stream publishes what a run finds, as it finds it, to an HTTP endpoint an external
+# script can attach to. It exists because the runs that matter here take hours: a crawl
+# of a leak site's file manager over Tor, or a listing of a 2 GB archive by range
+# requests. Everything those runs learn is already written to disk, but not until they
+# stop, and an incident response that has to wait for the run to finish before it can
+# search for the names in scope is an incident response running at the speed of Tor.
+#
+# The implementation lives in eventstream/ and is standard library only, so switching it
+# on cannot fail on a host that has not installed anything. It is still imported lazily,
+# like crawler/ and rvtree/, so that importing this module stays free of side effects.
+STREAM_BIND = "127.0.0.1:8787"
+STREAM_BUFFER = 10000
+STREAM_BODY_BYTES = 64 * 1024
+# How long a run waits at the end for consumers to read what it just published. Bounded:
+# the JSONL on disk is complete, so a wedged grep must not hold the process open.
+STREAM_DRAIN = 5.0
+# Ceiling on what the replay ring may hold when --stream-bodies is on. Without one the
+# two defaults multiply: 10,000 events of 64 KiB of page text, each kept as the record
+# *and* as the serialised line a consumer reads, is over a gigabyte of an analysis box's
+# memory held for the whole run.
+STREAM_BODY_RING_BYTES = 64 * 1024 * 1024
+
+
+def _import_eventstream():
+    """Import the eventstream package, or explain why the flag cannot be honoured."""
+    try:
+        import eventstream
+        return eventstream
+    except ImportError as e:                          # pragma: no cover - stdlib only
+        logger.error(f"--stream needs the eventstream package ({e}). Expected it next "
+                     f"to this script; it has no third-party dependencies.")
+        return None
+
+
+class _NoStream:
+    """The sink a run gets when --stream is off: answers everything, does nothing.
+
+    Callable so a mode can publish a run fact without checking first, and falsy so a
+    mode that would rather skip the work entirely can. crawl_mode does the second and
+    says why: with nobody watching, the crawler should take the path it always took
+    rather than call into a sink per record.
+    """
+
+    def __call__(self, kind, data=None):
+        return None
+
+    publish = __call__
+
+    def __bool__(self):
+        return False
+
+
+NO_STREAM = _NoStream()
+
+
+def _stream_ring(args, mode):
+    """How many events to keep for replay, given what each of them may weigh.
+
+    --stream-buffer is counted in events because that is the unit a consumer reconnects
+    in, and for metadata records the two defaults are a few megabytes. Page text is
+    three orders of magnitude heavier, so when --stream-bodies is on the ring is sized
+    by a byte budget instead: a replay depth of a few hundred findings is worth having,
+    and a gigabyte of somebody else's markup pinned in RAM for four hours is not.
+
+    Only crawl mode publishes bodies, so only crawl mode pays for them: a tree listing
+    of a million-member archive should keep its full replay depth even when the flag was
+    passed alongside it.
+    """
+    events = args.stream_buffer
+    if mode != "crawl":
+        return events
+    if not getattr(args, "stream_bodies", False) or args.stream_body_bytes <= 0:
+        return events
+    affordable = max(100, STREAM_BODY_RING_BYTES // (2 * args.stream_body_bytes))
+    if affordable >= events:
+        return events
+    logger.info(f"--stream-bodies: keeping {affordable} events for replay rather than "
+                f"{events}, to hold the page text under "
+                f"{STREAM_BODY_RING_BYTES // (1024 * 1024)} MiB.")
+    return affordable
+
+
+@contextlib.contextmanager
+def streaming(args, mode, target, status=None):
+    """Serve this run's events for as long as it lasts. Yields the sink to publish to.
+
+    Yields NO_STREAM when --stream was not given, so every call site can pass the result
+    straight into a producer's `sink=` without asking whether streaming is on.
+
+    `status` is a callable the /status endpoint asks for the run's own counters; it is
+    read while the run is in flight, so it must not block.
+    """
+    if not getattr(args, "stream", None):
+        yield NO_STREAM
+        return
+
+    pkg = _import_eventstream()
+    if pkg is None:
+        # Same rule as a bind that cannot be honoured, below: somebody asked for this
+        # run to be watched, and a run that quietly is not being watched is worse than
+        # no run at all.
+        sys.exit(1)
+
+    ring = _stream_ring(args, mode)
+    # A consumer's own queue is capped by the ring as well as by its own default. A
+    # deeper queue than the ring means a lagging consumer pins events the ring has
+    # already dropped -- which is memory outside the budget above, once per consumer,
+    # and under --stream-bodies that is hundreds of megabytes of somebody else's markup.
+    bus = pkg.EventBus(JOB_ID, mode, buffer=ring,
+                       queue=min(pkg.DEFAULT_QUEUE, ring))
+    try:
+        server = pkg.StreamServer(bus, args.stream, token=args.stream_token,
+                                  status=status).start()
+    except (ValueError, OSError) as e:
+        # A bind that fails is fatal rather than degraded: somebody asked for this run to
+        # be watched, and a run that quietly is not being watched is worse than no run.
+        logger.error(f"Cannot start the event stream: {e}")
+        sys.exit(1)
+
+    if args.stream_wait:
+        logger.info(f"Waiting for a consumer on {server.url}/events "
+                    f"(--stream-wait; Ctrl-C to give up) ...")
+        server.wait_for_consumer()
+        logger.info("Consumer attached; starting the run.")
+
+    bus(pkg.RUN_START, {"mode": mode, "target": target, "job_id": JOB_ID,
+                        "bodies": bool(getattr(args, "stream_bodies", False))})
+    try:
+        yield bus
+    finally:
+        if not bus.counts.get(pkg.RUN_STOP):
+            # Every run ends with exactly one run.stop, including the ones that end by
+            # exception -- a consumer that never sees one cannot tell "still working"
+            # from "died an hour ago".
+            bus(pkg.RUN_STOP, {"mode": mode, "stopped_because": "ended without a summary"})
+        server.stop(STREAM_DRAIN)
 
 
 # =========== CRAWL ("Index of /") ===========
@@ -1529,6 +1682,16 @@ def _import_crawler():
                      f"({e}). Install them with 'pip install -r requirements.txt' "
                      f"(aiohttp, aiohttp-socks, beautifulsoup4, lxml).")
         return None
+
+
+def crawl_out_dir():
+    """Where this job's crawl artefacts go.
+
+    One definition, because /status hands this path to a consumer as the thing to
+    reconcile a gap against: a second derivation of it somewhere else is a promise that
+    can quietly stop being true.
+    """
+    return os.path.join(crawler_default("CRAWLS_DIR", "crawls"), JOB_ID)
 
 
 def crawler_default(name, fallback):
@@ -1668,7 +1831,7 @@ def list_profiles_mode(args):
     return 0
 
 
-def detect_mode(urls, proxies, args):
+def detect_mode(urls, proxies, args, sink=None):
     """--detect: one request per seed, then say what the target is. Returns an exit code."""
     pkg = _import_crawler()
     if pkg is None:
@@ -1703,16 +1866,30 @@ def detect_mode(urls, proxies, args):
         print()
         print(pkg.listing.render(findings, seed, extra_flags=extra_flags))
         matched += 1 if any(f.usable for f in findings) else 0
+        if sink:
+            sink("detect.result", {
+                "seed": seed,
+                "usable": any(f.usable for f in findings),
+                "findings": [{"profile": f.profile.name, "score": round(f.score, 3),
+                              "entries": f.entries, "directories": f.directories,
+                              "files": f.files, "is_index": f.is_index,
+                              "usable": f.usable, "probed": f.probed,
+                              "error": f.error}
+                             for f in findings],
+            })
+    if sink:
+        sink("run.stop", {"mode": "detect", "seeds": len(results), "matched": matched,
+                          "stopped_because": "finished"})
     return 0 if matched else 1
 
 
-def crawl_mode(urls, proxies, args):
+def crawl_mode(urls, proxies, args, sink=None):
     """Run one crawl, then optionally download everything it found. Returns an exit code."""
     pkg = _import_crawler()
     if pkg is None:
         return 1
 
-    out_dir = os.path.join(pkg.config.CRAWLS_DIR, JOB_ID)
+    out_dir = crawl_out_dir()
     try:
         config = pkg.CrawlConfig(
             seeds=list(urls),
@@ -1732,6 +1909,8 @@ def crawl_mode(urls, proxies, args):
             download=args.download,
             profile=args.profile,
             templates=list(args.templates or []),
+            stream_bodies=args.stream_bodies,
+            stream_body_bytes=args.stream_body_bytes,
             out_dir=out_dir,
             job_id=JOB_ID,
         )
@@ -1740,32 +1919,49 @@ def crawl_mode(urls, proxies, args):
         return 1
 
     try:
-        stats, file_urls = pkg.crawl(config, proxies, load_user_agents())
+        # `sink or None` rather than the no-op sink: with no consumer the crawler should
+        # take its original path and not pay a call per record.
+        stats, file_urls = pkg.crawl(config, proxies, load_user_agents(),
+                                     sink=sink or None)
     except ValueError as e:                           # an unknown --profile, or a bad template
         logger.error(f"{e}")
         return 1
-    logger.info(f"Crawl manifest: {os.path.abspath(out_dir)} "
-                f"({len(file_urls)} file URL(s) in {pkg.config.URLS_FILE})")
+    # Held until this function actually returns rather than published here: with
+    # --download the process keeps pulling bytes for hours after the crawl stops, and a
+    # consumer told the run ended while the job is still working cannot tell a finished
+    # run from one that died.
+    stop = {"mode": "crawl", "out_dir": os.path.abspath(out_dir),
+            "stopped_because": stats["stopped_because"],
+            "totals": stats["totals"], "elapsed_s": stats["elapsed_s"],
+            "files": len(file_urls), "downloaded": 0}
+    try:
+        logger.info(f"Crawl manifest: {os.path.abspath(out_dir)} "
+                    f"({len(file_urls)} file URL(s) in {pkg.config.URLS_FILE})")
 
-    if not args.download:
-        if file_urls:
-            # --preserve-path is not optional advice here: a crawl manifest addresses a
-            # whole tree, and without it every same-named file in it lands on one path.
-            logger.info(f"Feed them to a download run with: cp "
-                        f"{os.path.join(out_dir, pkg.config.URLS_FILE)} {URLS_FILE} && "
-                        f"python3 OnionAccelerator.py --mode multi --preserve-path")
-        return 0 if stats["totals"]["directories"] else 1
+        if not args.download:
+            if file_urls:
+                # --preserve-path is not optional advice here: a crawl manifest addresses
+                # a whole tree, and without it every same-named file lands on one path.
+                logger.info(f"Feed them to a download run with: cp "
+                            f"{os.path.join(out_dir, pkg.config.URLS_FILE)} {URLS_FILE} && "
+                            f"python3 OnionAccelerator.py --mode multi --preserve-path")
+            return 0 if stats["totals"]["directories"] else 1
 
-    if not file_urls:
-        logger.warning("--download was given but the crawl found no files.")
+        if not file_urls:
+            logger.warning("--download was given but the crawl found no files.")
+            return 0
+
+        # A separate, sequential phase on purpose: the download stack is threads over
+        # `requests`, and running it alongside the event loop would put two unrelated
+        # concurrency models on the same Tor daemons at the same time.
+        logger.info(f"Downloading {len(file_urls)} discovered file(s) into "
+                    f"{DOWNLOAD_DIR}/ ...")
+        multi_download_mode(file_urls, proxies, retries=args.retries, preserve_path=True)
+        stop["downloaded"] = len(file_urls)
         return 0
-
-    # A separate, sequential phase on purpose: the download stack is threads over
-    # `requests`, and running it alongside the event loop would put two unrelated
-    # concurrency models on the same Tor daemons at the same time.
-    logger.info(f"Downloading {len(file_urls)} discovered file(s) into {DOWNLOAD_DIR}/ ...")
-    multi_download_mode(file_urls, proxies, retries=args.retries, preserve_path=True)
-    return 0
+    finally:
+        if sink:
+            sink("run.stop", stop)
 
 
 # =========== COMMAND LINE ===========
@@ -1918,6 +2114,47 @@ def build_parser():
                                  "for several). A template of the same name replaces the "
                                  "built-in one -- which is how a target-specific profile "
                                  "stays out of the repository.")
+
+    stream_opts = parser.add_argument_group(
+        "streaming API",
+        "Mirror a running crawl, tree listing or detection to an external process "
+        "(ignored by the download modes)."
+    )
+    stream_opts.add_argument("--stream", nargs="?", const=STREAM_BIND, default=None,
+                             metavar="HOST:PORT",
+                             help=f"Serve this run's findings as newline-delimited JSON "
+                                  f"while it runs, for an external script to grep or "
+                                  f"index. Default bind {STREAM_BIND}; a bare port works, "
+                                  f"and port 0 picks a free one and logs it. Attach with: "
+                                  f"curl -sN 'http://127.0.0.1:8787/events'. "
+                                  f"See also /status, /schema and /health.")
+    stream_opts.add_argument("--stream-token", default=None, metavar="TOKEN",
+                             help="Require this bearer token on every stream request. "
+                                  "Mandatory for any bind that is not loopback -- the "
+                                  "stream carries target URLs and file names.")
+    stream_opts.add_argument("--stream-buffer", type=int, default=STREAM_BUFFER,
+                             metavar="N",
+                             help=f"Events kept for replay, so a consumer that attaches "
+                                  f"late or reconnects can ask for what it missed with "
+                                  f"?since=SEQ (default {STREAM_BUFFER}).")
+    stream_opts.add_argument("--stream-bodies", action="store_true",
+                             help="Also publish the text of each fetched page, truncated, "
+                                  "for hunts that must match inside a listing rather than "
+                                  "in its file names. Crawl mode only. Never written to "
+                                  "disk.")
+    # The cap lives in crawler/config.py next to MAX_PAGE_BYTES, which is what it has to
+    # stay proportionate to; the constant here is only the fallback for a host that
+    # cannot import the crawler at all. Same bargain as --max-page-bytes above.
+    body_bytes = crawler_default("STREAM_BODY_BYTES", STREAM_BODY_BYTES)
+    stream_opts.add_argument("--stream-body-bytes", type=int, default=body_bytes,
+                             metavar="N",
+                             help=f"How much of each body --stream-bodies publishes "
+                                  f"(default {body_bytes}). The event says whether "
+                                  f"it was truncated.")
+    stream_opts.add_argument("--stream-wait", action="store_true",
+                             help="Do not start the run until a consumer has attached to "
+                                  "/events. Use it when the keyword index has to see the "
+                                  "first finding, not the first one after it woke up.")
     return parser
 
 
@@ -2007,6 +2244,14 @@ def main(argv=None):
     if args.farm and args.url:
         parser.error("--url has no meaning for --farm; it manages proxies, not targets")
 
+    if args.farm and args.stream:
+        # Refused rather than ignored, for the same reason a bind that cannot be honoured
+        # is fatal: somebody asked for this to be watched, and quietly not watching it is
+        # worse than not running it.
+        parser.error("--stream has nothing to publish for --farm: it manages Tor "
+                     "daemons and discovers nothing. It applies to --mode crawl, "
+                     "--mode tree and --detect.")
+
     # Farm management needs no URL list; run the action and exit.
     if args.farm:
         run_farm_action(args.farm, args.count, args.base_port, args.bootstrap_timeout)
@@ -2026,9 +2271,17 @@ def main(argv=None):
         proxies = resolve_tree_endpoints(args, tree_urls(rv_args))
         if not proxies:
             sys.exit(1)
-        code = tree_mode(rv_args, proxies, retries=args.retries)
+        target = rv_target_urls(rv_args) or tree_urls(rv_args)
+        with streaming(args, "tree", target) as stream:
+            code = tree_mode(rv_args, proxies, retries=args.retries, sink=stream)
         logger.info(f"OnionAccelerator tree mode finished (exit {code}).")
         sys.exit(code)
+
+    if args.stream and args.mode in ("multi", "partial", "speedtest"):
+        parser.error(f"--stream has nothing to publish in --mode {args.mode}: it mirrors "
+                     f"what a run *discovers*, and these modes consume a URL list rather "
+                     f"than produce one. It applies to --mode crawl, --mode tree and "
+                     f"--detect.")
 
     urls = resolve_urls(args)
     source = "--url" if args.url else URLS_FILE
@@ -2045,10 +2298,21 @@ def main(argv=None):
         logger.info(f"Using {len(proxies)} SOCKS endpoint(s) x "
                     f"{args.circuits_per_endpoint} circuit(s).")
         if args.detect:
-            code = detect_mode(urls, proxies, args)
+            with streaming(args, "detect", urls) as stream:
+                code = detect_mode(urls, proxies, args, sink=stream)
             logger.info(f"OnionAccelerator detection finished (exit {code}).")
             sys.exit(code)
-        code = crawl_mode(urls, proxies, args)
+        # /status answers with where this run's artefacts are going, so a consumer that
+        # sees a gap knows which files to reconcile against. The live counters it also
+        # wants are the stream's own, and the bus keeps those already.
+        out_dir = crawl_out_dir()
+
+        def status():
+            return {"job_id": JOB_ID, "seeds": urls, "endpoints": len(proxies),
+                    "out_dir": os.path.abspath(out_dir), "download": args.download}
+
+        with streaming(args, "crawl", urls, status=status) as stream:
+            code = crawl_mode(urls, proxies, args, sink=stream)
         logger.info(f"OnionAccelerator crawl mode finished (exit {code}).")
         sys.exit(code)
 

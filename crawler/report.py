@@ -8,6 +8,12 @@ eyeballing and a bare URL list that feeds straight back into `--mode multi`.
 Every record carries where it came from -- parent directory, depth, the SOCKS endpoint
 that fetched it, the HTTP status, and the size and timestamp exactly as the server
 printed them.
+
+The same records are published to an optional `sink` as they are written, which is what
+`--stream` serves to a consumer attached to the running crawl. The record is published
+*by reference*, unchanged: what a keyword hunt sees live and what listing.jsonl says at
+the end are the same object, so an index built from the stream cannot drift from the
+evidence on disk.
 """
 
 from __future__ import annotations
@@ -17,13 +23,14 @@ import json
 import logging
 import os
 import time
-from typing import Any, Iterable, Optional, TextIO
+from typing import Any, Callable, Iterable, Optional, TextIO
 
 from .config import (
     DIRS_FILE,
     FAILED_FILE,
     LISTING_FILE,
     STATS_FILE,
+    STREAM_BODY_BYTES,
     TREE_FILE,
     URLS_FILE,
 )
@@ -31,7 +38,21 @@ from .frontier import Job
 from .listing import Entry, Listing
 from .urlnorm import dedup_key, host_of, path_segments
 
+# What a live consumer of this crawl looks like from in here: a callable, nothing more.
+Sink = Callable[[str, dict], None]
+
 logger = logging.getLogger("OnionAccelerator.crawl.report")
+
+# The event kinds this module publishes. Plain strings on purpose: the crawler must keep
+# working on a host that has nothing but aiohttp installed, so it cannot import the
+# eventstream package to name them. tests/test_stream_contract.py fails if these ever
+# drift from the KINDS table in eventstream/bus.py, which is what a consumer reads.
+EVENT_DIR = "crawl.dir"
+EVENT_FILE = "crawl.file"
+EVENT_SKIP = "crawl.skip"
+EVENT_FAIL = "crawl.fail"
+EVENT_PAGE = "crawl.page"
+EVENT_PROGRESS = "crawl.progress"
 
 
 @dataclasses.dataclass
@@ -52,12 +73,21 @@ class Totals:
 class CrawlReport:
     """Streams crawl output into `out_dir`, then renders the summaries on close."""
 
-    def __init__(self, out_dir: str, job_id: str, seeds: Iterable[str]) -> None:
+    def __init__(self, out_dir: str, job_id: str, seeds: Iterable[str], *,
+                 sink: Optional[Sink] = None, stream_bodies: bool = False,
+                 stream_body_bytes: int = STREAM_BODY_BYTES) -> None:
         self.out_dir = out_dir
         self.job_id = job_id
         self.seeds = list(seeds)
         self.totals = Totals()
         self.started = time.time()
+        # Anything callable as sink(kind, data). None is the common case and costs one
+        # branch per record; see emit(). The crawler never learns what is on the other
+        # end of it -- eventstream.EventBus happens to be callable with that signature.
+        self._sink = sink
+        self._sink_failures = 0
+        self._stream_bodies = stream_bodies
+        self._stream_body_bytes = max(0, stream_body_bytes)
 
         self._listing: Optional[TextIO] = None
         self._dirs: Optional[TextIO] = None
@@ -101,7 +131,7 @@ class CrawlReport:
             "title": listing.title,
             "discovered_at": _now(),
         })
-        self._write(self._dirs, record)
+        self._write(self._dirs, record, EVENT_DIR)
         self._add_to_tree(job.url, is_dir=True)
 
         for entry in listing.files:
@@ -148,7 +178,7 @@ class CrawlReport:
             "content_type": content_type,
             "endpoint": endpoint,
             "discovered_at": _now(),
-        })
+        }, EVENT_FILE)
         self._add_to_tree(entry.url, is_dir=False, size=entry.size_bytes,
                           mtime=entry.mtime_text)
 
@@ -178,7 +208,7 @@ class CrawlReport:
             "title": listing.title,
             "discovered_at": _now(),
         })
-        self._write(self._dirs, record)
+        self._write(self._dirs, record, EVENT_SKIP)
         self._add_to_tree(job.url, is_dir=True)
 
     def record_leaf(self, job: Job, result_record: dict[str, Any]) -> None:
@@ -212,10 +242,68 @@ class CrawlReport:
             "final": final,
             "at": _now(),
         })
-        self._write(self._failed, record)
+        self._write(self._failed, record, EVENT_FAIL)
         if final:
             logger.error("[FAIL] gave up on %s after %d attempt(s): %s",
                          job.url, job.attempt + 1, record.get("error"))
+
+    def record_page(self, url: str, body: str, *, status: Optional[int],
+                    content_type: Optional[str], depth: int,
+                    parent: Optional[str]) -> None:
+        """Publish a fetched page's text. Does nothing unless --stream-bodies is on.
+
+        Never written to disk: the crawl's artefacts are a manifest of what is on the
+        target, and a copy of every listing's markup is neither evidence anyone asked
+        for nor something to leave lying around. It exists only for a hunt that has to
+        match inside the page -- a name in a listing's header, a comment in the markup.
+        """
+        if not self._stream_bodies or self._sink is None:
+            return
+        cap = self._stream_body_bytes
+        # Counted in bytes, because that is what the flag promises and what crosses the
+        # socket. Slicing the str would cap characters instead, and a listing of
+        # Cyrillic or CJK file names is two to four bytes a character -- so a 64 KiB cap
+        # would put a quarter of a megabyte on the wire and report it as 64 KiB.
+        raw = body.encode("utf-8", "replace")
+        clipped = raw[:cap].decode("utf-8", "ignore")
+        self.emit(EVENT_PAGE, {
+            "url": url,
+            "host": host_of(url),
+            "status": status,
+            "content_type": content_type,
+            "depth": depth,
+            "parent": parent,
+            "bytes": len(raw),
+            "truncated": len(raw) > cap,
+            "body": clipped,
+            "at": _now(),
+        })
+
+    def emit(self, kind: str, data: dict[str, Any]) -> None:
+        """Publish one event, if anyone is listening.
+
+        A sink must not block and must not raise -- it is called from the crawl's event
+        loop, on the path that is otherwise fetching over Tor. The guard here is for the
+        second half of that: a broken consumer costs the run a log line, not the run.
+
+        The sink is *not* dropped after a failure. One bad record -- something in a
+        listing that a consumer choked on -- would otherwise take the stream dark for
+        the remaining hours of the crawl while every endpoint still answered as though
+        it were healthy, which is exactly the unannounced hole this feature exists to
+        avoid. Only the first failure is logged loudly, so a persistently broken
+        consumer does not bury the crawl's own log.
+        """
+        if self._sink is None:
+            return
+        try:
+            self._sink(kind, data)
+        except Exception as exc:                                       # noqa: BLE001
+            self._sink_failures += 1
+            if self._sink_failures == 1:
+                logger.warning("event sink failed on %s (%s); the crawl continues and "
+                               "keeps publishing", kind, exc)
+            else:
+                logger.debug("event sink failed on %s (%s)", kind, exc)
 
     # ------------------------------------------------------------ summaries
 
@@ -301,17 +389,20 @@ class CrawlReport:
 
     # ------------------------------------------------------------ internals
 
-    @staticmethod
-    def _write(handle: Optional[TextIO], record: dict[str, Any]) -> None:
-        """Append one JSONL record and flush it.
+    def _write(self, handle: Optional[TextIO], record: dict[str, Any],
+               kind: str) -> None:
+        """Append one JSONL record, flush it, and publish it.
 
         Flushing every line costs nothing next to a Tor round trip, and it is what makes
         the output of an interrupted run complete up to the interruption.
+
+        Disk first, then the stream. If the two ever disagree about whether a record
+        exists, the artefact on disk is the one an investigation will be defended on.
         """
-        if handle is None:
-            return
-        handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
-        handle.flush()
+        if handle is not None:
+            handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+            handle.flush()
+        self.emit(kind, record)
 
 
 def human_size(nbytes: Optional[int]) -> str:
