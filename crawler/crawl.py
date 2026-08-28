@@ -31,7 +31,10 @@ from .frontier import Frontier, HostLimiter, Job
 from .listing import Finding, ListingEngine, Page, PageRequest, detect
 from .listing.navigate import seed_request
 from .proxypool import AsyncLanePool, ConnectorFactory, Endpoint
-from .report import CrawlReport
+# _now is the stamp every record in this run carries; it comes from report.py rather
+# than being written twice, so a progress event and a listing record cannot end up
+# describing the same second in two different formats.
+from .report import EVENT_PROGRESS, CrawlReport, Sink, _now
 
 logger = logging.getLogger("OnionAccelerator.crawl")
 
@@ -175,6 +178,13 @@ class Crawler:
             headers=result.headers,
             request=job.fetch,
         )
+        # Before the parse, so a page that turns out not to be a listing is still
+        # searchable by a hunt: "the name we are looking for appeared on a page this
+        # crawl declined to expand" is exactly the kind of thing worth knowing.
+        self.report.record_page(
+            page.url, page.body, status=page.status, content_type=page.content_type,
+            depth=job.depth, parent=job.parent,
+        )
         listing = self.listing.parse(page)
 
         if not listing.is_index:
@@ -272,13 +282,26 @@ class Crawler:
         """
         while True:
             await asyncio.sleep(STATS_INTERVAL)
+            queued = self.frontier.pending - self.frontier.in_flight
             logger.info(
                 "progress: %d dir(s), %d file(s), %d queued, %d in flight, %d seen | %s",
                 self.report.totals.directories, self.report.totals.files,
-                self.frontier.pending - self.frontier.in_flight,
-                self.frontier.in_flight, self.frontier.seen,
+                queued, self.frontier.in_flight, self.frontier.seen,
                 self.pool.balance_line(),
             )
+            # The same facts to anyone attached to the stream, so a consumer can tell a
+            # crawl that is finding nothing from a crawl that has stopped moving.
+            self.report.emit(EVENT_PROGRESS, {
+                "directories": self.report.totals.directories,
+                "files": self.report.totals.files,
+                "failures": self.report.totals.failures,
+                "queued": queued,
+                "in_flight": self.frontier.in_flight,
+                "seen": self.frontier.seen,
+                "bytes_fetched": self.report.totals.bytes_fetched,
+                "endpoints": self.pool.balance_line(),
+                "at": _now(),
+            })
 
     # ------------------------------------------------------------ signals
 
@@ -330,11 +353,16 @@ async def run_crawl(
     user_agents: Sequence[str],
     *,
     connector_factory: Optional[ConnectorFactory] = None,
+    sink: Optional[Sink] = None,
 ) -> tuple[dict[str, Any], list[str]]:
     """Run one crawl to completion. Returns (stats, discovered file URLs).
 
     `connector_factory` is the Tor seam: leave it None in production, pass a direct
     connector in tests.
+
+    `sink` is the live-output seam: anything callable as sink(kind, record) is handed
+    every record as it is written, which is how `--stream` mirrors a running crawl to an
+    external process. Leave it None and the crawl behaves exactly as it always did.
     """
     pool = await AsyncLanePool.create(
         endpoints,
@@ -358,7 +386,9 @@ async def run_crawl(
     )
 
     try:
-        with CrawlReport(config.out_dir, config.job_id, config.seeds) as report:
+        with CrawlReport(config.out_dir, config.job_id, config.seeds, sink=sink,
+                         stream_bodies=config.stream_bodies,
+                         stream_body_bytes=config.stream_body_bytes) as report:
             crawler = Crawler(config, pool, frontier, fetcher, report, listing)
             stats = await crawler.run()
             return stats, report.file_urls
@@ -433,12 +463,14 @@ def crawl(
     user_agents: Sequence[str],
     *,
     connector_factory: Optional[ConnectorFactory] = None,
+    sink: Optional[Sink] = None,
 ) -> tuple[dict[str, Any], list[str]]:
     """Synchronous wrapper, so the rest of OnionAccelerator never has to see a loop."""
     started = time.monotonic()
     try:
         return asyncio.run(run_crawl(
-            config, endpoints, user_agents, connector_factory=connector_factory
+            config, endpoints, user_agents,
+            connector_factory=connector_factory, sink=sink,
         ))
     finally:
         logger.debug("crawl mode wall time: %.1fs", time.monotonic() - started)

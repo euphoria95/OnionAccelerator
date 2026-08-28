@@ -63,8 +63,17 @@ DEFAULT_PER_HOST = 8
 DEFAULT_MAX_DEPTH: Optional[int] = None
 LANE_WAIT_TIMEOUT = 300.0
 
-# How often the run logs a progress/endpoint-balance line.
+# How often the run logs a progress/endpoint-balance line. Also the interval at which a
+# crawl.progress event reaches an attached --stream consumer.
 STATS_INTERVAL = 30.0
+
+# ---------------------------------------------------------------- streaming
+
+# How much of a fetched page body reaches an attached consumer under --stream-bodies.
+# A listing body can be megabytes (see MAX_PAGE_BYTES) and a consumer hunting keywords
+# wants the text, not the markup budget -- so it is capped, and the cap is reported on
+# the event rather than silently applied.
+STREAM_BODY_BYTES = 64 * 1024
 
 # ---------------------------------------------------------------- parsing
 
@@ -114,6 +123,11 @@ class CrawlConfig:
     # addressed in the target's own scheme before there is a page to match against.
     profile: Optional[str] = None
     templates: list[str] = dataclasses.field(default_factory=list)
+    # Whether a fetched page's text is published to an attached event-stream consumer.
+    # Off by default: the metadata says what was found, and only a hunt that needs to
+    # match inside the listing itself needs the body, which is far more of it.
+    stream_bodies: bool = False
+    stream_body_bytes: int = STREAM_BODY_BYTES
     out_dir: str = ""
     job_id: str = ""
 

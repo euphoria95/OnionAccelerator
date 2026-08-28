@@ -53,6 +53,41 @@ _URL_FLAG = (
     "file entirely -- URLs.txt is not read and need not exist.",
 )
 
+_STREAM_FLAGS = [
+    ("--stream [HOST:PORT]",
+     "Serve what this run finds, as it finds it, as newline-delimited JSON over HTTP, "
+     "for an external script to grep or index. The runs this program is for take hours; "
+     "this is what makes their findings searchable during the run rather than after it. "
+     "Default bind 127.0.0.1:8787. A bare port works, and port 0 picks a free one and "
+     "logs which. Attach with \"curl -sN 'http://127.0.0.1:8787/events'\". "
+     "Also serves /status, /schema and /health."),
+    ("/events parameters",
+     "since=SEQ replays what you missed and then follows. kinds=A,B narrows by kind, "
+     "and a family prefix works: 'crawl' takes every crawl.* kind. match=REGEX filters "
+     "server-side, against the whole line. shape=ndjson|line, where line emits only the "
+     "URL or path, for piping. heartbeat=SECONDS. Every line carries seq, ts, run, mode, "
+     "kind and data -- and data is byte-for-byte the record the run writes to disk, so "
+     "an index built from the stream cannot disagree with the evidence in the crawl "
+     "directory."),
+    ("--stream-token TOKEN",
+     "Require this bearer token, sent as 'Authorization: Bearer TOKEN' or ?token=. "
+     "Mandatory for any bind that is not loopback: the stream carries the target's URLs "
+     "and file names, and binding it to an interface without one is refused rather than "
+     "warned about. Prefer a loopback bind and an SSH tunnel."),
+    ("--stream-buffer N",
+     "How many events are kept for replay (default 10000). A consumer that attaches "
+     "late, or reconnects after a dropped socket, asks for what it missed with "
+     "?since=SEQ; anything older than the buffer is reported as a gap rather than "
+     "silently skipped."),
+    ("--stream-bodies",
+     "Also publish the text of each fetched page, truncated to --stream-body-bytes "
+     "(default 65536), for a hunt that has to match inside a listing rather than in its "
+     "file names. Crawl mode only, and never written to disk."),
+    ("--stream-wait",
+     "Hold the run until a consumer has attached to /events, so the keyword index sees "
+     "the first finding rather than the first one after it woke up."),
+]
+
 _PROXY_FLAGS = [
     ("--external",
      "Fetch ip:port SOCKS5 proxies from the public list instead of using local Tor. "
@@ -195,7 +230,7 @@ SECTIONS = {
              "flags that subcommand takes. '-v' traces the pipeline, '-vv' logs one line "
              "per range request."),
             _RETRY_FLAG,
-        ] + _PROXY_FLAGS + _FARM_RANGE_FLAGS,
+        ] + _STREAM_FLAGS + _PROXY_FLAGS + _FARM_RANGE_FLAGS,
         "examples": [
             ("python3 OnionAccelerator.py --mode tree --url https://example.onion/backup.rar",
              "what is in it, and what did it cost"),
@@ -207,6 +242,10 @@ SECTIONS = {
             ("python3 OnionAccelerator.py --mode tree --url https://example.onion/big.tar.xz \\\n"
              "    -- list -f ndjson > tree.ndjson",
              "stream it, so an interrupt keeps what it had"),
+            ("python3 OnionAccelerator.py --mode tree --url https://example.onion/leak.7z \\\n"
+             "    --stream &\ncurl -sN "
+             "'http://127.0.0.1:8787/events?kinds=tree.entry&match=(?i)[.]pst$'",
+             "grep a 2 GB archive's members as they are walked"),
             ("python3 OnionAccelerator.py --mode tree -- --help",
              "rvtree's own reference"),
         ],
@@ -323,7 +362,7 @@ SECTIONS = {
              "built-in, which is how a profile for one engagement's target stays out of "
              "the repository."),
             _RETRY_FLAG,
-        ] + _PROXY_FLAGS + _FARM_RANGE_FLAGS,
+        ] + _STREAM_FLAGS + _PROXY_FLAGS + _FARM_RANGE_FLAGS,
         "examples": [
             ("python3 OnionAccelerator.py --mode crawl --url https://example.onion/dumps/",
              "one seed, whole tree"),
@@ -347,6 +386,13 @@ SECTIONS = {
              "daemons this script does not manage"),
             ("python3 OnionAccelerator.py --mode crawl --url https://example.onion/ --download",
              "map it, then pull it all down"),
+            ("python3 OnionAccelerator.py --mode crawl --url https://example.onion/ --stream &\n"
+             "curl -sN 'http://127.0.0.1:8787/events?kinds=crawl.file&match=(?i)payroll'",
+             "hunt the crawl while it is still running"),
+            ("python3 OnionAccelerator.py --mode crawl --url https://example.onion/ \\\n"
+             "    --stream --stream-wait &\n"
+             "python3 contrib/streamhunt.py --keywords scope.txt --out hits.jsonl",
+             "an indexer that must not miss the first finding"),
         ],
         "notes": [
             "Reading a page and crawling it are separate: the engine moves bytes, and a "

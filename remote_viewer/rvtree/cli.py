@@ -7,7 +7,8 @@ import logging
 import shutil
 import sys
 import textwrap
-from typing import Iterable, Iterator, Optional
+import time
+from typing import Callable, Iterable, Iterator, Optional
 from urllib.parse import urlsplit
 
 from . import __version__, archive, progress, render
@@ -24,6 +25,18 @@ from .transport import (
     probe,
 )
 from .util import human_bytes
+
+# Event kinds published to an embedder's sink. Plain strings, and deliberately not an
+# import: rvtree ships as its own package and must not acquire a dependency on
+# OnionAccelerator's event stream to hand it a listing. The kinds are checked against
+# that stream's table by tests/test_stream_contract.py in the parent project.
+EVENT_OPEN = "tree.open"
+EVENT_ENTRY = "tree.entry"
+EVENT_DONE = "tree.done"
+
+# What a live consumer of this listing looks like from in here: a callable, nothing
+# more. Never blocks, never raises -- see _sink().
+Sink = Callable[[str, dict], None]
 
 log = logging.getLogger("rvtree.cli")
 
@@ -560,12 +573,17 @@ def _build_transport(args):
     )
 
 
-def main(argv: Optional[list[str]] = None, transport=None) -> int:
+def main(argv: Optional[list[str]] = None, transport=None, sink=None) -> int:
     """Run one rvtree invocation.
 
     ``transport`` lets an embedder — OnionAccelerator's ``--mode tree`` — hand in a
     transport it has already built over its own proxy fleet. When it does, it keeps
     ownership: the caller opened it and the caller closes it.
+
+    ``sink`` is the same idea for output: anything callable as ``sink(kind, data)``
+    receives each member as it is walked, so a listing that takes an hour over Tor can
+    be grepped while it runs instead of after it. Stdout is unaffected — a sink is an
+    addition to the chosen ``--format``, never a replacement for it.
     """
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -595,7 +613,7 @@ def main(argv: Optional[list[str]] = None, transport=None) -> int:
             # The inner block closes the reporter before any handler below prints, so
             # an error message always lands on a line the bar has already vacated.
             if args.command == "list":
-                return _cmd_list(args, transport, reporter)
+                return _cmd_list(args, transport, reporter, sink)
             if args.command == "extract":
                 return _cmd_extract(args, transport, reporter)
             if args.command == "probe":
@@ -642,12 +660,21 @@ def _open(args, transport: Transport) -> archive.Archive:
 
 
 def _counted(
-    entries: Iterable[Entry], reporter: progress.Reporter, arc: archive.Archive
+    entries: Iterable[Entry],
+    reporter: progress.Reporter,
+    arc: archive.Archive,
+    sink: Optional[Sink] = None,
 ) -> Iterator[Entry]:
     """Count entries as they stream past, and announce the walk when it truly starts.
 
     A generator on purpose: ``list_archive`` hands back a lazy iterator, so the work it
     describes begins on the first ``next()`` rather than when it returned.
+
+    It is also where an embedder's ``sink`` sees each member, for the same reason the
+    counter lives here: every entry the walk produces passes through this loop exactly
+    once, whatever format it came out of and whichever renderer is about to consume it.
+    The published payload is ``render.as_dict``, so a streamed member and a member from
+    ``-f ndjson`` are the same object.
     """
     reporter.stage("walk", detect_mod.describe(arc.fmt))
     source = arc.walk_source
@@ -655,7 +682,21 @@ def _counted(
         reporter.track(source, getattr(source, "size", 0) or 0)
     for entry in entries:
         reporter.entry()
+        if sink is not None:
+            _sink(sink, EVENT_ENTRY, render.as_dict(entry))
         yield entry
+
+
+def _now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _sink(sink: Sink, kind: str, data: dict) -> None:
+    """Publish one event. A failing consumer must never take the listing down with it."""
+    try:
+        sink(kind, data)
+    except Exception as exc:  # noqa: BLE001 - a broken consumer is not a broken archive
+        log.debug("event sink failed on %s: %s", kind, exc)
 
 
 def _walkers(args, transport) -> int:
@@ -669,9 +710,22 @@ def _walkers(args, transport) -> int:
     return max(1, getattr(transport, "lanes", 1))
 
 
-def _cmd_list(args, transport: Transport, reporter: progress.Reporter) -> int:
+def _cmd_list(args, transport: Transport, reporter: progress.Reporter,
+              sink: Optional[Sink] = None) -> int:
     arc = _open(args, transport)
     fmt = arc.fmt
+    if sink is not None:
+        # Published before the walk starts. Opening an archive over Tor is itself
+        # minutes of work -- a proof-of-work gate, a spool of a rangeless server -- so a
+        # consumer that hears the format and the size knows the run got that far, and
+        # roughly what the silence before the first entry is going to cost.
+        _sink(sink, EVENT_OPEN, {
+            "url": args.url,
+            "format": fmt,
+            "format_name": detect_mod.describe(fmt),
+            "size": arc.size,
+            "at": _now(),
+        })
     entries = _counted(
         archive.list_archive(
             arc,
@@ -683,6 +737,7 @@ def _cmd_list(args, transport: Transport, reporter: progress.Reporter) -> int:
         ),
         reporter,
         arc,
+        sink,
     )
 
     if args.format == "ndjson":
@@ -713,6 +768,17 @@ def _cmd_list(args, transport: Transport, reporter: progress.Reporter) -> int:
                 },
             )
     reporter.close()
+
+    if sink is not None:
+        _sink(sink, EVENT_DONE, {
+            "url": args.url,
+            "format": fmt,
+            "entries": count,
+            "total_size": total,
+            "bytes_fetched": transport.bytes_fetched,
+            "requests": transport.requests_made,
+            "at": _now(),
+        })
 
     if not args.quiet and args.format != "json":
         pct = transport.bytes_fetched / arc.size * 100 if arc.size else 0
