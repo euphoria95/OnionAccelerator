@@ -93,6 +93,64 @@ TOR_LIB_DIR = "/var/lib/tor-instances"
 TOR_RUN_DIR = "/run/tor-instances"
 BOOTSTRAP_TIMEOUT = 120        # seconds to wait for each instance to reach 100%
 PORT_PROBE_TIMEOUT = 0.3       # seconds, per-port local liveness probe
+# Gap between restarting one farm instance and the next when '--farm up' has to apply a
+# changed torrc: the pool is never cold all at once, and a crawl running on it loses one
+# endpoint at a time rather than every one together.
+FARM_RESTART_STAGGER = 2.0
+
+# --farm-tune: torrc lines appended to every farm instance, as (line, why) pairs. Drawn
+# from "Tor Client Performance Tuning" (the section numbers below are its) and then cut
+# down by an A/B benchmark against a self-hosted onion, with a crossover so guard luck
+# could not pass for a config effect (README, "Tuning the farm"). What survived is what
+# fixes something observed on a real farm; the latency and throughput knobs the guide
+# rates Safe -- MaxClientCircuitsPending 96 among them, tried at 64 concurrent cold
+# connects per instance -- measured no different from the defaults, and SocksTimeout
+# duplicates timeouts every mode here already sets lower. Left out on principle:
+# Conflux (exit traffic only, never onions), CircuitStreamTimeout (a defended onion
+# legitimately takes tens of seconds), and anything that narrows path selection
+# (ExitNodes, EntryNodes, NumEntryGuards): the target is an observer too, and a crawler
+# that pins its path is a crawler that clusters in the target's logs. Congestion
+# control, PoW and vanguards-lite are on by default on tor >= 0.4.8.
+# "{mem}" is filled in by farm_mem_budget(); see there.
+FARM_TUNE_SAFE = (
+    ("DormantClientTimeout 7 days",
+     "§4.4 Safe: the default 24 h put the whole farm to sleep between runs"),
+    ("DormantCanceledByStartup 1",
+     "§4.4 Safe: a farm brought up on purpose is never dormant at start"),
+    ("CircuitsAvailableTimeout 21600",
+     "§5.2 Safe: keep predicted onion circuits built through gaps between jobs"),
+    ("MaxMemInQueues {mem} MB",
+     "§10.2 Safe: N instances must not each budget for the whole host's RAM"),
+)
+FARM_TUNE_PROFILES = {
+    "off": (),
+    "onion": FARM_TUNE_SAFE,
+    "onion-aggressive": FARM_TUNE_SAFE + (
+        ("MaxCircuitDirtiness 1800",
+         "§5 Trade-off: reuse a circuit for 30 min, not 10; more linkable, fewer builds"),
+    ),
+}
+# ExtendedErrors (§7.3) is a SocksPort flag rather than an option. It makes tor report
+# *why* an onion failed (descriptor gone, intro failed, rendezvous failed...) instead of
+# 'host unreachable' for all of them, which the crawler turns into its retry policy.
+FARM_TUNE_SOCKS_FLAGS = {"off": "", "onion": " ExtendedErrors",
+                         "onion-aggressive": " ExtendedErrors"}
+FARM_TUNE_HEADER = "# --farm-tune "
+
+# Tor's ExtendedErrors SOCKS replies, for the download modes' log lines. The crawler's
+# copy, crawler.fetcher.TOR_SOCKS_REPLIES, is the one that decides retries; it cannot be
+# imported from here without dragging aiohttp into --farm. tests/test_farm_tune.py keeps the
+# two equal.
+TOR_SOCKS_REPLIES = {
+    0xF0: "onion descriptor not found",
+    0xF1: "onion descriptor invalid",
+    0xF2: "onion introduction failed",
+    0xF3: "onion rendezvous failed",
+    0xF4: "onion client authorization missing",
+    0xF5: "onion client authorization wrong",
+    0xF6: "invalid onion address",
+    0xF7: "onion introduction timed out",
+}
 
 # =========== LOGGER & JOB_ID SETUP ============
 # Logger is configured in setup_logging(), called from main(), to avoid
@@ -208,6 +266,22 @@ def make_proxies(proxy: str) -> dict:
         "http": f"socks5h://{proxy}",
         "https": f"socks5h://{proxy}",
     }
+
+
+_TOR_REPLY_RE = re.compile(r"\b0x(f[0-7])\b", re.IGNORECASE)
+
+
+def explain_error(exc):
+    """`exc` as text, with an ExtendedErrors reply translated.
+
+    PySocks has no names for tor's onion codes and says '0xf0: Unknown error', which
+    reads like a broken proxy when it means the onion's descriptor is gone.
+    """
+    text = str(exc)
+    m = _TOR_REPLY_RE.search(text)
+    if m:
+        text += f" (tor: {TOR_SOCKS_REPLIES[int(m.group(1), 16)]})"
+    return text
 
 
 # =========== LOCAL PORT DISCOVERY ===========
@@ -513,7 +587,7 @@ def download_file(url, proxy, user_agents, progress_queue=None, preserve_path=Fa
         logger.debug(f"[OK] {url} -> {out_path} (proxy={proxy})")
         return True
     except Exception as e:
-        logger.error(f"[ERR] Download failed for {url} on proxy={proxy}: {e}")
+        logger.error(f"[ERR] Download failed for {url} on proxy={proxy}: {explain_error(e)}")
         # Only ever removes this attempt's own partial file, never the destination.
         if tmp_path is not None:
             try:
@@ -855,7 +929,7 @@ def partial_download_chunk_to_file(url, start, end, proxy, ua, progress_queue, p
                         progress_queue.put(len(chunk))
         return True
     except Exception as e:
-        logger.error(f"Chunk {start}-{end} failed on proxy={proxy}: {e}")
+        logger.error(f"Chunk {start}-{end} failed on proxy={proxy}: {explain_error(e)}")
         if os.path.exists(part_path):
             os.remove(part_path)
         return False
@@ -894,7 +968,7 @@ def fallback_sequential_download(url, out_path, user_agent, proxy, progress_queu
         logger.info(f"[SEQUENTIAL OK] {url} -> {out_path}, size={total_downloaded} B")
         return True
     except Exception as e:
-        logger.error(f"Fallback sequential download failed for {url}: {e}")
+        logger.error(f"Fallback sequential download failed for {url}: {explain_error(e)}")
         if tmp_path is not None:
             try:
                 os.remove(tmp_path)
@@ -1207,19 +1281,95 @@ def farm_preflight():
         logger.error(f"Missing required tool(s): {', '.join(missing)}. "
                      f"Install the 'tor' package (Debian/Ubuntu).")
         sys.exit(1)
+    # Onion-service proof-of-work (tor >= 0.4.8) needs tor built with the pow module.
+    # Without it a defended onion is unreachable however the farm is tuned, and it fails
+    # as 'introduction failed', which reads like an overloaded target, not a local gap.
+    try:
+        modules = subprocess.run(["tor", "--list-modules"], capture_output=True,
+                                 text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        modules = ""
+    if modules and "pow: yes" not in modules:
+        logger.warning("This tor was built without the 'pow' module, so onion services "
+                       "defended by proof-of-work will refuse every connection. Install "
+                       "tor from the Tor Project's own repository (tor >= 0.4.8).")
 
 
-def render_torrc(name, port):
-    """Client-only torrc for a farm instance bound to 127.0.0.1:<port>."""
-    return (
+def farm_mem_budget(count):
+    """MaxMemInQueues for one of `count` farm instances, in MB.
+
+    Tor sizes its queue budget from the RAM it can see, and every instance sees all of
+    it: twenty instances each planning to use most of the host is an OOM kill waiting
+    for a busy crawl. Half the host split between them, never under tor's own 256 MB
+    floor and never over 1 GB, which no single client needs.
+    """
+    try:
+        ram_mb = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") // (1024 * 1024)
+    except (ValueError, OSError, AttributeError):
+        ram_mb = 8192
+    return min(1024, max(256, ram_mb // 2 // max(1, count)))
+
+
+def render_torrc(name, port, tune="off", count=1):
+    """Client-only torrc for a farm instance bound to 127.0.0.1:<port>.
+
+    `tune` picks a FARM_TUNE_PROFILES entry; "off" renders exactly the torrc the farm
+    always had, so an existing farm is not restarted by an upgrade. `count` is the size
+    of the farm, which the memory budget is split across.
+    """
+    torrc = (
         "# MANAGED BY OnionAccelerator (--farm). Regenerated on every 'up'; edits are lost.\n"
         f"# Farm instance {name}: client-only SOCKS proxy, no relay descriptor published.\n"
-        f"SocksPort 127.0.0.1:{port}\n"
+        f"SocksPort 127.0.0.1:{port}{FARM_TUNE_SOCKS_FLAGS[tune]}\n"
         "ClientOnly 1\n"
         "AvoidDiskWrites 1\n"
         "SafeLogging 1\n"
         f"Log notice file {TOR_LIB_DIR}/{name}/notices.log\n"
     )
+    if tune == "off":
+        return torrc
+    torrc += f"{FARM_TUNE_HEADER}{tune}\n"
+    for line, why in FARM_TUNE_PROFILES[tune]:
+        torrc += f"# {why}\n{line.format(mem=farm_mem_budget(count))}\n"
+    return torrc
+
+
+def farm_tune_of(torrc):
+    """The --farm-tune profile a rendered torrc was built with ("off" if none)."""
+    for line in torrc.splitlines():
+        if line.startswith(FARM_TUNE_HEADER):
+            return line[len(FARM_TUNE_HEADER):].strip()
+    return "off"
+
+
+def _read_torrc(name):
+    """The torrc a farm instance is running now, or "" if it has none yet."""
+    path = os.path.join(TOR_INSTANCES_DIR, name, "torrc")
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    except PermissionError:
+        return _run(["cat", path], check=False).stdout
+    except OSError:
+        return ""
+
+
+def _socks_line(torrc):
+    return next((l for l in torrc.splitlines() if l.startswith("SocksPort ")), "")
+
+
+def torrc_apply_action(old, new):
+    """How a running instance picks up `new` in place of `old`: None, reload or restart.
+
+    A reload (SIGHUP) keeps the instance's circuits and descriptor cache, which is the
+    whole of what a warm client is worth, so it is preferred. But tor keeps an existing
+    listener's flags across a reload -- a SocksPort that gained ExtendedErrors went on
+    answering 'host unreachable' until restarted -- so a changed SocksPort line needs
+    the restart.
+    """
+    if old == new:
+        return None
+    return "restart" if _socks_line(old) != _socks_line(new) else "reload"
 
 
 def bootstrap_percent(name):
@@ -1261,13 +1411,15 @@ def wait_bootstrap(names, base_port, timeout=BOOTSTRAP_TIMEOUT):
     return done
 
 
-def farm_up(count, base_port, timeout=BOOTSTRAP_TIMEOUT):
+def farm_up(count, base_port, timeout=BOOTSTRAP_TIMEOUT, tune="off"):
     farm_preflight()
     if count > MAX_WORKERS:
         logger.warning(f"count={count} exceeds MAX_WORKERS={MAX_WORKERS}; "
                        f"the download modes will only use the first {MAX_WORKERS}.")
-    logger.info(f"Bringing up {count} Tor instance(s) on 127.0.0.1:{base_port}-{base_port + count - 1}")
+    logger.info(f"Bringing up {count} Tor instance(s) on 127.0.0.1:{base_port}-"
+                f"{base_port + count - 1} (--farm-tune {tune})")
     names = []
+    restarted = 0
     for i in range(count):
         name = assert_farm_name(farm_instance_name(i))
         port = base_port + i
@@ -1277,8 +1429,21 @@ def farm_up(count, base_port, timeout=BOOTSTRAP_TIMEOUT):
             _run(["tor-instance-create", name])
         else:
             logger.info(f"[{name}] already exists, refreshing config")
-        _write_root_file(os.path.join(inst_dir, "torrc"), render_torrc(name, port))
+        torrc = render_torrc(name, port, tune=tune, count=count)
+        old = _read_torrc(name)
+        was_active = systemd_active(name) == "active"
+        _write_root_file(os.path.join(inst_dir, "torrc"), torrc)
         _run(["systemctl", "enable", "--now", f"tor@{name}"])
+        # 'enable --now' starts a stopped instance and does nothing to a running one, so
+        # a changed torrc on a running instance used to wait for its next reboot.
+        action = torrc_apply_action(old, torrc) if was_active else None
+        if action == "restart":
+            if restarted:
+                time.sleep(FARM_RESTART_STAGGER)
+            restarted += 1
+        if action:
+            logger.info(f"[{name}] torrc changed; {action}ing to apply it")
+            _run(["systemctl", action, f"tor@{name}"])
         names.append(name)
     wait_bootstrap(names, base_port, timeout=timeout)
     logger.info("Farm is up. Run a download mode, e.g. "
@@ -1312,9 +1477,11 @@ def farm_status(base_port):
         state = systemd_active(name)
         listening = _port_is_open("127.0.0.1", port)
         pct = bootstrap_percent(name)
+        tune = farm_tune_of(_read_torrc(name))
         mark = "✅" if (state == "active" and listening and pct >= 100) else "⚠️"
         logger.info(f"{mark} {name}: systemd={state}, socks=127.0.0.1:{port} "
-                    f"({'listening' if listening else 'down'}), bootstrap={pct}%")
+                    f"({'listening' if listening else 'down'}), bootstrap={pct}%, "
+                    f"tune={tune}")
 
 
 def farm_down():
@@ -1348,9 +1515,9 @@ def farm_destroy():
     logger.info("Farm destroyed. Your own (non-farm) Tor instances were left untouched.")
 
 
-def run_farm_action(action, count, base_port, timeout):
+def run_farm_action(action, count, base_port, timeout, tune="off"):
     if action == "up":
-        farm_up(count, base_port, timeout=timeout)
+        farm_up(count, base_port, timeout=timeout, tune=tune)
     elif action == "status":
         farm_status(base_port)
     elif action == "down":
@@ -2020,6 +2187,14 @@ def build_parser():
     parser.add_argument("--bootstrap-timeout", type=int, default=BOOTSTRAP_TIMEOUT,
                         help=f"Seconds to wait for each instance to bootstrap on "
                              f"'--farm up' (default {BOOTSTRAP_TIMEOUT}).")
+    parser.add_argument("--farm-tune", choices=list(FARM_TUNE_PROFILES), default=None,
+                        help="torrc tuning for '--farm up' (default off). 'onion' adds "
+                             "ExtendedErrors, so a crawl can tell a dead onion from a dead "
+                             "circuit, no dormancy and warm circuits between jobs, and a "
+                             "per-instance memory cap -- all rated Safe. 'onion-aggressive' "
+                             "adds MaxCircuitDirtiness 1800, a linkability trade-off. "
+                             "Instances whose torrc changes are reloaded, or restarted "
+                             "one at a time if their SocksPort line changed.")
     parser.add_argument("--retries", type=int, default=DEFAULT_RETRIES,
                         help="Number of retries for download failures.")
     parser.add_argument("--preserve-path", action="store_true",
@@ -2286,9 +2461,14 @@ def main(argv=None):
                      "daemons and discovers nothing. It applies to --mode crawl, "
                      "--mode tree and --detect.")
 
+    if args.farm_tune and args.farm != "up":
+        parser.error("--farm-tune only applies to '--farm up', which is what writes the "
+                     "torrc; '--farm status' shows the profile each instance runs.")
+
     # Farm management needs no URL list; run the action and exit.
     if args.farm:
-        run_farm_action(args.farm, args.count, args.base_port, args.bootstrap_timeout)
+        run_farm_action(args.farm, args.count, args.base_port, args.bootstrap_timeout,
+                        tune=args.farm_tune or "off")
         logger.info("OnionAccelerator farm action finished.")
         return
 

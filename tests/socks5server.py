@@ -7,7 +7,8 @@ server speaks the same handshake Tor does and records which credential every con
 presented, so that claim can be asserted rather than assumed.
 
 It implements only what the crawler uses: CONNECT, no-auth and username/password
-(RFC 1929), IPv4 and domain-name targets.
+(RFC 1929), IPv4 and domain-name targets -- plus `reply_code`, to refuse every CONNECT
+the way tor refuses an unreachable onion.
 """
 
 from __future__ import annotations
@@ -23,8 +24,11 @@ from typing import Optional
 class Socks5Server:
     """A threaded SOCKS5 proxy on an ephemeral loopback port."""
 
-    def __init__(self, *, require_auth: bool = True) -> None:
+    def __init__(self, *, require_auth: bool = True, reply_code: Optional[int] = None) -> None:
         self.require_auth = require_auth
+        # Answer every CONNECT with this SOCKS reply instead of dialling out: how a test
+        # plays tor refusing an onion, ExtendedErrors codes (0xF0-0xF7) included.
+        self.reply_code = reply_code
         self.credentials: Counter[str] = Counter()
         self.targets: list[str] = []
         self._lock = threading.Lock()
@@ -102,6 +106,9 @@ class Socks5Server:
         with self._lock:
             self.targets.append(f"{host}:{port}")
 
+        if self.reply_code is not None:
+            sock.sendall(bytes([5, self.reply_code, 0, 1]) + b"\x00" * 6)
+            return
         try:
             upstream = socket.create_connection((host, port), timeout=10)
         except OSError:

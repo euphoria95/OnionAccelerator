@@ -132,7 +132,7 @@ shared or logged host that difference matters.
 
 ```bash
 # Provision / manage the native Tor proxy farm:
-python3 OnionAccelerator.py --farm <up|status|down|destroy> [--count N] [--base-port PORT] [--bootstrap-timeout SEC]
+python3 OnionAccelerator.py --farm <up|status|down|destroy> [--count N] [--base-port PORT] [--bootstrap-timeout SEC] [--farm-tune off|onion|onion-aggressive]
 
 # Download / speedtest through the proxies:
 python3 OnionAccelerator.py --mode <multi|partial|speedtest> [--url URL ...] [--retries N] [--external] [--test-url URL]
@@ -826,6 +826,74 @@ sudo python3 OnionAccelerator.py --farm destroy
   and its SOCKS port is listening (bounded by `--bootstrap-timeout`, default 120s).
 - **Configurable size/ports.** `--count` (default 20) and `--base-port` (default 5000)
   control how many instances and which ports; instance `NN` binds `base_port + NN`.
+
+### Tuning the farm for onion crawling (`--farm-tune`)
+
+```bash
+sudo python3 OnionAccelerator.py --farm up --count 20 --farm-tune onion
+python3 OnionAccelerator.py --farm status        # shows tune=onion per instance
+```
+
+`--farm-tune` appends torrc options to every instance. The default, `off`, is the farm's
+torrc exactly as before, so upgrading restarts nothing. The candidates came from the
+tuning guide *Tor Client Performance Tuning* (section numbers are its); what made the cut
+is what fixes something observed on a real farm, after an A/B benchmark (below) showed
+the guide's latency knobs make no measurable difference here:
+
+| Line | Profile | Why |
+|---|---|---|
+| `SocksPort … ExtendedErrors` | onion | tor says *why* an onion failed (`0xF0` descriptor gone, `0xF2` intro failed, `0xF3` rendezvous failed, `0xF6` bad address…) instead of `host unreachable` for all of them. The crawler acts on it, see below. §7.3 |
+| `DormantClientTimeout 7 days`, `DormantCanceledByStartup 1` | onion | with the 24 h default every instance went dormant between jobs (visible in each `notices.log`), so the next job started cold. §4.4 |
+| `CircuitsAvailableTimeout 21600` | onion | keeps predicted onion circuits built across gaps between jobs (default 30–60 min). §5.2 |
+| `MaxMemInQueues <N> MB` | onion | half the host's RAM split across `--count` instances (256 MB–1 GB each); otherwise every instance budgets for the whole host. §10.2 |
+| `MaxCircuitDirtiness 1800` | onion-aggressive | **Trade-off**: reuses a circuit for 30 min instead of 10 — fewer builds, more linkable. §5 |
+
+Deliberately **not** included: `MaxClientCircuitsPending` and `SocksTimeout` (measured no
+gain, see below; every mode here already times out sooner than tor would), Conflux (exit
+traffic only; onions never use it), `CircuitStreamTimeout` (a PoW-defended onion
+legitimately takes tens of seconds), and anything that narrows path selection —
+`ExitNodes`, `EntryNodes`, `NumEntryGuards`, padding cuts. The target is an observer too,
+and a crawler with a pinned path clusters in its logs. Congestion control, onion PoW and
+vanguards-lite are already on by default in tor 0.4.8+, so there is nothing to add for
+them; `--farm up` only warns if this tor lacks the `pow` module.
+
+**What the crawler does with ExtendedErrors.** A missing descriptor, failed or timed-out
+introduction backs off and retries without burning a circuit rotation (the fault is at
+the far end); a failed rendezvous rotates; a malformed address, broken descriptor or
+missing client auth is dropped at once. None of them count against the daemon's health,
+so a dead target can no longer park every healthy farm instance. The download modes
+translate the codes in their log lines (PySocks prints `0xf0: Unknown error`).
+
+**Applying it to a running farm.** `--farm up` compares each instance's torrc with the
+new one. Changed options are applied with a reload (SIGHUP), which keeps the instance's
+circuits and descriptor cache. A changed `SocksPort` line — turning ExtendedErrors on or
+off — needs a restart, because tor keeps a listener's flags across a reload; those
+instances are restarted two seconds apart so a crawl running on the farm loses one
+endpoint at a time.
+
+**What was measured (2026-09-29).** A self-hosted onion (Range-capable static server, a
+351-directory open index) on the same host as two sets of four user-level tor 0.4.9.13
+clients: the farm's baseline torrc versus a tuned one (everything above plus
+`MaxClientCircuitsPending 96` and `SocksTimeout 90`). Arms were interleaved request by
+request, then **crossed over** — configs swapped between the two sets, keeping each
+set's DataDirectory and guard — so a difference that is really guard luck flips sign
+while a config effect does not.
+
+| Test | Baseline | Tuned | Verdict |
+|---|---|---|---|
+| Cold TTFB, fresh rendezvous per request (80 per config) | p50 1.60 s | p50 1.68 s | no difference (p=0.85) |
+| Warm TTFB, reused circuit (80 per config) | p50 0.77 s | p50 0.82 s | no difference pooled; each phase alone was "significant" (p≈0.004) **in opposite directions** — it follows the guard |
+| 10 MiB throughput, warm circuit (8 per config) | 404 KiB/s | 341 KiB/s | no difference (p=0.19); congestion control confirmed active on onion circuits (`CWND` in CIRC_BW) |
+| 64 concurrent cold connects on one instance (16 bursts per config) | median 10.4 s, 4/16 bursts with failures | median 10.6 s, 3/16 | no difference (p=0.79 / 1.0). Stalled bursts end at `SocksTimeout`: 120 s vs 90 s |
+| `--mode crawl`, 351 dirs, 4×8 lanes (4 per config) | 87 / 33 / 28 / 32 s | 32 / 26 / 136 / 172 s | follows the instances, not the config |
+| `--mode partial`, 64 MiB over 4 instances (6 per config) | 94–286 s | 67–92 s | tuned faster in both phases, but back-to-back runs share one uncredentialed circuit per instance, so this is ~2 independent samples a side: not evidence |
+| Dead onion (valid v3 address, no descriptor) | `0x04` host unreachable, 5/5 | `0xF0` descriptor not found, 5/5 | ExtendedErrors works; time to fail no different |
+| First onion request 20 s after a warm restart, with/without a warm-up request to another onion | — | — | no difference (p=0.86); 3/10 failed outright either way, which is why `--farm up` reloads rather than restarts where it can |
+
+The honest summary: against an onion, per-request speed is set by the path the guard
+and rendezvous point give you, and no client torrc line moved it. What `--farm-tune`
+buys is a farm that is awake and not over-committing memory when a job starts, and a
+crawler that can tell a dead target from a dead circuit.
 
 ### Auto-discovery
 

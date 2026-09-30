@@ -18,8 +18,10 @@ import asyncio
 import dataclasses
 import datetime
 import enum
+import importlib
 import logging
 import random
+import re
 import time
 from email.utils import parsedate_to_datetime
 from typing import Mapping, Optional
@@ -42,15 +44,62 @@ from .urlnorm import normalize_url
 
 logger = logging.getLogger("OnionAccelerator.crawl.fetch")
 
-# python_socks is only present when the real SOCKS connector is in use; the test suite
-# swaps that out. Missing exceptions simply never match.
-try:  # pragma: no cover - import guard
-    from python_socks import ProxyError, ProxyConnectionError, ProxyTimeoutError
-    _SOCKS_ERRORS: tuple[type[BaseException], ...] = (
-        ProxyError, ProxyConnectionError, ProxyTimeoutError,
-    )
-except ImportError:  # pragma: no cover
-    _SOCKS_ERRORS = ()
+# The SOCKS exceptions a failed dial can surface as. aiohttp_socks, which is what
+# socks_connector() actually uses, raises classes of its own that share only their names
+# with python_socks' -- matching python_socks' alone meant a refused onion never matched
+# here, fell through to "unclassified", and never rotated its lane. Both are collected;
+# either may be absent (the test suite swaps the connector out), and a missing one
+# simply never matches.
+_SOCKS_ERRORS: tuple[type[BaseException], ...] = ()
+for _module in ("aiohttp_socks", "python_socks"):
+    try:  # pragma: no cover - import guard
+        _mod = importlib.import_module(_module)
+        _SOCKS_ERRORS += (_mod.ProxyError, _mod.ProxyConnectionError, _mod.ProxyTimeoutError)
+    except (ImportError, AttributeError):  # pragma: no cover
+        pass
+
+# Tor's ExtendedErrors SOCKS replies (tor(1), SocksPort ExtendedErrors): what went wrong
+# on the *onion's* side of the connection. The daemon only sends them when the SocksPort
+# asks for them -- '--farm up --farm-tune onion' does -- and otherwise says 'host
+# unreachable' for all of them. Mirrored in OnionAccelerator.TOR_SOCKS_REPLIES for the
+# download modes, which cannot import this package; tests/test_farm_tune.py keeps the two
+# equal.
+TOR_SOCKS_REPLIES = {
+    0xF0: "onion descriptor not found",
+    0xF1: "onion descriptor invalid",
+    0xF2: "onion introduction failed",
+    0xF3: "onion rendezvous failed",
+    0xF4: "onion client authorization missing",
+    0xF5: "onion client authorization wrong",
+    0xF6: "invalid onion address",
+    0xF7: "onion introduction timed out",
+}
+# Nothing will change on a retry: the address is malformed, its descriptor is broken, or
+# it wants credentials this crawler does not have.
+_ONION_PERMANENT = frozenset({0xF1, 0xF4, 0xF5, 0xF6})
+# The service is offline or overloaded. A new circuit changes nothing -- the fault is at
+# the far end -- so these back off rather than spend a rotation. Not DROP: a missing
+# descriptor is also what an HSDir churn or a service that restarted a minute ago looks
+# like, and dropping on the first one would lose a whole subtree to a transient.
+_ONION_BACKOFF = frozenset({0xF0, 0xF2, 0xF7})
+# 0xF3, a failed rendezvous, is the one a fresh circuit can fix: it rotates.
+
+# python_socks renders a reply code it has no name for as 'Invalid reply code: 0XF0'.
+_REPLY_CODE = re.compile(r"\b0x(f[0-7])\b", re.IGNORECASE)
+
+
+def tor_socks_reply(exc: BaseException) -> Optional[int]:
+    """The ExtendedErrors code a SOCKS failure carries, or None if it carries none.
+
+    Read from `error_code` where the library set one, and otherwise from the message,
+    because python_socks only sets it for the nine codes RFC 1928 defines and reports
+    tor's own as a parse error with the byte in the text.
+    """
+    code = getattr(exc, "error_code", None)
+    if isinstance(code, int) and code in TOR_SOCKS_REPLIES:
+        return code
+    match = _REPLY_CODE.search(str(exc))
+    return int(match.group(1), 16) if match else None
 
 MAX_REDIRECTS = 5
 
@@ -93,6 +142,9 @@ class FetchResult:
     endpoint: Optional[Endpoint] = None
     lane_index: Optional[int] = None
     retry_budget: Optional[int] = None
+    # Set when tor answered with an ExtendedErrors code: the daemon reached the onion
+    # network and reports what the *service* did, so the failure is not the endpoint's.
+    socks_reply: Optional[int] = None
     # Kept for the listing layer, not for the report: a template may identify its target
     # by `Server:` or by a framework's own header, and by the time the body is parsed the
     # response object is long closed.
@@ -145,8 +197,11 @@ class AsyncFetcher:
             # favour. Only RETRY and ROTATE are the transport's fault.
             if result.verdict in (Verdict.OK, Verdict.LEAF, Verdict.DROP):
                 await self._pool.record_success(lane, result.nbytes, result.elapsed)
-            else:
+            elif result.socks_reply is None:
                 await self._pool.record_failure(lane, ENDPOINT_DEATH_STREAK)
+            # An ExtendedErrors reply counts neither way. It proves the daemon is alive,
+            # but it moved no bytes; and counting it as a failure is how a dead onion
+            # used to park every healthy daemon in the pool, one streak at a time.
 
             if result.verdict is Verdict.ROTATE:
                 await self._pool.rotate(lane)
@@ -278,9 +333,20 @@ class AsyncFetcher:
         name = type(exc).__name__
         detail = f"{name}: {exc}".strip()
 
+        reply = tor_socks_reply(exc) if isinstance(exc, _SOCKS_ERRORS) else None
+        if reply is not None:
+            detail = f"{detail} (tor: {TOR_SOCKS_REPLIES[reply]})"
+            if reply in _ONION_PERMANENT:
+                verdict = Verdict.DROP
+            elif reply in _ONION_BACKOFF:
+                verdict = Verdict.RETRY
+            else:
+                verdict = Verdict.ROTATE
+            return FetchResult(verdict, url, error=detail, socks_reply=reply)
         if isinstance(exc, _SOCKS_ERRORS):
-            # Tor answers a SOCKS request for an unreachable onion with 'TTL expired'
-            # or 'host unreachable' -- a failed descriptor fetch or a failed rendezvous,
+            # Without ExtendedErrors, tor answers a SOCKS request for an unreachable
+            # onion with 'TTL expired' or 'host unreachable' -- a failed descriptor
+            # fetch or a failed rendezvous, lumped together --
             # both of which a new circuit can fix and a retry down this one cannot.
             return FetchResult(Verdict.ROTATE, url, error=detail)
         if isinstance(exc, (aiohttp.ServerDisconnectedError, aiohttp.ClientPayloadError,

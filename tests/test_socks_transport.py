@@ -22,6 +22,8 @@ import pytest
 
 from crawler.config import CrawlConfig, ORDER_BFS
 from crawler.crawl import run_crawl
+from crawler.fetcher import AsyncFetcher, Verdict
+from crawler.frontier import Job
 from crawler.proxypool import AsyncLanePool, socks_connector
 from socks5server import Socks5Server
 
@@ -147,3 +149,59 @@ def test_a_crawl_runs_over_real_socks5(origin, tmp_path):
     assert stats["stopped_because"] == "completed"
     assert stats["totals"]["failures"] == 0
     assert all(e["requests"] > 0 for e in stats["endpoints"])
+
+
+# ---------------------------------------------------------------- tor's refusals
+
+
+async def _fetch_through(reply_code):
+    """One fetch through the genuine connector, refused with `reply_code`."""
+    with Socks5Server(reply_code=reply_code) as proxy:
+        pool = await AsyncLanePool.create(
+            [proxy.address], circuits_per_endpoint=1, user_agents=UAS,
+            connector_factory=socks_connector,
+        )
+        try:
+            fetcher = AsyncFetcher(pool, max_page_bytes=1 << 20)
+            url = "http://" + "a" * 56 + ".onion/"
+            result = await fetcher.fetch(Job(url=url, depth=0))
+            return result, pool._lanes[0].endpoint
+        finally:
+            await pool.close()
+
+
+@pytest.mark.parametrize("code, verdict", [
+    (0xF0, Verdict.RETRY),    # descriptor not found: back off, a circuit will not help
+    (0xF2, Verdict.RETRY),    # introduction failed
+    (0xF7, Verdict.RETRY),    # introduction timed out
+    (0xF3, Verdict.ROTATE),   # rendezvous failed: the one a fresh circuit can fix
+    (0xF1, Verdict.DROP),     # descriptor invalid
+    (0xF4, Verdict.DROP),     # client authorization missing
+    (0xF6, Verdict.DROP),     # invalid onion address
+])
+def test_extended_errors_decide_the_verdict(code, verdict):
+    """Tor's ExtendedErrors codes survive the real connector and steer the retry policy.
+
+    aiohttp_socks has no name for them and reports 'Invalid reply code: 0XF0'; if that
+    ever stopped being parsed, every one of these would silently become a RETRY.
+    """
+    result, endpoint = asyncio.run(_fetch_through(code))
+    assert result.verdict is verdict
+    assert result.socks_reply == code
+    assert "(tor: " in result.error
+    # The daemon answered, so a refusal from the onion's side is not the endpoint's
+    # fault: a dead target must not be able to park a healthy daemon.
+    assert endpoint.streak == 0 and endpoint.failures == 0
+
+
+def test_a_plain_socks_refusal_rotates_and_counts_against_the_endpoint():
+    """Without ExtendedErrors tor says 'host unreachable' for every onion failure.
+
+    That must reach the SOCKS branch -- rotate, blame the endpoint -- rather than fall
+    through as unclassified, which is what happened while only python_socks' exception
+    classes were matched and aiohttp_socks raised its own.
+    """
+    result, endpoint = asyncio.run(_fetch_through(0x04))
+    assert result.verdict is Verdict.ROTATE
+    assert result.socks_reply is None
+    assert endpoint.failures == 1
