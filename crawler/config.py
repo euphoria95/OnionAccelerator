@@ -17,17 +17,25 @@ CRAWLS_DIR = "crawls"
 LISTING_FILE = "listing.jsonl"
 DIRS_FILE = "dirs.jsonl"
 FAILED_FILE = "failed.jsonl"
+# The frontier's write-ahead journal: one line per directory admitted to the queue, one
+# per directory finished with. Replaying it reconstructs what a previous run had queued
+# and what it had already listed, which is what `--resume` needs and what no other
+# output file records -- dirs.jsonl says what was *done*, never what was still pending.
+FRONTIER_FILE = "frontier.jsonl"
 STATS_FILE = "stats.json"
 TREE_FILE = "tree.txt"
 URLS_FILE = "urls.txt"
 
 # ---------------------------------------------------------------- network
 
-# Onion services are slow; a connect that hasn't landed in 30s is usually a dead
-# descriptor rather than a slow one, and waiting longer just parks a circuit.
-CONNECT_TIMEOUT = 30.0
-READ_TIMEOUT = 60.0
-TOTAL_TIMEOUT = 120.0
+# Onion services are slow, and the slowest are not dead -- they are one small process
+# behind three relays. Measured on a QData mirror: 58-68s to answer an *idle* listing
+# request, with onion rendezvous alone routinely past 30s. The old 30/60/120 budget
+# timed out on responses that were merely slow, which costs a whole subtree per miss,
+# so each is set above the observed worst case rather than at it.
+CONNECT_TIMEOUT = 90.0
+READ_TIMEOUT = 180.0
+TOTAL_TIMEOUT = 300.0
 
 # A directory listing is text, but not necessarily small text: one directory of a leaked
 # fileshare routinely holds thousands of entries, and at the ~600 bytes of markup a
@@ -112,11 +120,22 @@ class CrawlConfig:
     max_pages: Optional[int] = None
     time_budget: Optional[float] = None
     max_page_bytes: int = MAX_PAGE_BYTES
+    # Per-request time budget. Tunable because "slow" is a property of the target, not
+    # of onions in general: the same tree served by one mirror answers in 5s and by
+    # another in 60s, and a read window below the second one abandons subtrees that are
+    # merely slow to arrive.
+    connect_timeout: float = CONNECT_TIMEOUT
+    read_timeout: float = READ_TIMEOUT
+    total_timeout: float = TOTAL_TIMEOUT
     allow_offsite: bool = False
     include: Optional[Pattern[str]] = None
     exclude: Optional[Pattern[str]] = None
     switch_after: Optional[int] = None
     download: bool = False
+    # A previous crawl's output directory to carry forward. Its frontier journal is
+    # replayed before seeding, so directories it finished are not fetched again and the
+    # ones it never reached are queued. See crawler/resume.py.
+    resume: Optional[str] = None
     # Which listing template to read pages with. None lets the engine pick one per host
     # from the built-in set, falling back to the structural reader; a name forces one,
     # which is also what makes an API target crawlable at all -- its seed has to be

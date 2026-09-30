@@ -27,3 +27,6 @@ rvtree-test/
 # Test archive corpus: generated on demand by tests/make_fixtures.sh (conftest.py
 # runs it when files are missing). ~300 MB, never commit.
 remote_viewer/tests/fixtures/
+
+# contrib/sensor.py: a sidejob incident tool, not part of the project proper.
+contrib/sensor.py

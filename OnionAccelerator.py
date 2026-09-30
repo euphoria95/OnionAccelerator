@@ -1841,6 +1841,9 @@ def detect_mode(urls, proxies, args, sink=None):
             seeds=list(urls),
             circuits_per_endpoint=args.circuits_per_endpoint,
             max_page_bytes=args.max_page_bytes,
+            connect_timeout=args.connect_timeout,
+            read_timeout=args.read_timeout,
+            total_timeout=args.total_timeout,
             allow_offsite=args.allow_offsite,
             profile=args.profile,
             templates=list(args.templates or []),
@@ -1902,11 +1905,15 @@ def crawl_mode(urls, proxies, args, sink=None):
             max_pages=args.max_pages,
             time_budget=args.time_budget,
             max_page_bytes=args.max_page_bytes,
+            connect_timeout=args.connect_timeout,
+            read_timeout=args.read_timeout,
+            total_timeout=args.total_timeout,
             allow_offsite=args.allow_offsite,
             include=pkg.CrawlConfig.compile_filter(args.include),
             exclude=pkg.CrawlConfig.compile_filter(args.exclude),
             switch_after=args.switch_after,
             download=args.download,
+            resume=args.resume,
             profile=args.profile,
             templates=list(args.templates or []),
             stream_bodies=args.stream_bodies,
@@ -2082,6 +2089,33 @@ def build_parser():
                                  "and record the fetch as a failure (default 16 MiB). One "
                                  "directory of a leaked fileshare can be thousands of "
                                  "rows, so raise this rather than lose its subtree.")
+    crawl_opts.add_argument("--connect-timeout", type=float,
+                            default=crawler_default("CONNECT_TIMEOUT", 90.0),
+                            help="Seconds to establish a connection, including the Tor "
+                                 "rendezvous (default 90). Raise it for a slow onion: a "
+                                 "rendezvous that needs longer than this is reported as a "
+                                 "dead host when it is only a distant one.")
+    crawl_opts.add_argument("--read-timeout", type=float,
+                            default=crawler_default("READ_TIMEOUT", 180.0),
+                            help="Seconds the server may go silent mid-response before the "
+                                 "fetch is abandoned (default 180). This is the one to raise "
+                                 "on a slow target: set below its normal response time, every "
+                                 "listing times out and each miss costs a whole subtree.")
+    crawl_opts.add_argument("--total-timeout", type=float,
+                            default=crawler_default("TOTAL_TIMEOUT", 300.0),
+                            help="Seconds for one whole request, connect and read together "
+                                 "(default 300). Keep it above --connect-timeout plus "
+                                 "--read-timeout or it caps them both.")
+    crawl_opts.add_argument("--resume", metavar="JOB_DIR", default=None,
+                            help="Continue a previous crawl from its output directory, "
+                                 "e.g. crawls/20260908_110133_bfiyq8. Its frontier "
+                                 "journal is replayed first: directories it finished are "
+                                 "not fetched again, and the ones it discovered but never "
+                                 "reached are queued, along with any subtree it gave up "
+                                 "on. Use it when a target goes offline mid-crawl -- "
+                                 "without it a restart re-walks the same shallow layers "
+                                 "and never gets deeper. The new run writes its own "
+                                 "journal, so resume from the newest directory each time.")
     crawl_opts.add_argument("--include", default=None,
                             help="Only crawl directory URLs matching this regex.")
     crawl_opts.add_argument("--exclude", default=None,

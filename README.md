@@ -746,6 +746,30 @@ python3 contrib/streamhunt.py --keywords scope.txt --out hits.jsonl
 The stream is read-only. There is no way to steer a run through it — no seed injection,
 no stop command — by design.
 
+### Waiting for a target to go live (`contrib/sensor.py`)
+
+Some targets — a leak site's per-victim "final" endpoint, most often — do not serve
+anything crawlable the moment they are known about. `contrib/sensor.py` polls one URL
+with `--mode crawl --detect` on an interval, and the moment that call reports the target
+usable, it stops polling and feeds the newest job directory under `crawls/` to
+`--resume` — so a crawl started early (or cut short because the target was not up yet)
+continues instead of starting over:
+
+```bash
+python3 OnionAccelerator.py --mode crawl --url http://target.onion/dl/1/ --max-pages 1 &
+wait   # let the first pass fail/park, leaving a frontier journal to resume from
+
+python3 contrib/sensor.py --url http://target.onion/site/data?uuid=... \
+    --interval 300 -- --socks 127.0.0.1:5000,127.0.0.1:5001
+```
+
+Everything after the `--` is passed through unchanged to both the `--detect` poll and
+the `--resume` run it triggers. `--resume-dir JOB_DIR` picks a job explicitly instead of
+the newest one; `--max-polls N` gives up instead of polling forever. It never opens a
+socket itself — detection and the resumed crawl both go through
+`OnionAccelerator.py`, so proxy selection and the farm's own safety rails apply exactly
+as they would to a run started by hand.
+
 ## Project Structure
 
 - `OnionAccelerator.py`: The main script containing all modes (multi-download, partial-download, speedtest, tree, crawl).
@@ -754,6 +778,7 @@ no stop command — by design.
 - `crawler/listing/`: The scraping layer, with no crawl in it: the structural reader, the JSON/XML/row/manifest strategies, the addressing rules, and the template engine behind `--profile` and `--detect`. Adding support for a target is a file in `crawler/listing/templates/`, not a change to the crawler — see that directory's [README](crawler/listing/templates/README.md).
 - `eventstream/`: The live streaming API behind `--stream` — the event bus, the query filters and the HTTP server. Standard library only, so switching it on cannot fail on a host that has installed nothing.
 - `contrib/streamhunt.py`: A reference consumer of that stream: keyword hunting with reconnect and gap accounting, in stdlib Python.
+- `contrib/sensor.py`: Polls a target with `--detect` until it looks live, then `--resume`s the newest job under `crawls/` at it.
 - `fullhelp.py`: The long-form per-mode reference printed by `--full-help`. Pure prose and stdlib, imported eagerly precisely because it can never fail.
 - `requirements.txt`: Python dependencies.
 - `URLs.txt`: A text file with one URL per line. Optional — `--url` replaces it.
