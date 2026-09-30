@@ -330,6 +330,29 @@ SECTIONS = {
              "Abandon a body larger than this instead of parsing it, recording the fetch "
              "as a failure (default 16 MiB). One directory of a leaked fileshare can be "
              "thousands of rows, so raise this rather than lose its subtree."),
+            ("--connect-timeout SECONDS",
+             "Seconds to establish a connection, including the Tor rendezvous "
+             "(default 90). A rendezvous slower than this is reported as a dead host "
+             "when it is only a distant one."),
+            ("--read-timeout SECONDS",
+             "Seconds the server may go silent mid-response before the fetch is "
+             "abandoned (default 180). This is the one to raise on a slow target: the "
+             "same tree served by one mirror answers in 5s and by another in 60s, and a "
+             "read window below the target's normal response time abandons listings that "
+             "were merely slow -- each miss costing a whole subtree."),
+            ("--total-timeout SECONDS",
+             "Seconds for one whole request, connect and read together (default 300). "
+             "Keep it above --connect-timeout plus --read-timeout, or it caps both."),
+            ("--resume JOB_DIR",
+             "Continue a previous crawl from its output directory. Its frontier journal "
+             "(frontier.jsonl) is replayed before seeding: every directory the old run "
+             "settled is marked seen and never fetched again, and everything it had "
+             "discovered but not reached -- including the subtrees it gave up on -- is "
+             "queued at the depth it was found at. This is what makes a tree larger than "
+             "one session's uptime crawlable at all: an onion that dies after an hour "
+             "otherwise costs that hour re-walking the layers you already have. The new "
+             "run journals the replay into its own directory, so each window is "
+             "self-contained -- resume from the newest one, not the first."),
             ("--include REGEX",
              "Only crawl directory URLs matching this regex."),
             ("--exclude REGEX",

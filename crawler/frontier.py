@@ -28,10 +28,11 @@ import heapq
 import itertools
 import logging
 import time
-from typing import Optional, Pattern, Sequence
+from typing import Optional, Pattern, Protocol, Sequence
 
 from .config import ORDER_BFS, ORDER_DFS
 from .listing.model import PageRequest
+from .resume import ResumeState, request_from_dict, request_to_dict
 from .urlnorm import dedup_key, dir_url, host_of, is_within, normalize_url
 
 logger = logging.getLogger("OnionAccelerator.crawl.frontier")
@@ -63,6 +64,15 @@ class Job:
         return dataclasses.replace(
             self, attempt=self.attempt + 1, not_before=time.monotonic() + delay
         )
+
+
+class _Journal(Protocol):
+    """What the frontier needs of a report: somewhere to record queue transitions."""
+
+    def record_admitted(self, url: str, depth: int, parent: Optional[str],
+                        request: Optional[dict]) -> None: ...
+
+    def record_done(self, url: str) -> None: ...
 
 
 @dataclasses.dataclass
@@ -112,7 +122,11 @@ class Frontier:
         include: Optional[Pattern[str]] = None,
         exclude: Optional[Pattern[str]] = None,
         allow_offsite: bool = False,
+        journal: Optional["_Journal"] = None,
     ) -> None:
+        # Where admissions and completions are written so a later run can replay them.
+        # None disables journaling entirely, which is what the tests and --detect use.
+        self._journal = journal
         self._order = order
         self._max_depth = max_depth
         self._include = include
@@ -198,18 +212,66 @@ class Frontier:
         # request contributes what a URL cannot express. It contributes nothing at all
         # for a plain GET of a directory's own URL, which is what keeps the folding above
         # working exactly as it did.
-        key = dedup_key(normalized)
-        if request is not None and request.identity:
-            key = f"{request.identity}|{key}"
+        key = self._key_for(normalized, request)
         async with self._cv:
             if key in self._seen:
                 logger.debug("skip already-seen url=%s", normalized)
                 return False
             self._seen.add(key)
-            self._push(Job(url=normalized, depth=depth, parent=parent,
-                           request=self._pin(request, normalized)))
+            pinned = self._pin(request, normalized)
+            self._push(Job(url=normalized, depth=depth, parent=parent, request=pinned))
+            if self._journal is not None:
+                self._journal.record_admitted(normalized, depth, parent,
+                                              request_to_dict(pinned))
             self._cv.notify()
         return True
+
+    @staticmethod
+    def _key_for(normalized: str, request: Optional[PageRequest]) -> str:
+        """The identity a directory is deduplicated under. See add() for why."""
+        key = dedup_key(normalized)
+        if request is not None and request.identity:
+            key = f"{request.identity}|{key}"
+        return key
+
+    async def restore(self, state: ResumeState) -> tuple[int, int]:
+        """Replay a previous run's journal. Returns (known, queued).
+
+        Everything the old run admitted becomes `seen`, so a directory it already
+        listed is never fetched twice across windows -- that saving is the entire
+        purpose. What it never settled is queued at the depth it was found at, which
+        keeps breadth-first ordering meaningful rather than restarting the shape of the
+        traversal from zero.
+
+        The replay is re-journaled into *this* run's directory, so each window's output
+        is self-contained and the next `--resume` can point at the newest one instead of
+        having to chain every previous one.
+        """
+        known = queued = 0
+        async with self._cv:
+            for record in state.admitted:
+                url = record.get("url")
+                if not url:
+                    continue
+                request = request_from_dict(record.get("request"))
+                key = self._key_for(url, request)
+                if key in self._seen:
+                    continue
+                self._seen.add(key)
+                known += 1
+                depth = int(record.get("depth") or 0)
+                parent = record.get("parent")
+                if self._journal is not None:
+                    self._journal.record_admitted(url, depth, parent,
+                                                  request_to_dict(request))
+                if url in state.done:
+                    if self._journal is not None:
+                        self._journal.record_done(url)
+                    continue
+                self._push(Job(url=url, depth=depth, parent=parent, request=request))
+                queued += 1
+            self._cv.notify_all()
+        return known, queued
 
     async def requeue(self, job: Job, delay: float) -> None:
         """Put a failed job back, runnable again after `delay` seconds.

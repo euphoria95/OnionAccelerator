@@ -27,6 +27,7 @@ from .config import (
     STATS_INTERVAL,
 )
 from .fetcher import AsyncFetcher, FetchResult, Verdict, backoff_delay
+from . import resume
 from .frontier import Frontier, HostLimiter, Job
 from .listing import Finding, ListingEngine, Page, PageRequest, detect
 from .listing.navigate import seed_request
@@ -70,6 +71,14 @@ class Crawler:
 
     async def run(self) -> dict[str, Any]:
         """Seed, spawn workers, wait, and write the report. Always writes a report."""
+        # Replayed before seeding, so a seed the previous window already listed is
+        # recognised as seen rather than crawled again.
+        if self.config.resume:
+            state = resume.load(self.config.resume)
+            known, queued = await self.frontier.restore(state)
+            logger.info("%s", resume.describe(state, self.config.resume))
+            logger.info("frontier restored: %d known, %d queued to crawl", known, queued)
+
         for seed in self.config.seeds:
             # A forced profile addresses the seed the way it addresses everything else:
             # an API target would otherwise be asked for its root with a GET, answer a
@@ -78,7 +87,12 @@ class Crawler:
             if self.listing.forced is not None:
                 request = seed_request(self.listing.forced, seed)
             if not await self.frontier.add(seed, depth=0, parent=None, request=request):
-                logger.warning("seed rejected by the frontier: %s", seed)
+                # On a resume this is the normal case, not a problem: the seed was
+                # listed in an earlier window and is already accounted for.
+                if self.config.resume:
+                    logger.debug("seed already known from the resumed run: %s", seed)
+                else:
+                    logger.warning("seed rejected by the frontier: %s", seed)
 
         n_workers = self.config.workers or len(self.pool)
         n_workers = max(1, min(n_workers, len(self.pool)))
@@ -341,6 +355,7 @@ class Crawler:
             "exclude": self.config.exclude.pattern if self.config.exclude else None,
             "profile": self.config.profile,
             "templates": list(self.config.templates),
+            "resumed_from": self.config.resume,
         }
 
 
@@ -369,14 +384,9 @@ async def run_crawl(
         circuits_per_endpoint=config.circuits_per_endpoint,
         user_agents=list(user_agents),
         connector_factory=connector_factory,
-    )
-    frontier = Frontier(
-        seeds=config.seeds,
-        max_depth=config.max_depth,
-        order=config.order,
-        include=config.include,
-        exclude=config.exclude,
-        allow_offsite=config.allow_offsite,
+        connect_timeout=config.connect_timeout,
+        read_timeout=config.read_timeout,
+        total_timeout=config.total_timeout,
     )
     fetcher = AsyncFetcher(pool, max_page_bytes=config.max_page_bytes)
     listing = ListingEngine.build(
@@ -389,6 +399,18 @@ async def run_crawl(
         with CrawlReport(config.out_dir, config.job_id, config.seeds, sink=sink,
                          stream_bodies=config.stream_bodies,
                          stream_body_bytes=config.stream_body_bytes) as report:
+            # Built inside the report's context because the report is its journal: the
+            # frontier has to be able to record an admission the moment it accepts one,
+            # or a run killed mid-crawl resumes from a queue missing its newest entries.
+            frontier = Frontier(
+                seeds=config.seeds,
+                max_depth=config.max_depth,
+                order=config.order,
+                include=config.include,
+                exclude=config.exclude,
+                allow_offsite=config.allow_offsite,
+                journal=report,
+            )
             crawler = Crawler(config, pool, frontier, fetcher, report, listing)
             stats = await crawler.run()
             return stats, report.file_urls
@@ -415,6 +437,9 @@ async def run_detect(
         circuits_per_endpoint=config.circuits_per_endpoint,
         user_agents=list(user_agents),
         connector_factory=connector_factory,
+        connect_timeout=config.connect_timeout,
+        read_timeout=config.read_timeout,
+        total_timeout=config.total_timeout,
     )
     fetcher = AsyncFetcher(pool, max_page_bytes=config.max_page_bytes)
     engine = ListingEngine.build(

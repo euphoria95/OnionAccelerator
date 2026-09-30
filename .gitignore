@@ -23,3 +23,6 @@ URLs.txt
 # images, a RARLAB trial binary, and (under the onion profile) a hidden service
 # private key. All generated, none of it source.
 rvtree-test/
+
+# contrib/sensor.py: a sidejob incident tool, not part of the project proper.
+contrib/sensor.py

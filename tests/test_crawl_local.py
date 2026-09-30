@@ -423,7 +423,11 @@ def test_a_permanently_failing_directory_is_recorded_and_the_crawl_continues(tre
     assert len(failed) == 1 and failed[0]["url"].endswith("/b/")
     # Everything outside the broken subtree still made it.
     assert any(u.endswith("/a/readme.txt") for u in urls)
-    assert stats["stopped_because"] == "completed"
+    # The frontier drained, but one subtree was given up on rather than listed -- so the
+    # run is `incomplete`, and says how much it lost. "completed" is reserved for a crawl
+    # that actually listed everything it discovered.
+    assert stats["stopped_because"] == "incomplete"
+    assert stats["totals"]["abandoned"] == 1
 
 
 def test_a_dead_endpoint_is_parked_and_the_crawl_still_completes(tree, tmp_path):
@@ -474,3 +478,80 @@ def test_requests_are_spread_across_endpoints(tree, tmp_path):
     counts = [e["requests"] for e in stats["endpoints"]]
     assert all(c > 0 for c in counts), counts
     assert max(counts) <= 3 * min(counts), f"lanes are not being spread: {counts}"
+
+
+# ---------------------------------------------------------------- resume
+
+
+def test_resume_skips_what_the_previous_run_finished(tree, tmp_path):
+    """Two windows over one tree cover it exactly once between them.
+
+    This is the property that makes a tree larger than a host's uptime crawlable: the
+    second run must not spend its window re-walking the first one's directories.
+    """
+    first, second, control = (str(tmp_path / n) for n in ("first", "second", "control"))
+    with IndexServer(tree) as server:
+        stats1, _ = crawl(server.base_url, first, max_pages=2)
+        stats2, _ = crawl(server.base_url, second, resume=first)
+        stats_all, _ = crawl(server.base_url, control)
+
+    listed = lambda out: {r["url"] for r in records(out, "dirs.jsonl")}
+    one, two, whole = listed(first), listed(second), listed(control)
+
+    assert stats1["stopped_because"] == "max_pages (2) reached"
+    # At least the cap, and more only because workers already mid-request finish their
+    # listing rather than throwing it away -- but not the whole tree, or there would be
+    # nothing left to prove the resume did anything.
+    assert 2 <= len(one) < len(whole)
+    # No directory is paid for twice ...
+    assert one & two == set()
+    # ... and nothing is lost between the windows.
+    assert one | two == whole
+    assert stats2["config"]["resumed_from"] == first
+
+
+def test_resume_keeps_an_abandoned_subtree_pending(tree, tmp_path):
+    """A give-up is unfinished business, not a settled directory.
+
+    The run that abandoned /b/ never listed it, so a later window has to try it again --
+    otherwise a host that dies mid-crawl silently costs a subtree forever.
+    """
+    from crawler import resume as resume_mod
+
+    out = str(tmp_path / "out")
+    with IndexServer(tree, flaky={"/b/": 99}) as server:
+        stats, _ = crawl(server.base_url, out, retries=2)
+
+    assert stats["totals"]["abandoned"] == 1
+    state = resume_mod.load(out)
+    pending = {r["url"] for r in state.pending}
+    assert any(u.endswith("/b/") for u in pending)
+    # The directories it did list are settled and will not be fetched again.
+    assert all(not u.endswith("/a/") for u in pending)
+
+
+def test_a_resumed_run_journals_what_it_inherited(tree, tmp_path):
+    """Each window's journal stands alone, so --resume points at the newest one."""
+    from crawler import resume as resume_mod
+
+    first, second = str(tmp_path / "first"), str(tmp_path / "second")
+    with IndexServer(tree) as server:
+        crawl(server.base_url, first, max_pages=2)
+        crawl(server.base_url, second, resume=first)
+
+    inherited = {r["url"] for r in resume_mod.load(first).admitted}
+    carried = {r["url"] for r in resume_mod.load(second).admitted}
+    assert inherited <= carried
+    # And the newest journal knows everything is finished, so a third window is a no-op.
+    third = resume_mod.load(second)
+    assert third.pending == []
+
+
+def test_resume_without_a_journal_is_a_clear_error(tmp_path):
+    """Resuming a pre-journal run says so, instead of silently crawling from scratch."""
+    from crawler import resume as resume_mod
+
+    empty = tmp_path / "no_journal"
+    empty.mkdir()
+    with pytest.raises(FileNotFoundError, match="frontier journal"):
+        resume_mod.load(str(empty))
