@@ -469,9 +469,26 @@ FARM = {
         ("--bootstrap-timeout SECONDS",
          "How long to wait for each instance to bootstrap on '--farm up' (default 120). "
          "Only read by '--farm up'."),
+        ("--farm-tune {off,onion,onion-aggressive}",
+         "torrc tuning written by '--farm up' (default off, which is the farm's torrc "
+         "unchanged). 'onion' adds ExtendedErrors -- tor then says *why* an onion failed, "
+         "which the crawler reads: a missing descriptor or failed introduction backs off "
+         "instead of burning a circuit rotation, an invalid address or missing client auth "
+         "is dropped at once, and neither counts against the daemon's health -- plus "
+         "DormantClientTimeout 7 days and DormantCanceledByStartup 1 (with the 24 h "
+         "default the farm went dormant between jobs), CircuitsAvailableTimeout 6 h, and "
+         "a MaxMemInQueues that splits half the host's RAM across the instances. The "
+         "latency knobs a tuning guide suggests (MaxClientCircuitsPending, SocksTimeout) "
+         "were benchmarked against a self-hosted onion and measured no faster, so they are "
+         "not in it; see the README. 'onion-aggressive' adds MaxCircuitDirtiness 1800, a "
+         "linkability trade-off. Instances whose torrc changes are reloaded (SIGHUP, "
+         "circuits kept), or restarted two seconds apart when the SocksPort line changed, "
+         "which a reload does not apply. '--farm status' shows each instance's profile."),
     ],
     "examples": [
         ("sudo python3 OnionAccelerator.py --farm up --count 20", "bring proxies up"),
+        ("sudo python3 OnionAccelerator.py --farm up --count 20 --farm-tune onion",
+         "bring them up tuned for onion crawling"),
         ("python3 OnionAccelerator.py --farm status", "check on them"),
         ("sudo python3 OnionAccelerator.py --farm destroy", "tear down when done"),
     ],
