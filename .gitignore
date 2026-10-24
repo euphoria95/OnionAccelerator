@@ -23,3 +23,7 @@ URLs.txt
 # images, a RARLAB trial binary, and (under the onion profile) a hidden service
 # private key. All generated, none of it source.
 rvtree-test/
+
+# Test archive corpus: generated on demand by tests/make_fixtures.sh (conftest.py
+# runs it when files are missing). ~300 MB, never commit.
+remote_viewer/tests/fixtures/

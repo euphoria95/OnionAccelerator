@@ -11,6 +11,10 @@ DEST="${1:-$HERE/fixtures}"
 mkdir -p "$DEST"
 cd "$DEST"
 
+# Homebrew's sevenzip ships the binary as 7zz; p7zip and Linux packages use 7z.
+SEVENZ="$(command -v 7z || command -v 7zz || true)"
+[ -n "$SEVENZ" ] || { echo "7z/7zz not found (brew install sevenzip)" >&2; exit 1; }
+
 if [ -f test.tar ] && [ -f test.tar.gz ] && [ "${FORCE:-0}" != "1" ]; then
     echo "fixtures already present in $DEST (FORCE=1 to rebuild)"
     exit 0
@@ -38,12 +42,12 @@ gzip -c test.tar > test.tar.gz
 if command -v zip >/dev/null 2>&1; then
     zip -q -r -y test.zip payload
 else
-    7z a -tzip -bso0 -bsp0 test.zip payload >/dev/null
+    "$SEVENZ" a -tzip -bso0 -bsp0 test.zip payload >/dev/null
 fi
-7z a -bso0 -bsp0 test.7z payload >/dev/null
+"$SEVENZ" a -bso0 -bsp0 test.7z payload >/dev/null
 
 # A deliberately non-solid 7z so extraction cost stays small for one member.
-7z a -bso0 -bsp0 -ms=off test.nonsolid.7z payload >/dev/null
+"$SEVENZ" a -bso0 -bsp0 -ms=off test.nonsolid.7z payload >/dev/null
 
 # RAR, written in Python: there is no freely installable `rar`, and unrar and 7z only
 # ever read the format. The tests check these against unrar rather than trusting them.
