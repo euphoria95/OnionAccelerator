@@ -13,7 +13,6 @@ import asyncio
 import functools
 import time
 
-import pytest
 
 from crawler.config import ORDER_BFS, ORDER_DFS
 from crawler.frontier import Frontier, HostLimiter, Job

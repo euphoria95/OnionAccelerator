@@ -13,9 +13,8 @@ import time
 
 import pytest
 
-from eventstream import bus as bus_mod
 from eventstream.bus import EventBus, Event
-from eventstream.filters import LINE, NDJSON, Selector, SelectorError
+from eventstream.filters import NDJSON, Selector, SelectorError
 
 
 @pytest.fixture

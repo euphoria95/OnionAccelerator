@@ -12,9 +12,12 @@ import io
 import logging
 import tarfile
 from concurrent.futures import ThreadPoolExecutor
-from typing import Iterator, Optional
+from typing import TYPE_CHECKING, Iterator, Optional
 
 from ..model import DIR, FILE, HARDLINK, OTHER, SYMLINK, Entry
+
+if TYPE_CHECKING:  # imported lazily at run time, inside walk()
+    from .rar import Cursor
 
 log = logging.getLogger(__name__)
 

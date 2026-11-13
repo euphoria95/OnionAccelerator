@@ -19,7 +19,7 @@ import lzma
 import struct
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Iterator, Optional
+from typing import Optional
 
 from .. import progress
 from ..util import human_bytes

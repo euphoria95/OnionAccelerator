@@ -15,7 +15,6 @@ produce exactly the serial listing.
 from __future__ import annotations
 
 import io
-import zlib
 
 import pytest
 

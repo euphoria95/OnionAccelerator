@@ -12,7 +12,6 @@ without it the suite would read the repo's own list.
 
 from __future__ import annotations
 
-import argparse
 import ast
 import os
 
