@@ -20,7 +20,7 @@ from .listing.model import Entry, Listing, PageRequest, dedupe, split_entries
 from .listing.navigate import Location, resolve
 from .listing.page import Page
 from .listing.profile import Extract, Navigate, Profile
-from .listing.rowtext import parse_size as _parse_size
+from .listing.rowtext import parse_size as _parse_size  # noqa: F401  (tests import it here)
 from .listing.strategies import ExtractContext
 from .listing.strategies.anchors import read as _read_anchors, score_index
 from .listing.strategies.jsonrows import read as _read_json

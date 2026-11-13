@@ -102,7 +102,7 @@ class Reporter:
         self._painted = 0
         self._started = time.monotonic()
         self._last_plain = 0.0
-        self._samples: deque = collections.deque()
+        self._samples: collections.deque = collections.deque()
 
         # Sampled state. Plain attributes on purpose: the writers are on the hot path
         # and an int store is atomic, so none of them needs the lock.

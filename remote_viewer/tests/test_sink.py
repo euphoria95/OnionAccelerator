@@ -9,7 +9,6 @@ exactly what ``-f ndjson`` writes, and cannot break the listing by failing.
 
 from __future__ import annotations
 
-import io
 import json
 
 import pytest

@@ -104,13 +104,20 @@ end. See **Live Streaming API** below.
 
 ## Installation
 
-1. **Install Python 3** (3.7+ recommended).
+1. **Install Python 3.11 or newer.**
 
-2. **Install dependencies:**
+2. **Install OnionAccelerator** from the checkout, into a virtualenv:
 
     ```bash
-    pip install -r requirements.txt
+    python3 -m venv .venv && . .venv/bin/activate
+    pip install -e .
     ```
+
+    This installs the `onionaccelerator` command along with every dependency, and
+    `rvtree` (for `--mode tree`) with it. `onionaccelerator ARGS` and
+    `python3 OnionAccelerator.py ARGS` are the same program; the examples below use the
+    second form, which also runs from an uninstalled checkout whose dependencies are
+    already present. Add `[dev]` (`pip install -e '.[dev]'`) for pytest and ruff.
 
 3. **Ensure you have multiple SOCKS5 proxies** (e.g., Tor instances on ports `5000..5019`). The easiest way is the built-in native farm — `python3 OnionAccelerator.py --farm up` (see **Native Tor Farm** below) — or bring your own proxies / Docker.
 
@@ -132,7 +139,7 @@ shared or logged host that difference matters.
 
 ```bash
 # Provision / manage the native Tor proxy farm:
-python3 OnionAccelerator.py --farm <up|status|down|destroy> [--count N] [--base-port PORT] [--bootstrap-timeout SEC]
+python3 OnionAccelerator.py --farm <up|status|down|destroy> [--count N] [--base-port PORT] [--bootstrap-timeout SEC] [--farm-tune off|onion|onion-aggressive]
 
 # Download / speedtest through the proxies:
 python3 OnionAccelerator.py --mode <multi|partial|speedtest> [--url URL ...] [--retries N] [--external] [--test-url URL]
@@ -746,16 +753,42 @@ python3 contrib/streamhunt.py --keywords scope.txt --out hits.jsonl
 The stream is read-only. There is no way to steer a run through it — no seed injection,
 no stop command — by design.
 
+### Waiting for a target to go live (`contrib/sensor.py`)
+
+Some targets — a leak site's per-victim "final" endpoint, most often — do not serve
+anything crawlable the moment they are known about. `contrib/sensor.py` polls one URL
+with `--mode crawl --detect` on an interval, and the moment that call reports the target
+usable, it stops polling and feeds the newest job directory under `crawls/` to
+`--resume` — so a crawl started early (or cut short because the target was not up yet)
+continues instead of starting over:
+
+```bash
+python3 OnionAccelerator.py --mode crawl --url http://target.onion/dl/1/ --max-pages 1 &
+wait   # let the first pass fail/park, leaving a frontier journal to resume from
+
+python3 contrib/sensor.py --url http://target.onion/site/data?uuid=... \
+    --interval 300 -- --socks 127.0.0.1:5000,127.0.0.1:5001
+```
+
+Everything after the `--` is passed through unchanged to both the `--detect` poll and
+the `--resume` run it triggers. `--resume-dir JOB_DIR` picks a job explicitly instead of
+the newest one; `--max-polls N` gives up instead of polling forever. It never opens a
+socket itself — detection and the resumed crawl both go through
+`OnionAccelerator.py`, so proxy selection and the farm's own safety rails apply exactly
+as they would to a run started by hand.
+
 ## Project Structure
 
-- `OnionAccelerator.py`: The main script containing all modes (multi-download, partial-download, speedtest, tree, crawl).
+- `OnionAccelerator.py`: The command line, speedtest, proxy discovery and the glue for tree, crawl and stream. Installed as the `onionaccelerator` command.
+- `oacore/`: The download modes (`download.py`), the remote size probe (`sizeprobe.py`), the native farm (`farm.py`) and the settings and helpers they share. `OnionAccelerator.py` re-exports all of it.
 - `remote_viewer/`: The `rvtree` package behind `--mode tree`. Usable on its own too — see its own README.
 - `crawler/`: The asyncio package behind `--mode crawl` — multi-circuit proxy pool, frontier, fetcher and reporting. The only async code in the project; the other modes stay on threads over `requests`.
 - `crawler/listing/`: The scraping layer, with no crawl in it: the structural reader, the JSON/XML/row/manifest strategies, the addressing rules, and the template engine behind `--profile` and `--detect`. Adding support for a target is a file in `crawler/listing/templates/`, not a change to the crawler — see that directory's [README](crawler/listing/templates/README.md).
 - `eventstream/`: The live streaming API behind `--stream` — the event bus, the query filters and the HTTP server. Standard library only, so switching it on cannot fail on a host that has installed nothing.
 - `contrib/streamhunt.py`: A reference consumer of that stream: keyword hunting with reconnect and gap accounting, in stdlib Python.
+- `contrib/sensor.py`: Polls a target with `--detect` until it looks live, then `--resume`s the newest job under `crawls/` at it.
 - `fullhelp.py`: The long-form per-mode reference printed by `--full-help`. Pure prose and stdlib, imported eagerly precisely because it can never fail.
-- `requirements.txt`: Python dependencies.
+- `pyproject.toml`: Packaging, dependency floors, and the pytest and ruff configuration.
 - `URLs.txt`: A text file with one URL per line. Optional — `--url` replaces it.
 - `UserAgents.tsv`: Tab-separated file; first column is the User-Agent string.
 - `logs/`: A directory automatically created to store timestamped log files.
@@ -765,10 +798,12 @@ no stop command — by design.
 
 ## Requirements
 
-- Python 3.7+ (3.8+ for `--mode crawl`, which is `aiohttp`'s own floor; 3.11+ for its listing templates, which are TOML read with the standard library's `tomllib` — on 3.8–3.10 install `tomli`)
-- `requests[socks]` or `PySocks` for SOCKS5 support
+- Python 3.11+, for every mode. The crawler's listing templates are TOML read with the standard library's `tomllib`.
+- `requests` and `PySocks` for SOCKS5 support
 - `tqdm` for progress bars
-- `aiohttp`, `aiohttp-socks`, `beautifulsoup4`, `lxml` — `--mode crawl` only; the other modes run without them
+- `aiohttp`, `aiohttp-socks`, `beautifulsoup4`, `lxml` — used by `--mode crawl` and `--detect` only. `pip install` brings them anyway, but they are imported lazily, so the other modes still run on a host where they fail to import.
+
+The version floors are in `pyproject.toml`. CI tests them as written, on the oldest supported Python.
 
 ## Native Tor Farm (`--farm`)
 
@@ -801,6 +836,74 @@ sudo python3 OnionAccelerator.py --farm destroy
   and its SOCKS port is listening (bounded by `--bootstrap-timeout`, default 120s).
 - **Configurable size/ports.** `--count` (default 20) and `--base-port` (default 5000)
   control how many instances and which ports; instance `NN` binds `base_port + NN`.
+
+### Tuning the farm for onion crawling (`--farm-tune`)
+
+```bash
+sudo python3 OnionAccelerator.py --farm up --count 20 --farm-tune onion
+python3 OnionAccelerator.py --farm status        # shows tune=onion per instance
+```
+
+`--farm-tune` appends torrc options to every instance. The default, `off`, is the farm's
+torrc exactly as before, so upgrading restarts nothing. The candidates came from the
+tuning guide *Tor Client Performance Tuning* (section numbers are its); what made the cut
+is what fixes something observed on a real farm, after an A/B benchmark (below) showed
+the guide's latency knobs make no measurable difference here:
+
+| Line | Profile | Why |
+|---|---|---|
+| `SocksPort … ExtendedErrors` | onion | tor says *why* an onion failed (`0xF0` descriptor gone, `0xF2` intro failed, `0xF3` rendezvous failed, `0xF6` bad address…) instead of `host unreachable` for all of them. The crawler acts on it, see below. §7.3 |
+| `DormantClientTimeout 7 days`, `DormantCanceledByStartup 1` | onion | with the 24 h default every instance went dormant between jobs (visible in each `notices.log`), so the next job started cold. §4.4 |
+| `CircuitsAvailableTimeout 21600` | onion | keeps predicted onion circuits built across gaps between jobs (default 30–60 min). §5.2 |
+| `MaxMemInQueues <N> MB` | onion | half the host's RAM split across `--count` instances (256 MB–1 GB each); otherwise every instance budgets for the whole host. §10.2 |
+| `MaxCircuitDirtiness 1800` | onion-aggressive | **Trade-off**: reuses a circuit for 30 min instead of 10 — fewer builds, more linkable. §5 |
+
+Deliberately **not** included: `MaxClientCircuitsPending` and `SocksTimeout` (measured no
+gain, see below; every mode here already times out sooner than tor would), Conflux (exit
+traffic only; onions never use it), `CircuitStreamTimeout` (a PoW-defended onion
+legitimately takes tens of seconds), and anything that narrows path selection —
+`ExitNodes`, `EntryNodes`, `NumEntryGuards`, padding cuts. The target is an observer too,
+and a crawler with a pinned path clusters in its logs. Congestion control, onion PoW and
+vanguards-lite are already on by default in tor 0.4.8+, so there is nothing to add for
+them; `--farm up` only warns if this tor lacks the `pow` module.
+
+**What the crawler does with ExtendedErrors.** A missing descriptor, failed or timed-out
+introduction backs off and retries without burning a circuit rotation (the fault is at
+the far end); a failed rendezvous rotates; a malformed address, broken descriptor or
+missing client auth is dropped at once. None of them count against the daemon's health,
+so a dead target can no longer park every healthy farm instance. The download modes
+translate the codes in their log lines (PySocks prints `0xf0: Unknown error`).
+
+**Applying it to a running farm.** `--farm up` compares each instance's torrc with the
+new one. Changed options are applied with a reload (SIGHUP), which keeps the instance's
+circuits and descriptor cache. A changed `SocksPort` line — turning ExtendedErrors on or
+off — needs a restart, because tor keeps a listener's flags across a reload; those
+instances are restarted two seconds apart so a crawl running on the farm loses one
+endpoint at a time.
+
+**What was measured (2026-09-29).** A self-hosted onion (Range-capable static server, a
+351-directory open index) on the same host as two sets of four user-level tor 0.4.9.13
+clients: the farm's baseline torrc versus a tuned one (everything above plus
+`MaxClientCircuitsPending 96` and `SocksTimeout 90`). Arms were interleaved request by
+request, then **crossed over** — configs swapped between the two sets, keeping each
+set's DataDirectory and guard — so a difference that is really guard luck flips sign
+while a config effect does not.
+
+| Test | Baseline | Tuned | Verdict |
+|---|---|---|---|
+| Cold TTFB, fresh rendezvous per request (80 per config) | p50 1.60 s | p50 1.68 s | no difference (p=0.85) |
+| Warm TTFB, reused circuit (80 per config) | p50 0.77 s | p50 0.82 s | no difference pooled; each phase alone was "significant" (p≈0.004) **in opposite directions** — it follows the guard |
+| 10 MiB throughput, warm circuit (8 per config) | 404 KiB/s | 341 KiB/s | no difference (p=0.19); congestion control confirmed active on onion circuits (`CWND` in CIRC_BW) |
+| 64 concurrent cold connects on one instance (16 bursts per config) | median 10.4 s, 4/16 bursts with failures | median 10.6 s, 3/16 | no difference (p=0.79 / 1.0). Stalled bursts end at `SocksTimeout`: 120 s vs 90 s |
+| `--mode crawl`, 351 dirs, 4×8 lanes (4 per config) | 87 / 33 / 28 / 32 s | 32 / 26 / 136 / 172 s | follows the instances, not the config |
+| `--mode partial`, 64 MiB over 4 instances (6 per config) | 94–286 s | 67–92 s | tuned faster in both phases, but back-to-back runs share one uncredentialed circuit per instance, so this is ~2 independent samples a side: not evidence |
+| Dead onion (valid v3 address, no descriptor) | `0x04` host unreachable, 5/5 | `0xF0` descriptor not found, 5/5 | ExtendedErrors works; time to fail no different |
+| First onion request 20 s after a warm restart, with/without a warm-up request to another onion | — | — | no difference (p=0.86); 3/10 failed outright either way, which is why `--farm up` reloads rather than restarts where it can |
+
+The honest summary: against an onion, per-request speed is set by the path the guard
+and rendezvous point give you, and no client torrc line moved it. What `--farm-tune`
+buys is a farm that is awake and not over-committing memory when a job starts, and a
+crawler that can tell a dead target from a dead circuit.
 
 ### Auto-discovery
 

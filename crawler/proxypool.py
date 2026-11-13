@@ -137,6 +137,9 @@ class AsyncLanePool:
         user_agents: Sequence[str],
         connector_factory: Optional[ConnectorFactory] = None,
         timeout: Optional[aiohttp.ClientTimeout] = None,
+        connect_timeout: float = CONNECT_TIMEOUT,
+        read_timeout: float = READ_TIMEOUT,
+        total_timeout: float = TOTAL_TIMEOUT,
     ) -> "AsyncLanePool":
         """Build `len(addresses) * circuits_per_endpoint` lanes.
 
@@ -152,7 +155,7 @@ class AsyncLanePool:
         endpoints = [Endpoint.parse(a) for a in addresses]
         factory = connector_factory or socks_connector
         client_timeout = timeout or aiohttp.ClientTimeout(
-            total=TOTAL_TIMEOUT, connect=CONNECT_TIMEOUT, sock_read=READ_TIMEOUT
+            total=total_timeout, connect=connect_timeout, sock_read=read_timeout
         )
 
         lanes: list[Lane] = []

@@ -1,8 +1,0 @@
-requests[socks]
-tqdm
-
-# crawl mode (--mode crawl) only; the other modes stay on requests/threading.
-aiohttp
-aiohttp-socks
-beautifulsoup4
-lxml

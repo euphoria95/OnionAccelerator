@@ -232,13 +232,13 @@ def test_progress_events_say_the_run_is_still_moving(tmp_path, monkeypatch):
     sink = Recorder()
     config = CrawlConfig(seeds=["http://x.onion/"], out_dir=str(tmp_path), job_id="t")
     report = CRAWL_MODULE.CrawlReport(str(tmp_path), "t", config.seeds, sink=sink)
-    crawler = CRAWL_MODULE.Crawler(
+    engine = CRAWL_MODULE.Crawler(
         config, _Pool(), CRAWL_MODULE.Frontier(seeds=config.seeds, max_depth=1),
         fetcher=None, report=report, listing=None,
     )
 
     async def tick():
-        watcher = asyncio.ensure_future(crawler._progress())
+        watcher = asyncio.ensure_future(engine._progress())
         await asyncio.sleep(0.05)
         watcher.cancel()
 

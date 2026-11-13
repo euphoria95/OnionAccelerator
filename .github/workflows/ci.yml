@@ -1,0 +1,100 @@
+name: CI
+
+# Runs on pull requests from forks too: nothing here needs a secret, and the token is
+# read-only. No job touches the network beyond installing packages -- tests marked
+# `network` are deselected by both suites' pytest configuration.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install "ruff>=0.6"
+      - run: ruff check --output-format github .
+
+  test:
+    needs: lint
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          allow-prereleases: true
+      # make_fixtures.sh builds the rvtree archive corpus with these; curl is used by a
+      # stream test as an independent client.
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends p7zip-full xz-utils zip curl
+      - name: Cache the generated archive corpus
+        uses: actions/cache@v4
+        with:
+          path: remote_viewer/tests/fixtures
+          key: rvtree-fixtures-${{ hashFiles('remote_viewer/tests/make_fixtures.sh', 'remote_viewer/tests/rarwriter.py') }}
+      - run: pip install -e ".[dev]"
+      - name: Root suite
+        run: python -m pytest -q
+      - name: rvtree suite
+        working-directory: remote_viewer
+        run: python -m pytest -q
+
+  lowest-deps:
+    # Every dependency at the floor pyproject.toml declares, on the oldest Python.
+    needs: lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@v6
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends p7zip-full xz-utils zip curl
+      - uses: actions/cache@v4
+        with:
+          path: remote_viewer/tests/fixtures
+          key: rvtree-fixtures-${{ hashFiles('remote_viewer/tests/make_fixtures.sh', 'remote_viewer/tests/rarwriter.py') }}
+      - run: uv pip install --system --resolution lowest-direct -e .
+      - run: uv pip install --system "pytest>=8"
+      - run: python -m pip list
+      - run: python -m pytest -q
+      - working-directory: remote_viewer
+        run: python -m pytest -q
+
+  wheel:
+    # The installed command, from a built wheel, run outside the checkout: catches a
+    # module or a data file the package list leaves out.
+    needs: lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip wheel --no-deps -w dist .
+      - name: Install into a clean venv and run from elsewhere
+        run: |
+          python -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install dist/*.whl
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/venv/bin/onionaccelerator" --full-help > installed.txt
+          "$RUNNER_TEMP/venv/bin/python" "$GITHUB_WORKSPACE/OnionAccelerator.py" --full-help > checkout.txt
+          cmp installed.txt checkout.txt
+          "$RUNNER_TEMP/venv/bin/onionaccelerator" --list-profiles > profiles.txt
+          test -s profiles.txt
+          "$RUNNER_TEMP/venv/bin/python" -c "import rvtree.cli, rvtree.transport, eventstream, crawler, oacore"

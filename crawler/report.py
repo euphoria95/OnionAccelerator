@@ -28,6 +28,7 @@ from typing import Any, Callable, Iterable, Optional, TextIO
 from .config import (
     DIRS_FILE,
     FAILED_FILE,
+    FRONTIER_FILE,
     LISTING_FILE,
     STATS_FILE,
     STREAM_BODY_BYTES,
@@ -68,6 +69,11 @@ class Totals:
     retries: int = 0
     rotations: int = 0
     failures: int = 0
+    # Directories that exhausted their retry budget and were never listed. Each one is
+    # a whole subtree missing from the manifest, which is why it is counted apart from
+    # `failures` (attempts, most of which a retry recovered) and why it decides whether
+    # a drained frontier may call itself complete.
+    abandoned: int = 0
 
 
 class CrawlReport:
@@ -92,6 +98,7 @@ class CrawlReport:
         self._listing: Optional[TextIO] = None
         self._dirs: Optional[TextIO] = None
         self._failed: Optional[TextIO] = None
+        self._frontier: Optional[TextIO] = None
         # File URLs are deduplicated here, not in the frontier: the frontier only ever
         # queues directories, but the same file can legitimately be linked from two of
         # them, and the manifest should list it once. Keyed by identity rather than by
@@ -104,11 +111,12 @@ class CrawlReport:
         self._listing = open(os.path.join(self.out_dir, LISTING_FILE), "a", encoding="utf-8")
         self._dirs = open(os.path.join(self.out_dir, DIRS_FILE), "a", encoding="utf-8")
         self._failed = open(os.path.join(self.out_dir, FAILED_FILE), "a", encoding="utf-8")
+        self._frontier = open(os.path.join(self.out_dir, FRONTIER_FILE), "a", encoding="utf-8")
         logger.info("crawl output: %s", os.path.abspath(self.out_dir))
         return self
 
     def __exit__(self, *exc: object) -> None:
-        for handle in (self._listing, self._dirs, self._failed):
+        for handle in (self._listing, self._dirs, self._failed, self._frontier):
             if handle is not None:
                 handle.close()
 
@@ -132,6 +140,7 @@ class CrawlReport:
             "discovered_at": _now(),
         })
         self._write(self._dirs, record, EVENT_DIR)
+        self.record_done(job.url)
         self._add_to_tree(job.url, is_dir=True)
 
         for entry in listing.files:
@@ -209,6 +218,7 @@ class CrawlReport:
             "discovered_at": _now(),
         })
         self._write(self._dirs, record, EVENT_SKIP)
+        self.record_done(job.url)
         self._add_to_tree(job.url, is_dir=True)
 
     def record_leaf(self, job: Job, result_record: dict[str, Any]) -> None:
@@ -230,6 +240,7 @@ class CrawlReport:
             status=result_record.get("status"),
             content_type=result_record.get("content_type"),
         )
+        self.record_done(job.url)
 
     def record_failure(self, job: Job, result_record: dict[str, Any], *, final: bool) -> None:
         """A failed attempt. `final` marks the one that exhausted the retry budget."""
@@ -244,6 +255,7 @@ class CrawlReport:
         })
         self._write(self._failed, record, EVENT_FAIL)
         if final:
+            self.totals.abandoned += 1
             logger.error("[FAIL] gave up on %s after %d attempt(s): %s",
                          job.url, job.attempt + 1, record.get("error"))
 
@@ -313,6 +325,15 @@ class CrawlReport:
                  stopped_because: str) -> dict[str, Any]:
         """Write stats.json, tree.txt and urls.txt. Returns the stats it wrote."""
         elapsed = time.time() - self.started
+        # A frontier can drain two ways: every directory was listed, or the rest were
+        # given up on. Both leave nothing queued, so "the workers stopped" cannot be
+        # read as success -- a run that abandoned 1,020 subtrees against a host that
+        # went offline reported "completed" and looked like a finished crawl. Only the
+        # first way earns that word; the second is `incomplete`, with the count in
+        # `totals.abandoned`. Reasons other than draining (a budget, a signal) already
+        # say what they were and are left alone.
+        if stopped_because == "completed" and self.totals.abandoned:
+            stopped_because = "incomplete"
         stats = {
             "job_id": self.job_id,
             "seeds": self.seeds,
@@ -336,9 +357,11 @@ class CrawlReport:
                 fh.write(line + "\n")
 
         logger.info(
-            "crawl finished (%s): %d directories, %d files, %s advertised, %s fetched, %.1fs",
+            "crawl finished (%s): %d directories, %d files, %s advertised, %s fetched, %.1fs%s",
             stopped_because, self.totals.directories, self.totals.files,
             human_size(self.totals.bytes_seen), human_size(self.totals.bytes_fetched), elapsed,
+            f" -- {self.totals.abandoned} subtree(s) abandoned, see {FAILED_FILE}"
+            if self.totals.abandoned else "",
         )
         return stats
 
@@ -388,6 +411,36 @@ class CrawlReport:
         return lines
 
     # ------------------------------------------------------------ internals
+
+    # ------------------------------------------------------------ frontier journal
+
+    def record_admitted(self, url: str, depth: int, parent: Optional[str],
+                        request: Optional[dict[str, Any]]) -> None:
+        """Journal a directory the frontier accepted, before anything fetches it."""
+        self._journal({"k": "add", "url": url, "depth": depth,
+                       "parent": parent, "request": request})
+
+    def record_done(self, url: str) -> None:
+        """Journal a directory nothing should fetch again.
+
+        Listed, skipped as not-a-listing, or found to be a file: all three are settled.
+        A give-up is deliberately *not* settled -- it stays pending so that resuming a
+        run retries the subtrees the last one abandoned, which is the whole point of
+        resuming a crawl a dying host cut short.
+        """
+        self._journal({"k": "done", "url": url})
+
+    def _journal(self, record: dict[str, Any]) -> None:
+        """Append to the frontier journal. Not published to the event stream.
+
+        This is the crawler's own bookkeeping, not a finding: a consumer watching
+        --stream wants the directories and files, not a second copy of every URL as it
+        enters the queue.
+        """
+        if self._frontier is None:
+            return
+        self._frontier.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+        self._frontier.flush()
 
     def _write(self, handle: Optional[TextIO], record: dict[str, Any],
                kind: str) -> None:

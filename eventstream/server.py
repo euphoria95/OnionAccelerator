@@ -36,7 +36,7 @@ from typing import Any, Callable, Optional
 from urllib.parse import urlparse, parse_qs
 
 from .bus import KINDS, STREAM_GAP, STREAM_HEARTBEAT, STREAM_HELLO, EventBus
-from .filters import LINE, NDJSON, Selector, SelectorError
+from .filters import LINE, Selector, SelectorError
 
 logger = logging.getLogger("OnionAccelerator.eventstream")
 

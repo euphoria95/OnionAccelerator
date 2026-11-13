@@ -16,7 +16,7 @@ import logging
 import lzma
 import struct
 import zlib
-from typing import Any, Optional
+from typing import Optional
 
 from ..model import DIR, FILE, SYMLINK, Entry
 from ..util import human_bytes

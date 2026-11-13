@@ -1,30 +1,24 @@
 #!/usr/bin/env python3
+"""OnionAccelerator: discover and download files over pools of Tor SOCKS5 circuits.
+
+This file is the command line and the glue between modes. The download modes, the size
+probe and the farm live in oacore/ and are re-exported from here: tests, contrib
+scripts and older callers reach them as `OnionAccelerator.<name>`, and the forwarding
+table at the bottom keeps a monkeypatch applied here effective where the code runs.
+"""
 import argparse
 import contextlib
 import os
 import re
 import sys
-import glob
 import time
-import socket
-import shutil
 import random
 import shlex
 import string
 import threading
-import queue
-import subprocess
-import tempfile
-from email.message import Message
-from typing import NamedTuple, Optional
-from urllib.parse import urlparse, unquote
+import types
 
 import requests
-# Wyłączamy ostrzeżenia o certyfikatach
-import requests.packages.urllib3
-from requests.packages.urllib3.exceptions import InsecureRequestWarning
-requests.packages.urllib3.disable_warnings(category=InsecureRequestWarning)
-
 from tqdm import tqdm
 import logging
 
@@ -33,66 +27,43 @@ import logging
 # remote_viewer/, it can never make --help fail on a host missing a dependency.
 import fullhelp
 
-# ================== GLOBAL CONFIG ==================
-MAX_WORKERS = 20              # e.g. ports 5000..5019
-BASE_PORT = 5000
-CHUNK_SIZE = 1024 * 64        # 64 KB
-MIN_PARTIAL_CHUNK_SIZE = 1024 * 1024  # 1 MB: don't split a file finer than this
-REQUEST_TIMEOUT = 20          # seconds, connect
+# Importing oacore.common also silences urllib3's InsecureRequestWarning: TLS
+# verification is off on purpose, since an onion address authenticates the peer.
+from oacore import common as _common, config as _config, download as _download
+from oacore import farm as _farm, sizeprobe as _sizeprobe
+from oacore.config import (
+    MAX_WORKERS, BASE_PORT, CHUNK_SIZE, MIN_PARTIAL_CHUNK_SIZE, REQUEST_TIMEOUT,
+    TRANSFER_TIMEOUT, USERAGENTS_FILE, URLS_FILE, DOWNLOAD_DIR,
+    PARTIAL_DOWNLOAD_DIR, LOGS_DIR, DEFAULT_RETRIES, MAX_SPEEDTEST_BYTES,
+    SPEEDTEST_CHUNK_SIZE, EXTERNAL_PROXIES_URL, MAX_EXTERNAL_PROXIES,
+    CONNECTIVITY_TIMEOUT, PROXY_TEST_URL,
+)
+from oacore.common import (
+    TOR_SOCKS_REPLIES, load_user_agents, random_user_agent, url_to_local_path,
+    _safe_path_component, make_proxies, _TOR_REPLY_RE, explain_error,
+    PORT_PROBE_TIMEOUT, _port_is_open, discover_local_socks_ports,
+)
+from oacore.sizeprobe import (
+    IDENTITY_ENCODINGS, SizeProbe, _positive_int, _size_from_content_length,
+    _size_from_content_disposition, _size_from_content_range, _size_from_response,
+    _probe, probe_remote_size, get_remote_file_size,
+)
+from oacore.download import (
+    ProxyPool, _UMASK, _DOWNLOAD_MODE, _MARKUP_TYPES, _MARKUP_EXTENSIONS,
+    _error_page_reason, _check_response, download_file, _warn_on_path_collisions,
+    multi_download_mode, partial_download_chunk_to_file,
+    fallback_sequential_download, partial_download_file, partial_download_mode,
+)
+from oacore.farm import (
+    TOR_INSTANCE_PREFIX, FARM_RE, FARM_RESERVED, TOR_INSTANCES_DIR, TOR_LIB_DIR,
+    TOR_RUN_DIR, BOOTSTRAP_TIMEOUT, FARM_RESTART_STAGGER, FARM_TUNE_SAFE,
+    FARM_TUNE_PROFILES, FARM_TUNE_SOCKS_FLAGS, FARM_TUNE_HEADER, assert_farm_name,
+    _run, _write_root_file, farm_instance_name, farm_preflight, farm_mem_budget,
+    render_torrc, farm_tune_of, _read_torrc, _socks_line, torrc_apply_action,
+    bootstrap_percent, wait_bootstrap, farm_up, farm_instances_on_disk,
+    systemd_active, farm_status, farm_down, farm_destroy, run_farm_action,
+)
 
-# Connect and read budgets for anything that moves a file body, kept apart because one
-# number cannot serve both. Passing a scalar to requests sets the two to the same value,
-# which makes the connect budget double as the ceiling on how long the server may think
-# before sending its first byte -- and these file managers think for as long as the file
-# is big. A 39 MB archive measured 27.2s to response headers against a 20s scalar: the
-# transfer was aborted seven seconds before the first byte, then streamed 37 MB with a
-# worst inter-chunk gap of 3.1s once the wait was allowed to finish. That is why every
-# file above ~5 MB "timed out" while every file below it downloaded cleanly. The read
-# half is generous because it is per socket read, not for the whole transfer, so it
-# bounds a stalled circuit without capping a large download. Tree mode has always used
-# this pair; multi and partial mode are the ones that were passing a scalar.
-TRANSFER_TIMEOUT = (REQUEST_TIMEOUT, REQUEST_TIMEOUT * 6)
-USERAGENTS_FILE = "UserAgents.tsv"
-URLS_FILE = "URLs.txt"
-
-DOWNLOAD_DIR = "downloads"
-PARTIAL_DOWNLOAD_DIR = "partials"
-LOGS_DIR = "logs"
-DEFAULT_RETRIES = 3
-
-# Dla speedtest:
-MAX_SPEEDTEST_BYTES = 5 * 1024 * 1024  # 5 MB
-SPEEDTEST_CHUNK_SIZE = 1024 * 64
-
-# External proxy list (--external): fetched fresh every run, never persisted.
-EXTERNAL_PROXIES_URL = "https://raw.githubusercontent.com/euphoria95/external-tor-proxies/refs/heads/main/proxies.txt"
-MAX_EXTERNAL_PROXIES = 100     # hard cap on threads/proxies for external mode
-CONNECTIVITY_TIMEOUT = 15      # seconds, per-proxy liveness check
-
-# Proxy connectivity check (--external): the URL hit to confirm a candidate proxy
-# is alive. Point this at an endpoint you control or trust so that real target
-# URLs are never revealed to proxies that end up discarded. Leave empty to fall
-# back to a random URL from URLS_FILE (convenient, but leaks a target to every
-# candidate proxy). Override per-run with --test-url.
-PROXY_TEST_URL = ""            # e.g. "http://your-own-service.onion/ping"
-
-# =========== NATIVE TOR FARM (--farm) ============
-# A farm of client-only Tor instances managed via the native Debian/Ubuntu
-# tor-instance-create + systemd tor@<name> stack (no Docker). Instances are
-# named "<prefix><NN>" and each binds SocksPort 127.0.0.1:<BASE_PORT + NN>, so
-# they line up with what the download modes already expect.
-#
-# SAFETY: farm operations act ONLY on instances whose name matches FARM_RE and
-# is not in FARM_RESERVED. This guarantees a stray --farm destroy can never stop
-# or purge a user's own relay/client instances (e.g. "relay2", "torclient").
-TOR_INSTANCE_PREFIX = "oa"
-FARM_RE = re.compile(r"^oa\d+$")
-FARM_RESERVED = {"default", "relay2", "torclient"}
-TOR_INSTANCES_DIR = "/etc/tor/instances"
-TOR_LIB_DIR = "/var/lib/tor-instances"
-TOR_RUN_DIR = "/run/tor-instances"
-BOOTSTRAP_TIMEOUT = 120        # seconds to wait for each instance to reach 100%
-PORT_PROBE_TIMEOUT = 0.3       # seconds, per-port local liveness probe
 
 # =========== LOGGER & JOB_ID SETUP ============
 # Logger is configured in setup_logging(), called from main(), to avoid
@@ -123,119 +94,6 @@ def setup_logging():
     ch.setLevel(logging.INFO)
     ch.setFormatter(logging.Formatter('[%(levelname)s] %(message)s'))
     logger.addHandler(ch)
-
-
-# =========== UTILS ===========
-
-def load_user_agents(filepath=USERAGENTS_FILE):
-    """
-    Load user-agent strings from a TSV file (first column). Fallback if missing.
-    """
-    if not os.path.isfile(filepath):
-        logger.warning(f"UserAgents file not found: {filepath}. Using fallback.")
-        return [
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-            "Mozilla/5.0 (X11; Linux x86_64)"
-        ]
-    agents = []
-    with open(filepath, "r", encoding="utf-8") as f:
-        for line in f:
-            # TSV: first column is the UA string, remaining columns are metadata
-            parts = line.strip().split('\t')
-            ua = parts[0].strip()
-            if ua:
-                agents.append(ua)
-    if not agents:
-        agents = ["Mozilla/5.0 (Windows NT 10.0; Win64; x64)"]
-    return agents
-
-
-def random_user_agent(uas):
-    return random.choice(uas)
-
-
-def url_to_local_path(url: str, base_dir: str, preserve_path: bool = False) -> str:
-    """
-    Derive a collision-free local path from a URL using hostname as a subdirectory.
-    e.g. http://example.onion/file.zip -> base_dir/example.onion/file.zip
-
-    With `preserve_path`, the URL's directories are mirrored under the hostname:
-    http://example.onion/a/b/file.zip -> base_dir/example.onion/a/b/file.zip. The
-    hostname alone is enough for a hand-written URL list, where two entries rarely
-    share a basename, but not for a crawl: an open directory routinely holds a
-    README.txt in every subdirectory, and flattening those would have each overwrite
-    the last. `--mode crawl --download` always passes True; multi and partial mode
-    take it from --preserve-path and default to the flat layout, which
-    _warn_on_path_collisions() counts the cost of before a run starts.
-    """
-    parsed = urlparse(url)
-    host = parsed.netloc.replace(":", "_") or "unknown"
-    filename = os.path.basename(parsed.path) or "index.html"
-    if not preserve_path:
-        return os.path.join(base_dir, host, filename)
-
-    # Decoded before the split, for the same reason crawler.urlnorm.path_segments is:
-    # a file manager addresses a nested directory by encoding the separator into one
-    # segment, and `/TOK/dumps%2Fraw/part.bin` is three levels, not two. Splitting first
-    # would mirror it as a single directory named "dumps_raw" sitting beside the "dumps"
-    # its own subdirectories were written into, flattening the tree being preserved.
-    #
-    # Sanitise every component afterwards: a path traversal in a URL served by a hostile
-    # onion must not be able to write outside base_dir. Decoding first cannot weaken
-    # that -- it is what exposes an encoded `..` to the check, rather than hiding it
-    # inside a segment that is sanitised as one opaque name.
-    parts = [_safe_path_component(p) for p in unquote(parsed.path).split("/") if p]
-    parts = [p for p in parts if p]
-    if not parts:
-        parts = ["index.html"]
-    return os.path.join(base_dir, host, *parts)
-
-
-def _safe_path_component(component: str) -> str:
-    """One URL path segment, made safe to use as a filename."""
-    if component in (".", ".."):
-        return ""
-    cleaned = re.sub(r'[\x00-\x1f/\\:*?"<>|]', "_", component).strip(". ")
-    return cleaned[:120]
-
-
-def make_proxies(proxy: str) -> dict:
-    """
-    Build a SOCKS5 proxy dict for a 'host:port' endpoint (local or remote).
-    Accept any cert (verify=False), resolve DNS via Tor (socks5h).
-    """
-    return {
-        "http": f"socks5h://{proxy}",
-        "https": f"socks5h://{proxy}",
-    }
-
-
-# =========== LOCAL PORT DISCOVERY ===========
-
-def _port_is_open(host, port, timeout=PORT_PROBE_TIMEOUT):
-    """Return True if a TCP connect to host:port succeeds within `timeout`."""
-    try:
-        with socket.create_connection((host, port), timeout=timeout):
-            return True
-    except OSError:
-        return False
-
-
-def discover_local_socks_ports(base_port=BASE_PORT, max_ports=MAX_WORKERS, host="127.0.0.1"):
-    """
-    Probe host:base_port .. host:base_port+max_ports-1 and return the
-    'host:port' endpoints that actually accept a TCP connection.
-
-    This makes local mode adapt to however many SOCKS proxies are really up —
-    a native farm of any size (see --farm) or legacy Docker instances — instead
-    of blindly assuming exactly MAX_WORKERS are listening.
-    """
-    live = []
-    for i in range(max_ports):
-        port = base_port + i
-        if _port_is_open(host, port):
-            live.append(f"{host}:{port}")
-    return live
 
 
 # =========== EXTERNAL PROXIES ===========
@@ -362,679 +220,6 @@ def resolve_proxies(use_external, urls, test_url=None):
     return verify_proxies(candidates, check_url, user_agents)
 
 
-# =========== PROXY POOL ===========
-
-class ProxyPool:
-    """
-    Thread-safe pool of 'host:port' SOCKS5 endpoints shared across a run.
-
-    Instead of pinning a download to one proxy by index, callers acquire() a
-    proxy per attempt and report the outcome. A failed attempt can retry on a
-    *different* live proxy (mark_dead + acquire(exclude=...)), so a single dead
-    endpoint no longer sinks a whole file. If every proxy is parked as dead the
-    pool falls back to reusing them — a stale retry beats giving up — and any
-    proxy that later succeeds is rehabilitated via mark_alive().
-    """
-
-    def __init__(self, proxies):
-        self._proxies = list(proxies)
-        self._lock = threading.Lock()
-        self._idx = 0
-        self._dead = set()
-
-    def __len__(self):
-        return len(self._proxies)
-
-    def acquire(self, exclude=None):
-        """Return a proxy, preferring live ones and avoiding `exclude` when possible."""
-        with self._lock:
-            n = len(self._proxies)
-            # One full rotation looking for a live, non-excluded endpoint.
-            for _ in range(n):
-                proxy = self._proxies[self._idx % n]
-                self._idx += 1
-                if proxy not in self._dead and proxy != exclude:
-                    return proxy
-            # Everything is dead or excluded: hand back the next in rotation so a
-            # transient outage doesn't permanently strand the download.
-            proxy = self._proxies[self._idx % n]
-            self._idx += 1
-            return proxy
-
-    def mark_dead(self, proxy):
-        with self._lock:
-            self._dead.add(proxy)
-
-    def mark_alive(self, proxy):
-        with self._lock:
-            self._dead.discard(proxy)
-
-
-# =========== MULTI-DOWNLOAD ===========
-
-# Markup content types, and the target extensions for which markup is a plausible
-# answer. Anything else answering with markup is an error page wearing the filename.
-# tempfile.mkstemp() hardcodes 0600, but a download is an ordinary file and used to be
-# created by open(), i.e. at the process umask. Sampled once here, while the process is
-# still single-threaded, because reading the umask means temporarily setting it.
-_UMASK = os.umask(0)
-os.umask(_UMASK)
-_DOWNLOAD_MODE = 0o666 & ~_UMASK
-
-_MARKUP_TYPES = frozenset({"text/html", "application/xhtml+xml"})
-_MARKUP_EXTENSIONS = frozenset({
-    "", ".html", ".htm", ".xhtml", ".shtml", ".php", ".asp", ".aspx", ".jsp", ".cgi",
-})
-
-
-def _error_page_reason(url: str, content_type: str) -> Optional[str]:
-    """Why this response body is a server error page and not the requested file.
-
-    Returns None when the body should be believed.
-
-    The status line cannot be used for this. The file managers behind these onions
-    answer 404 while sending the complete file -- a 16-byte note arrives with the
-    right length, the right `text/plain`, and a 404 -- and they answer *200* with a
-    9.6 KB "not available" HTML page in place of a 166 MB CAD model. Trusting the
-    code both throws away good files and saves rubbish under their names, and the
-    second failure is silent: the page is written to `Auftragslayout....STEP`,
-    reported [OK], and only found much later by whoever tries to open it.
-
-    What does separate the two is the content type against the target's extension.
-    A `.STEP`, `.zip` or `.xlsx` request answered with markup is an error page on any
-    server, whatever the status line claims; a `.txt` answered with `text/plain` is
-    the file, whatever the status line claims. Extensions that could legitimately be
-    served as markup are exempt, so this can only reject a body that contradicts the
-    name it was asked for.
-    """
-    ctype = (content_type or "").split(";")[0].strip().lower()
-    if ctype not in _MARKUP_TYPES:
-        return None
-    ext = os.path.splitext(urlparse(url).path)[1].lower()
-    if ext in _MARKUP_EXTENSIONS:
-        return None
-    return f"server sent {ctype} for a '{ext}' target -- an error page, not the file"
-
-
-def _check_response(url, response) -> None:
-    """Raise unless `response` carries the requested file. See _error_page_reason()."""
-    reason = _error_page_reason(url, response.headers.get("content-type", ""))
-    if reason is not None:
-        raise RuntimeError(f"HTTP {response.status_code}: {reason}")
-    if not response.ok:
-        if not response.headers.get("content-type"):
-            # A bad status with nothing to identify the body is just a bad status.
-            response.raise_for_status()
-        # A body that survived the check above is the file, mislabelled. Say so once,
-        # loudly, because "downloaded 404s" is otherwise indistinguishable from a bug.
-        logger.warning(
-            f"HTTP {response.status_code} for {url}, but the body is "
-            f"{response.headers.get('content-type')} and not an error page -- keeping it."
-        )
-
-
-def download_file(url, proxy, user_agents, progress_queue=None, preserve_path=False):
-    """
-    Download a single file with requests, streaming, ignoring HTTPS cert.
-    """
-    proxies = make_proxies(proxy)
-    ua = random_user_agent(user_agents)
-    out_path = url_to_local_path(url, DOWNLOAD_DIR, preserve_path=preserve_path)
-    out_dir = os.path.dirname(out_path)
-    os.makedirs(out_dir, exist_ok=True)
-
-    # The body streams into a private temp file in the destination directory and is
-    # only moved into place once it has arrived complete. Writing straight to
-    # `out_path` was wrong in two ways that both silently destroyed finished work:
-    # the open() truncated any existing file before a single byte had been read, so a
-    # mid-body timeout left a stub where a good file used to be, and the failure
-    # handler then unlinked `out_path` unconditionally -- deleting whatever was there
-    # even when this attempt had never written to it. Under the flat naming layout
-    # those are not hypothetical: several distinct URLs map to one path, so a retry
-    # that times out on `.../v3/Thumbs.db` would wipe the `.../v1/Thumbs.db` that had
-    # already downloaded cleanly. os.replace() is atomic, so concurrent writers to one
-    # path now leave a whole file from one of them rather than the interleaved bytes
-    # of both.
-    tmp_path = None
-    try:
-        with requests.get(url, proxies=proxies, timeout=TRANSFER_TIMEOUT,
-                          verify=False, stream=True, headers={"User-Agent": ua}) as r:
-            _check_response(url, r)
-            fd, tmp_path = tempfile.mkstemp(dir=out_dir, prefix=".oa-", suffix=".part")
-            os.chmod(tmp_path, _DOWNLOAD_MODE)
-            with os.fdopen(fd, "wb") as f:
-                for chunk in r.iter_content(CHUNK_SIZE):
-                    if chunk:
-                        f.write(chunk)
-                        if progress_queue:
-                            progress_queue.put(len(chunk))
-            os.replace(tmp_path, out_path)
-            tmp_path = None
-        logger.debug(f"[OK] {url} -> {out_path} (proxy={proxy})")
-        return True
-    except Exception as e:
-        logger.error(f"[ERR] Download failed for {url} on proxy={proxy}: {e}")
-        # Only ever removes this attempt's own partial file, never the destination.
-        if tmp_path is not None:
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
-        return False
-
-
-def _warn_on_path_collisions(urls, *, preserve_path: bool, base_dir: str = DOWNLOAD_DIR) -> int:
-    """Say up front how many URLs are about to overwrite each other, and why.
-
-    The flat layout names a download after its basename alone, so a list holding
-    `.../v1/Thumbs.db` and `.../v2/Thumbs.db` writes one file and keeps whichever
-    finished last. Every download still reports [OK], nothing reports an error, and
-    the only trace is that downloads/ ends up smaller than the URL list -- which is
-    exactly the shape of a bug that gets blamed on the URLs being wrong. A crawl
-    manifest is full of these (README.txt, Thumbs.db, Bild1.PNG in every directory),
-    so the count is worth a line in the log before the run rather than an
-    investigation after it.
-
-    Returns the number of URLs that would be lost.
-    """
-    mapping = {}
-    for url in urls:
-        mapping.setdefault(url_to_local_path(url, base_dir,
-                                             preserve_path=preserve_path), []).append(url)
-    clashes = {path: group for path, group in mapping.items() if len(group) > 1}
-    if not clashes:
-        return 0
-
-    lost = sum(len(group) - 1 for group in clashes.values())
-    logger.warning(
-        f"{lost} of {len(urls)} URL(s) map onto {len(clashes)} already-taken local "
-        f"path(s) and will overwrite each other; only {len(mapping)} file(s) can survive."
-    )
-    if not preserve_path:
-        logger.warning(
-            "Pass --preserve-path to mirror the remote directory tree under "
-            f"{base_dir}/<host>/ and keep all of them."
-        )
-    for path, group in list(clashes.items())[:5]:
-        logger.warning(f"  {os.path.relpath(path)} <- {len(group)} URLs, e.g. {group[0]}")
-    if len(clashes) > 5:
-        logger.warning(f"  ... and {len(clashes) - 5} more collision(s).")
-    return lost
-
-
-def multi_download_mode(urls, proxies, retries=DEFAULT_RETRIES, preserve_path=False):
-    """Download every URL in parallel, one worker per proxy.
-
-    `preserve_path` mirrors each URL's directories under downloads/<host>/ instead of
-    flattening to the basename; crawl mode's --download phase needs it, because a
-    crawled tree is full of same-named files in different directories.
-    """
-    logger.info(f"multi_download_mode: {len(urls)} URLs, {len(proxies)} proxies, retries={retries}")
-    _warn_on_path_collisions(urls, preserve_path=preserve_path)
-    user_agents = load_user_agents()
-    pool = ProxyPool(proxies)
-
-    q = queue.Queue()
-    for u in urls:
-        q.put(u)
-
-    progress_queue = queue.Queue()
-    stop_flag = threading.Event()
-
-    def progress_manager():
-        with tqdm(desc="Multi-Download", unit="B", unit_scale=True, total=None) as pbar:
-            while not stop_flag.is_set() or not progress_queue.empty():
-                try:
-                    chunk_size = progress_queue.get(timeout=0.2)
-                    pbar.update(chunk_size)
-                except queue.Empty:
-                    pass
-
-    pm_thread = threading.Thread(target=progress_manager, daemon=True)
-    pm_thread.start()
-
-    def worker_thread():
-        while True:
-            try:
-                url = q.get_nowait()
-            except queue.Empty:
-                break
-            # Inline retries — no re-queuing, which would deadlock if all workers
-            # exit with an empty queue before the retried item can be picked up.
-            # Each attempt draws a fresh proxy from the pool so a dead endpoint
-            # doesn't doom the URL.
-            last = None
-            for attempt in range(retries):
-                proxy = pool.acquire(exclude=last)
-                success = download_file(url, proxy, user_agents, progress_queue=progress_queue,
-                                        preserve_path=preserve_path)
-                if success:
-                    pool.mark_alive(proxy)
-                    logger.info(f"[OK] {url} (proxy={proxy})")
-                    break
-                pool.mark_dead(proxy)
-                last = proxy
-                if attempt < retries - 1:
-                    logger.warning(f"Retrying {url} ({attempt + 2}/{retries}) on a different proxy")
-            else:
-                logger.error(f"[FAIL] Giving up on {url} after {retries} attempts.")
-            q.task_done()
-
-    # Bound concurrency by the pool size (don't oversubscribe a single proxy) and
-    # by the URL count (extra workers would just exit on an empty queue).
-    n_workers = min(len(pool), len(urls))
-    threads = []
-    for _ in range(n_workers):
-        t = threading.Thread(target=worker_thread)
-        t.start()
-        threads.append(t)
-
-    q.join()
-    for t in threads:
-        t.join()
-
-    stop_flag.set()
-    pm_thread.join()
-    logger.info("multi_download_mode: completed")
-
-
-# =========== REMOTE FILE SIZE PROBE ===========
-
-# The lengths a response advertises only describe the file when the body is sent
-# as-is. Under any other Content-Encoding they describe the *compressed* transfer,
-# and feeding one of those to the range splitter would cut the file at the wrong
-# offsets. See _size_from_response().
-IDENTITY_ENCODINGS = {"", "identity"}
-
-
-class SizeProbe(NamedTuple):
-    """What a size probe learned about a URL.
-
-    `size is None` means undetermined, which is not the same as unreachable:
-    `reachable` says whether any probe got an answer out of the server at all.
-    """
-    size: Optional[int] = None
-    reachable: bool = False
-    source: str = ""
-    error: Optional[str] = None
-
-
-def _positive_int(value) -> Optional[int]:
-    """A header value as a positive int, or None if it isn't one.
-
-    Zero counts as undetermined on purpose: a HEAD-hostile server answering
-    "Content-Length: 0" is far more common than a genuinely empty file, and
-    treating it as unknown keeps the ladder walking instead of stopping there.
-    """
-    if value is None:
-        return None
-    text = str(value).strip()
-    if not text.isdigit():
-        return None
-    n = int(text)
-    return n if n > 0 else None
-
-
-def _size_from_content_length(headers) -> Optional[int]:
-    """Content-Length, which on a non-206 response is the size of the whole entity."""
-    return _positive_int(headers.get("content-length"))
-
-
-def _size_from_content_disposition(headers) -> Optional[int]:
-    """The optional `size` parameter of Content-Disposition.
-
-    `Message.get_param` is the stdlib's header parser, so quoting and the RFC 2231
-    form come for free and, unlike a "size=(digits)" regex, it will not read the 99
-    out of `filename="report-size=99.pdf"`. (`cgi.parse_header` would be the obvious
-    alternative and is gone in Python 3.13.)
-    """
-    raw = headers.get("content-disposition")
-    if not raw:
-        return None
-    msg = Message()
-    msg["Content-Disposition"] = raw
-    param = msg.get_param("size", header="content-disposition")
-    if isinstance(param, tuple):    # RFC 2231 form: (charset, language, value)
-        param = param[2]
-    return _positive_int(param)
-
-
-def _size_from_content_range(headers) -> Optional[int]:
-    """The total after the slash in `Content-Range: bytes 0-0/1048576`.
-
-    An unsatisfied range answers `bytes */0`, whose "*" is not a digit and is
-    rejected by _positive_int.
-    """
-    return _positive_int(headers.get("content-range", "").rsplit("/", 1)[-1])
-
-
-def _size_from_response(status, headers):
-    """The size a single response advertises, as (size, source); (None, "") if none.
-
-    A non-identity Content-Encoding disqualifies the whole response: every number it
-    carries then describes the compressed transfer rather than the file, and a body
-    that arrives encoded cannot be reassembled out of parallel ranges anyway.
-    Answering "unknown" routes the file to fallback_sequential_download(), which
-    handles it correctly, instead of letting the merge fail after every byte has
-    already been pulled over Tor.
-
-    On a 206 the Content-Length is the length of the returned range -- one byte for
-    our probe -- so the entity size has to come from Content-Range instead. Reading
-    Content-Length there would report every file as 1 byte.
-    """
-    encoding = headers.get("content-encoding", "").strip().lower()
-    if encoding not in IDENTITY_ENCODINGS:
-        logger.debug(f"Ignoring the sizes on a response sent with Content-Encoding: {encoding}")
-        return None, ""
-    if status == 206:
-        size = _size_from_content_range(headers)
-        if size:
-            return size, "Content-Range"
-    else:
-        size = _size_from_content_length(headers)
-        if size:
-            return size, "Content-Length"
-    size = _size_from_content_disposition(headers)
-    if size:
-        return size, "Content-Disposition size="
-    return None, ""
-
-
-def _probe(session, url, method, extra_headers=None, stream=False):
-    """Issue one probe request and return (status, lower-cased headers).
-
-    allow_redirects is passed explicitly because requests.head() defaults it to
-    False, and a redirect is not a 4xx -- so an unguarded HEAD happily reports the
-    redirect's empty body as the size of a file that downloads perfectly well.
-
-    The body is never touched on the streaming probes: closing an unconsumed
-    response tears the socket down instead of returning it to the pool, and that is
-    what stops the payload from being downloaded. The close sits in a finally so it
-    happens on every path out.
-    """
-    r = session.request(method, url, headers=extra_headers, stream=stream,
-                        timeout=TRANSFER_TIMEOUT, allow_redirects=True)
-    try:
-        return r.status_code, {k.lower(): v for k, v in r.headers.items()}
-    finally:
-        r.close()
-
-
-def probe_remote_size(url, proxy, ua=None) -> SizeProbe:
-    """Determine the size of `url` without downloading it.
-
-    Four sources of evidence, tried in this order and stopping at the first that
-    answers. They cost at most three requests, because the first two read the same
-    response:
-
-      1. Content-Length on a HEAD.
-      2. The `size=` parameter of that same response's Content-Disposition -- free,
-         since it shares the round trip.
-      3. Content-Range on a one-byte `Range: bytes=0-0` GET. A 206 gives the total
-         after the slash; a server that ignores the Range answers 200, and then its
-         Content-Length is the whole entity.
-      4. A plain streamed GET, aborted as soon as the headers are in. It earns its
-         place because a server that rejects *any* Range header with 501 never gets
-         an answer out of probe 3.
-
-    One Session covers all of them, so the proxy is dialled once rather than three
-    times, and its close() releases every socket on every exit path.
-    """
-    last_error = None
-    reachable = False
-
-    with requests.Session() as session:
-        session.proxies.update(make_proxies(proxy))
-        session.verify = False
-        if ua:
-            session.headers["User-Agent"] = ua
-
-        probes = (
-            ("HEAD", "HEAD", None, False),
-            ("range GET", "GET", {"Range": "bytes=0-0"}, True),
-            ("streamed GET", "GET", None, True),
-        )
-        for label, method, extra_headers, stream in probes:
-            try:
-                status, headers = _probe(session, url, method, extra_headers, stream)
-            except requests.exceptions.ConnectionError as e:
-                # Covers ProxyError and ConnectTimeout: the proxy or the endpoint is
-                # unreachable, so the remaining probes would fail the same way on the
-                # same proxy. Stop rather than spend another 2 x REQUEST_TIMEOUT.
-                logger.debug(f"{label} for {url} (proxy={proxy}) could not connect: {e}")
-                return SizeProbe(reachable=reachable, error=str(e))
-            except requests.RequestException as e:
-                # Read timeout, too many redirects, malformed response: this probe is
-                # out, but another method may still get an answer.
-                last_error = str(e)
-                logger.debug(f"{label} for {url} (proxy={proxy}) failed: {e}")
-                continue
-
-            if status >= 400:
-                # A 405 on HEAD or a 501/416 on Range is the very reason the later
-                # probes exist, so it isn't an error -- just move on.
-                last_error = f"HTTP {status}"
-                logger.debug(f"{label} for {url} returned HTTP {status}, trying the next probe")
-                continue
-
-            reachable = True
-            size, source = _size_from_response(status, headers)
-            if size:
-                logger.debug(f"{url}: size={size} B via {source} ({label})")
-                return SizeProbe(size=size, reachable=True, source=source)
-
-    logger.debug(f"No size for {url} after all probes (last error: {last_error})")
-    return SizeProbe(reachable=reachable, error=last_error)
-
-
-def get_remote_file_size(url, proxy, ua) -> Optional[int]:
-    """The size of `url` in bytes, or None if no probe could determine it."""
-    return probe_remote_size(url, proxy, ua).size
-
-
-# =========== PARTIAL-DOWNLOAD ===========
-
-
-def partial_download_chunk_to_file(url, start, end, proxy, ua, progress_queue, part_path):
-    proxies = make_proxies(proxy)
-    headers = {
-        "User-Agent": ua,
-        "Range": f"bytes={start}-{end}"
-    }
-    try:
-        with requests.get(url, proxies=proxies, timeout=TRANSFER_TIMEOUT,
-                          verify=False, stream=True, headers=headers) as r:
-            # Same check as the whole-file path: an error page accepted here is worse,
-            # because it is merged into the middle of the assembled file rather than
-            # sitting alone under a wrong name.
-            _check_response(url, r)
-            with open(part_path, "wb") as f:
-                for chunk in r.iter_content(CHUNK_SIZE):
-                    if chunk:
-                        f.write(chunk)
-                        progress_queue.put(len(chunk))
-        return True
-    except Exception as e:
-        logger.error(f"Chunk {start}-{end} failed on proxy={proxy}: {e}")
-        if os.path.exists(part_path):
-            os.remove(part_path)
-        return False
-
-
-def fallback_sequential_download(url, out_path, user_agent, proxy, progress_queue):
-    # Staged through a temp file and moved into place on success, for the reasons
-    # spelled out in download_file(): this is the retry path, so `out_path` may
-    # already hold a complete file from an earlier attempt, and truncating it up
-    # front means a failure here destroys that instead of merely not improving on it.
-    proxies = make_proxies(proxy)
-    out_dir = os.path.dirname(out_path) or "."
-    os.makedirs(out_dir, exist_ok=True)
-    tmp_path = None
-    try:
-        with requests.get(url, proxies=proxies, timeout=TRANSFER_TIMEOUT,
-                          verify=False, stream=True, headers={"User-Agent": user_agent}) as r:
-            _check_response(url, r)
-            total_downloaded = 0
-            fd, tmp_path = tempfile.mkstemp(dir=out_dir, prefix=".oa-", suffix=".part")
-            os.chmod(tmp_path, _DOWNLOAD_MODE)
-            with os.fdopen(fd, "wb") as f, tqdm(
-                desc=f"Fallback seq: {os.path.basename(out_path)}",
-                total=None, unit="B", unit_scale=True
-            ) as pbar:
-                for chunk in r.iter_content(CHUNK_SIZE):
-                    if chunk:
-                        f.write(chunk)
-                        chunk_len = len(chunk)
-                        total_downloaded += chunk_len
-                        pbar.update(chunk_len)
-                        if progress_queue:
-                            progress_queue.put(chunk_len)
-            os.replace(tmp_path, out_path)
-            tmp_path = None
-        logger.info(f"[SEQUENTIAL OK] {url} -> {out_path}, size={total_downloaded} B")
-        return True
-    except Exception as e:
-        logger.error(f"Fallback sequential download failed for {url}: {e}")
-        if tmp_path is not None:
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
-        return False
-
-
-def partial_download_file(url, pool, user_agents, preserve_path=False):
-    final_path = url_to_local_path(url, PARTIAL_DOWNLOAD_DIR, preserve_path=preserve_path)
-    os.makedirs(os.path.dirname(final_path), exist_ok=True)
-
-    # Probe for the size on a single pooled proxy. A server that won't disclose one
-    # is a server trait, not a proxy fault, so we don't mark the proxy dead here.
-    ua_probe = random_user_agent(user_agents)
-    size = get_remote_file_size(url, pool.acquire(), ua_probe)
-    if not size or size < 1:
-        logger.warning(f"Could not determine the size of {url}, fallback to sequential.")
-        return fallback_sequential_download(url, final_path, ua_probe, pool.acquire(), progress_queue=None)
-
-    # Cap chunks at the proxy count, and don't split finer than
-    # MIN_PARTIAL_CHUNK_SIZE. Guarantees 1 <= n_chunks <= size, so chunk_size is
-    # always >= 1 (no degenerate ranges) and tiny files aren't over-split.
-    n_chunks = min(len(pool), max(1, size // MIN_PARTIAL_CHUNK_SIZE))
-    logger.info(f"[PARTIAL] {url} => size={size} bytes, {n_chunks} chunk(s)")
-
-    chunk_size = size // n_chunks
-    ranges = []
-    for i in range(n_chunks):
-        start = i * chunk_size
-        end = size - 1 if i == n_chunks - 1 else start + chunk_size - 1
-        ranges.append((start, end))
-
-    progress_queue = queue.Queue()
-    stop_flag = threading.Event()
-
-    def progress_manager():
-        with tqdm(total=size, desc=f"Partial: {os.path.basename(final_path)}", unit="B", unit_scale=True) as pbar:
-            while not stop_flag.is_set() or not progress_queue.empty():
-                try:
-                    chunk_len = progress_queue.get(timeout=0.2)
-                    pbar.update(chunk_len)
-                except queue.Empty:
-                    pass
-
-    pm_thread = threading.Thread(target=progress_manager, daemon=True)
-    pm_thread.start()
-
-    chunk_paths = [None] * n_chunks
-
-    def chunk_worker(i):
-        start, end = ranges[i]
-        part_file = f"{final_path}.part{i}"
-        last = None
-        for attempt in range(DEFAULT_RETRIES):
-            # Draw a fresh proxy each attempt so a dead endpoint doesn't fail the
-            # whole file — the chunk simply retries through a different proxy.
-            proxy = pool.acquire(exclude=last)
-            ua = random_user_agent(user_agents)
-            ok = partial_download_chunk_to_file(url, start, end, proxy, ua, progress_queue, part_file)
-            if ok:
-                pool.mark_alive(proxy)
-                chunk_paths[i] = part_file
-                return
-            pool.mark_dead(proxy)
-            last = proxy
-            if attempt < DEFAULT_RETRIES - 1:
-                logger.warning(f"Chunk {i} retry {attempt + 2}/{DEFAULT_RETRIES} on a different proxy")
-
-    threads = []
-    for i in range(n_chunks):
-        t = threading.Thread(target=chunk_worker, args=(i,))
-        t.start()
-        threads.append(t)
-
-    for t in threads:
-        t.join()
-
-    stop_flag.set()
-    pm_thread.join()
-
-    if any(cp is None for cp in chunk_paths):
-        logger.error(f"[FAIL] Some chunk failed for {url}. Removing partials.")
-        for cp in chunk_paths:
-            if cp and os.path.exists(cp):
-                os.remove(cp)
-        if os.path.exists(final_path):
-            os.remove(final_path)
-        return False
-
-    total_merged = 0
-    try:
-        with open(final_path, "wb") as outf:
-            for cp in chunk_paths:
-                with open(cp, "rb") as cf:
-                    data = cf.read()
-                    outf.write(data)
-                    total_merged += len(data)
-    except Exception as e:
-        logger.error(f"Merge failed: {e}")
-        return False
-
-    for cp in chunk_paths:
-        if os.path.exists(cp):
-            os.remove(cp)
-
-    if total_merged != size:
-        logger.error(f"Merged size mismatch: {total_merged} != {size}, removing final.")
-        if os.path.exists(final_path):
-            os.remove(final_path)
-        return False
-
-    logger.info(f"[OK] Partial done: {final_path} ({total_merged} bytes)")
-    return True
-
-
-def partial_download_mode(urls, proxies, retries=DEFAULT_RETRIES, preserve_path=False):
-    logger.info(f"partial_download_mode: {len(urls)} URLs, {len(proxies)} proxies, retries={retries}")
-    _warn_on_path_collisions(urls, preserve_path=preserve_path, base_dir=PARTIAL_DOWNLOAD_DIR)
-    user_agents = load_user_agents()
-    pool = ProxyPool(proxies)
-
-    for idx, url in enumerate(urls, start=1):
-        logger.info(f"\n[{idx}/{len(urls)}] Partial: {url}")
-        success = False
-        attempts_left = retries
-        while attempts_left > 0 and not success:
-            success = partial_download_file(url, pool, user_agents,
-                                            preserve_path=preserve_path)
-            if not success:
-                attempts_left -= 1
-                if attempts_left > 0:
-                    logger.warning(f"Retrying partial for {url}, left={attempts_left}")
-                    time.sleep(2)
-        if not success:
-            logger.error(f"[FAIL] partial-download {url} after {retries} attempts.")
-
-    logger.info("partial_download_mode: completed")
-
-
 # =========== SPEEDTEST + availability check ===========
 
 def test_proxy_speed(url: str, proxy: str, ua) -> dict:
@@ -1158,207 +343,6 @@ def speedtest_mode(urls, proxies):
     logger.info("[DONE] Speedtest + availability check.\n")
 
 
-# =========== NATIVE TOR FARM ===========
-
-def assert_farm_name(name):
-    """
-    Guard: only ever mutate instances that belong to the farm.
-
-    Raises ValueError unless `name` matches FARM_RE (e.g. 'oa07') and is not one
-    of the reserved instance names. Every privileged mutation (config write,
-    systemctl stop/disable, directory removal) routes through here so the farm
-    can never touch a user's own relay/client instance.
-    """
-    if name in FARM_RESERVED or not FARM_RE.match(name):
-        raise ValueError(f"Refusing to operate on non-farm Tor instance: {name!r}")
-    return name
-
-
-def _run(cmd, check=True):
-    """Run a command, prefixing sudo when not already root. Returns CompletedProcess."""
-    if os.geteuid() != 0:
-        cmd = ["sudo"] + cmd
-    logger.debug(f"exec: {' '.join(cmd)}")
-    return subprocess.run(cmd, check=check, text=True,
-                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-
-
-def _write_root_file(path, content):
-    """Write `content` to `path` with root privileges (via tee), 0644."""
-    if os.geteuid() != 0:
-        subprocess.run(["sudo", "tee", path], input=content, text=True,
-                       check=True, stdout=subprocess.DEVNULL)
-    else:
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(content)
-
-
-def farm_instance_name(index):
-    return f"{TOR_INSTANCE_PREFIX}{index:02d}"
-
-
-def farm_preflight():
-    """Abort early with a clear message if the native tooling isn't available."""
-    if sys.platform != "linux":
-        logger.error("--farm requires Linux (native tor-instance-create + systemd).")
-        sys.exit(1)
-    missing = [t for t in ("tor-instance-create", "systemctl") if not shutil.which(t)]
-    if missing:
-        logger.error(f"Missing required tool(s): {', '.join(missing)}. "
-                     f"Install the 'tor' package (Debian/Ubuntu).")
-        sys.exit(1)
-
-
-def render_torrc(name, port):
-    """Client-only torrc for a farm instance bound to 127.0.0.1:<port>."""
-    return (
-        "# MANAGED BY OnionAccelerator (--farm). Regenerated on every 'up'; edits are lost.\n"
-        f"# Farm instance {name}: client-only SOCKS proxy, no relay descriptor published.\n"
-        f"SocksPort 127.0.0.1:{port}\n"
-        "ClientOnly 1\n"
-        "AvoidDiskWrites 1\n"
-        "SafeLogging 1\n"
-        f"Log notice file {TOR_LIB_DIR}/{name}/notices.log\n"
-    )
-
-
-def bootstrap_percent(name):
-    """Parse the newest 'Bootstrapped NN%' line from an instance's notices.log."""
-    log_path = f"{TOR_LIB_DIR}/{name}/notices.log"
-    try:
-        res = _run(["tail", "-n", "200", log_path], check=False)
-    except Exception:
-        return 0
-    pct = 0
-    for line in res.stdout.splitlines():
-        m = re.search(r"Bootstrapped (\d+)%", line)
-        if m:
-            pct = int(m.group(1))
-    return pct
-
-
-def wait_bootstrap(names, base_port, timeout=BOOTSTRAP_TIMEOUT):
-    """Wait until every instance reports Bootstrapped 100% (or times out)."""
-    logger.info(f"Waiting for {len(names)} instance(s) to bootstrap (timeout {timeout}s each)...")
-    deadline = time.time() + timeout
-    pending = set(names)
-    done = set()
-    with tqdm(total=len(names), desc="Bootstrapping", unit="inst") as pbar:
-        while pending and time.time() < deadline:
-            for name in list(pending):
-                idx = int(name[len(TOR_INSTANCE_PREFIX):])
-                port = base_port + idx
-                if bootstrap_percent(name) >= 100 and _port_is_open("127.0.0.1", port):
-                    pending.discard(name)
-                    done.add(name)
-                    pbar.update(1)
-            if pending:
-                time.sleep(1)
-    if pending:
-        logger.warning(f"Timed out waiting on: {', '.join(sorted(pending))}. "
-                       f"Check 'systemctl status tor@<name>' / their notices.log.")
-    logger.info(f"{len(done)}/{len(names)} instance(s) bootstrapped and listening.")
-    return done
-
-
-def farm_up(count, base_port, timeout=BOOTSTRAP_TIMEOUT):
-    farm_preflight()
-    if count > MAX_WORKERS:
-        logger.warning(f"count={count} exceeds MAX_WORKERS={MAX_WORKERS}; "
-                       f"the download modes will only use the first {MAX_WORKERS}.")
-    logger.info(f"Bringing up {count} Tor instance(s) on 127.0.0.1:{base_port}-{base_port + count - 1}")
-    names = []
-    for i in range(count):
-        name = assert_farm_name(farm_instance_name(i))
-        port = base_port + i
-        inst_dir = os.path.join(TOR_INSTANCES_DIR, name)
-        if not os.path.isdir(inst_dir):
-            logger.info(f"[{name}] creating instance")
-            _run(["tor-instance-create", name])
-        else:
-            logger.info(f"[{name}] already exists, refreshing config")
-        _write_root_file(os.path.join(inst_dir, "torrc"), render_torrc(name, port))
-        _run(["systemctl", "enable", "--now", f"tor@{name}"])
-        names.append(name)
-    wait_bootstrap(names, base_port, timeout=timeout)
-    logger.info("Farm is up. Run a download mode, e.g. "
-                "'python3 OnionAccelerator.py --mode multi'.")
-
-
-def farm_instances_on_disk():
-    """Return sorted names of farm instances (oa*) that exist under /etc/tor/instances."""
-    found = []
-    for path in glob.glob(os.path.join(TOR_INSTANCES_DIR, f"{TOR_INSTANCE_PREFIX}*")):
-        name = os.path.basename(path)
-        if FARM_RE.match(name) and name not in FARM_RESERVED:
-            found.append(name)
-    return sorted(found)
-
-
-def systemd_active(name):
-    res = _run(["systemctl", "is-active", f"tor@{name}"], check=False)
-    return res.stdout.strip()
-
-
-def farm_status(base_port):
-    names = farm_instances_on_disk()
-    if not names:
-        logger.info("No farm instances found. Create some with '--farm up'.")
-        return
-    logger.info(f"=== FARM STATUS ({len(names)} instance(s)) ===")
-    for name in names:
-        idx = int(name[len(TOR_INSTANCE_PREFIX):])
-        port = base_port + idx
-        state = systemd_active(name)
-        listening = _port_is_open("127.0.0.1", port)
-        pct = bootstrap_percent(name)
-        mark = "✅" if (state == "active" and listening and pct >= 100) else "⚠️"
-        logger.info(f"{mark} {name}: systemd={state}, socks=127.0.0.1:{port} "
-                    f"({'listening' if listening else 'down'}), bootstrap={pct}%")
-
-
-def farm_down():
-    names = farm_instances_on_disk()
-    if not names:
-        logger.info("No farm instances to stop.")
-        return
-    for name in names:
-        assert_farm_name(name)
-        logger.info(f"[{name}] stopping")
-        _run(["systemctl", "disable", "--now", f"tor@{name}"], check=False)
-    logger.info(f"Stopped {len(names)} instance(s). Configs/data kept (use '--farm destroy' to purge).")
-
-
-def farm_destroy():
-    farm_preflight()
-    names = farm_instances_on_disk()
-    if not names:
-        logger.info("No farm instances to destroy.")
-        return
-    logger.warning(f"Destroying {len(names)} farm instance(s): {', '.join(names)}")
-    for name in names:
-        assert_farm_name(name)
-        _run(["systemctl", "disable", "--now", f"tor@{name}"], check=False)
-        for d in (os.path.join(TOR_INSTANCES_DIR, name),
-                  os.path.join(TOR_LIB_DIR, name),
-                  os.path.join(TOR_RUN_DIR, name)):
-            if os.path.exists(d):
-                _run(["rm", "-rf", d], check=False)
-        logger.info(f"[{name}] removed")
-    logger.info("Farm destroyed. Your own (non-farm) Tor instances were left untouched.")
-
-
-def run_farm_action(action, count, base_port, timeout):
-    if action == "up":
-        farm_up(count, base_port, timeout=timeout)
-    elif action == "status":
-        farm_status(base_port)
-    elif action == "down":
-        farm_down()
-    elif action == "destroy":
-        farm_destroy()
-
-
 # =========== REMOTE ARCHIVE TREE (--mode tree) ===========
 # rvtree lists and extracts members of a huge remote archive (.rar, .tar, .zip, .7z,
 # .tar.xz) using HTTP Range requests instead of downloading it. It ships in
@@ -1382,13 +366,22 @@ LOCAL_TOR_SOCKS = "127.0.0.1:9150"   # a personal Tor client, used when no farm 
 
 
 def _import_rvtree():
-    """Import rvtree from remote_viewer/, or explain why it could not be used."""
+    """Import rvtree, or explain why it could not be used.
+
+    An installed rvtree (`pip install .` bundles it) wins. Only when none is importable
+    does an uninstalled checkout fall back to the copy in remote_viewer/ beside this file.
+    """
     here = os.path.dirname(os.path.abspath(__file__))
     pkg_dir = os.path.join(here, RVTREE_DIR)
-    if os.path.isdir(os.path.join(pkg_dir, "rvtree")) and pkg_dir not in sys.path:
-        sys.path.insert(0, pkg_dir)
     try:
-        from rvtree import cli as rvtree_cli
+        try:
+            from rvtree import cli as rvtree_cli
+        except ModuleNotFoundError as e:
+            if e.name != "rvtree" or not os.path.isdir(os.path.join(pkg_dir, "rvtree")):
+                raise
+            if pkg_dir not in sys.path:
+                sys.path.insert(0, pkg_dir)
+            from rvtree import cli as rvtree_cli
         from rvtree.transport import PooledTransport
         return rvtree_cli, PooledTransport
     except ImportError as e:
@@ -1679,7 +672,7 @@ def _import_crawler():
         return crawler
     except ImportError as e:
         logger.error(f"--mode crawl needs the crawler package and its dependencies "
-                     f"({e}). Install them with 'pip install -r requirements.txt' "
+                     f"({e}). Install them with 'pip install -e .' from the checkout "
                      f"(aiohttp, aiohttp-socks, beautifulsoup4, lxml).")
         return None
 
@@ -1818,7 +811,7 @@ def list_profiles_mode(args):
         from crawler.listing.registry import describe, load_profiles
     except ImportError as e:
         logger.error(f"--list-profiles needs the crawler package ({e}). Install it with "
-                     f"'pip install -r requirements.txt'.")
+                     f"'pip install -e .' from the checkout.")
         return 1
     try:
         profiles = load_profiles(args.templates or [])
@@ -1841,6 +834,9 @@ def detect_mode(urls, proxies, args, sink=None):
             seeds=list(urls),
             circuits_per_endpoint=args.circuits_per_endpoint,
             max_page_bytes=args.max_page_bytes,
+            connect_timeout=args.connect_timeout,
+            read_timeout=args.read_timeout,
+            total_timeout=args.total_timeout,
             allow_offsite=args.allow_offsite,
             profile=args.profile,
             templates=list(args.templates or []),
@@ -1902,11 +898,15 @@ def crawl_mode(urls, proxies, args, sink=None):
             max_pages=args.max_pages,
             time_budget=args.time_budget,
             max_page_bytes=args.max_page_bytes,
+            connect_timeout=args.connect_timeout,
+            read_timeout=args.read_timeout,
+            total_timeout=args.total_timeout,
             allow_offsite=args.allow_offsite,
             include=pkg.CrawlConfig.compile_filter(args.include),
             exclude=pkg.CrawlConfig.compile_filter(args.exclude),
             switch_after=args.switch_after,
             download=args.download,
+            resume=args.resume,
             profile=args.profile,
             templates=list(args.templates or []),
             stream_bodies=args.stream_bodies,
@@ -2013,6 +1013,14 @@ def build_parser():
     parser.add_argument("--bootstrap-timeout", type=int, default=BOOTSTRAP_TIMEOUT,
                         help=f"Seconds to wait for each instance to bootstrap on "
                              f"'--farm up' (default {BOOTSTRAP_TIMEOUT}).")
+    parser.add_argument("--farm-tune", choices=list(FARM_TUNE_PROFILES), default=None,
+                        help="torrc tuning for '--farm up' (default off). 'onion' adds "
+                             "ExtendedErrors, so a crawl can tell a dead onion from a dead "
+                             "circuit, no dormancy and warm circuits between jobs, and a "
+                             "per-instance memory cap -- all rated Safe. 'onion-aggressive' "
+                             "adds MaxCircuitDirtiness 1800, a linkability trade-off. "
+                             "Instances whose torrc changes are reloaded, or restarted "
+                             "one at a time if their SocksPort line changed.")
     parser.add_argument("--retries", type=int, default=DEFAULT_RETRIES,
                         help="Number of retries for download failures.")
     parser.add_argument("--preserve-path", action="store_true",
@@ -2082,6 +1090,33 @@ def build_parser():
                                  "and record the fetch as a failure (default 16 MiB). One "
                                  "directory of a leaked fileshare can be thousands of "
                                  "rows, so raise this rather than lose its subtree.")
+    crawl_opts.add_argument("--connect-timeout", type=float,
+                            default=crawler_default("CONNECT_TIMEOUT", 90.0),
+                            help="Seconds to establish a connection, including the Tor "
+                                 "rendezvous (default 90). Raise it for a slow onion: a "
+                                 "rendezvous that needs longer than this is reported as a "
+                                 "dead host when it is only a distant one.")
+    crawl_opts.add_argument("--read-timeout", type=float,
+                            default=crawler_default("READ_TIMEOUT", 180.0),
+                            help="Seconds the server may go silent mid-response before the "
+                                 "fetch is abandoned (default 180). This is the one to raise "
+                                 "on a slow target: set below its normal response time, every "
+                                 "listing times out and each miss costs a whole subtree.")
+    crawl_opts.add_argument("--total-timeout", type=float,
+                            default=crawler_default("TOTAL_TIMEOUT", 300.0),
+                            help="Seconds for one whole request, connect and read together "
+                                 "(default 300). Keep it above --connect-timeout plus "
+                                 "--read-timeout or it caps them both.")
+    crawl_opts.add_argument("--resume", metavar="JOB_DIR", default=None,
+                            help="Continue a previous crawl from its output directory, "
+                                 "e.g. crawls/20260908_110133_bfiyq8. Its frontier "
+                                 "journal is replayed first: directories it finished are "
+                                 "not fetched again, and the ones it discovered but never "
+                                 "reached are queued, along with any subtree it gave up "
+                                 "on. Use it when a target goes offline mid-crawl -- "
+                                 "without it a restart re-walks the same shallow layers "
+                                 "and never gets deeper. The new run writes its own "
+                                 "journal, so resume from the newest directory each time.")
     crawl_opts.add_argument("--include", default=None,
                             help="Only crawl directory URLs matching this regex.")
     crawl_opts.add_argument("--exclude", default=None,
@@ -2252,9 +1287,14 @@ def main(argv=None):
                      "daemons and discovers nothing. It applies to --mode crawl, "
                      "--mode tree and --detect.")
 
+    if args.farm_tune and args.farm != "up":
+        parser.error("--farm-tune only applies to '--farm up', which is what writes the "
+                     "torrc; '--farm status' shows the profile each instance runs.")
+
     # Farm management needs no URL list; run the action and exit.
     if args.farm:
-        run_farm_action(args.farm, args.count, args.base_port, args.bootstrap_timeout)
+        run_farm_action(args.farm, args.count, args.base_port, args.bootstrap_timeout,
+                        tune=args.farm_tune or "off")
         logger.info("OnionAccelerator farm action finished.")
         return
 
@@ -2333,6 +1373,48 @@ def main(argv=None):
         speedtest_mode(urls, proxies)
 
     logger.info("OnionAccelerator finished successfully.")
+
+
+# =========== RE-EXPORT FORWARDING ===========
+# The download modes, the size probe and the farm moved to oacore/, but tests and older
+# callers patch them here: `monkeypatch.setattr(oa, "_probe", ...)`. A plain re-export
+# would quietly defeat that -- the patch would rebind this module's copy of the name
+# while probe_remote_size() kept calling the one in oacore.sizeprobe, and the test would
+# go on passing against the real network code it meant to replace. So a write to a
+# re-exported name is forwarded to every oacore module that holds the same object
+# under the same name, and monkeypatch's undo is a write too. tests/test_facade.py
+# patches each forwarded name and checks the defining module sees it.
+_MOVED_MODULES = (_config, _common, _sizeprobe, _download, _farm)
+
+
+def _forwarding_table():
+    table = {}
+    for module in _MOVED_MODULES:
+        for name, obj in vars(module).items():
+            if name.startswith("__") or isinstance(obj, types.ModuleType):
+                continue
+            if name in globals() and globals()[name] is obj:
+                table.setdefault(name, []).append(module)
+    return table
+
+
+_FORWARDED = _forwarding_table()
+
+
+class _Facade(types.ModuleType):
+    def __setattr__(self, name, value):
+        for module in _FORWARDED.get(name, ()):
+            setattr(module, name, value)
+        super().__setattr__(name, value)
+
+    def __delattr__(self, name):
+        for module in _FORWARDED.get(name, ()):
+            if name in vars(module):
+                delattr(module, name)
+        super().__delattr__(name)
+
+
+sys.modules[__name__].__class__ = _Facade
 
 
 if __name__ == "__main__":
