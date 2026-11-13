@@ -104,13 +104,20 @@ end. See **Live Streaming API** below.
 
 ## Installation
 
-1. **Install Python 3** (3.7+ recommended).
+1. **Install Python 3.11 or newer.**
 
-2. **Install dependencies:**
+2. **Install OnionAccelerator** from the checkout, into a virtualenv:
 
     ```bash
-    pip install -r requirements.txt
+    python3 -m venv .venv && . .venv/bin/activate
+    pip install -e .
     ```
+
+    This installs the `onionaccelerator` command along with every dependency, and
+    `rvtree` (for `--mode tree`) with it. `onionaccelerator ARGS` and
+    `python3 OnionAccelerator.py ARGS` are the same program; the examples below use the
+    second form, which also runs from an uninstalled checkout whose dependencies are
+    already present. Add `[dev]` (`pip install -e '.[dev]'`) for pytest and ruff.
 
 3. **Ensure you have multiple SOCKS5 proxies** (e.g., Tor instances on ports `5000..5019`). The easiest way is the built-in native farm — `python3 OnionAccelerator.py --farm up` (see **Native Tor Farm** below) — or bring your own proxies / Docker.
 
@@ -772,7 +779,8 @@ as they would to a run started by hand.
 
 ## Project Structure
 
-- `OnionAccelerator.py`: The main script containing all modes (multi-download, partial-download, speedtest, tree, crawl).
+- `OnionAccelerator.py`: The command line, speedtest, proxy discovery and the glue for tree, crawl and stream. Installed as the `onionaccelerator` command.
+- `oacore/`: The download modes (`download.py`), the remote size probe (`sizeprobe.py`), the native farm (`farm.py`) and the settings and helpers they share. `OnionAccelerator.py` re-exports all of it.
 - `remote_viewer/`: The `rvtree` package behind `--mode tree`. Usable on its own too — see its own README.
 - `crawler/`: The asyncio package behind `--mode crawl` — multi-circuit proxy pool, frontier, fetcher and reporting. The only async code in the project; the other modes stay on threads over `requests`.
 - `crawler/listing/`: The scraping layer, with no crawl in it: the structural reader, the JSON/XML/row/manifest strategies, the addressing rules, and the template engine behind `--profile` and `--detect`. Adding support for a target is a file in `crawler/listing/templates/`, not a change to the crawler — see that directory's [README](crawler/listing/templates/README.md).
@@ -780,7 +788,7 @@ as they would to a run started by hand.
 - `contrib/streamhunt.py`: A reference consumer of that stream: keyword hunting with reconnect and gap accounting, in stdlib Python.
 - `contrib/sensor.py`: Polls a target with `--detect` until it looks live, then `--resume`s the newest job under `crawls/` at it.
 - `fullhelp.py`: The long-form per-mode reference printed by `--full-help`. Pure prose and stdlib, imported eagerly precisely because it can never fail.
-- `requirements.txt`: Python dependencies.
+- `pyproject.toml`: Packaging, dependency floors, and the pytest and ruff configuration.
 - `URLs.txt`: A text file with one URL per line. Optional — `--url` replaces it.
 - `UserAgents.tsv`: Tab-separated file; first column is the User-Agent string.
 - `logs/`: A directory automatically created to store timestamped log files.
@@ -790,10 +798,12 @@ as they would to a run started by hand.
 
 ## Requirements
 
-- Python 3.7+ (3.8+ for `--mode crawl`, which is `aiohttp`'s own floor; 3.11+ for its listing templates, which are TOML read with the standard library's `tomllib` — on 3.8–3.10 install `tomli`)
-- `requests[socks]` or `PySocks` for SOCKS5 support
+- Python 3.11+, for every mode. The crawler's listing templates are TOML read with the standard library's `tomllib`.
+- `requests` and `PySocks` for SOCKS5 support
 - `tqdm` for progress bars
-- `aiohttp`, `aiohttp-socks`, `beautifulsoup4`, `lxml` — `--mode crawl` only; the other modes run without them
+- `aiohttp`, `aiohttp-socks`, `beautifulsoup4`, `lxml` — used by `--mode crawl` and `--detect` only. `pip install` brings them anyway, but they are imported lazily, so the other modes still run on a host where they fail to import.
+
+The version floors are in `pyproject.toml`. CI tests them as written, on the oldest supported Python.
 
 ## Native Tor Farm (`--farm`)
 

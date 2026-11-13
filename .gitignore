@@ -34,3 +34,5 @@ contrib/sensor.py
 # The torrc tuning guide --farm-tune was drawn from: a personal research write-up,
 # kept locally as reference. The README records what was taken from it and why.
 Tor Client Performance Tuning torrc, Circuits, and the Stack Beneath.md
+build/
+dist/
