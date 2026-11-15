@@ -31,7 +31,7 @@ def run(db, *argv, hooks=None):
 def test_ingest_reports_what_it_added_and_is_idempotent(db, tmp_path):
     job = write_crawl_dir(tmp_path, "run1", files=FILES)
     code, out, _ = run(db, "ingest", job)
-    assert code == 0 and "run1" in out and "6 new" in out and "hit" in out
+    assert code == 0 and "run1" in out and "7 new" in out and "hit" in out
     code, out, _ = run(db, "ingest", job)
     assert code == 0 and "0 new" in out
 
@@ -95,9 +95,11 @@ def test_search_and_hits_and_runs_and_target(db, tmp_path):
     assert json.loads(out)[0]["label"] == "Case 12"
 
 
-def test_a_malformed_search_is_a_usage_error_not_a_traceback(db, tmp_path):
+def test_a_path_is_a_valid_search_and_a_malformed_raw_query_is_a_usage_error(db, tmp_path):
     run(db, "ingest", write_crawl_dir(tmp_path, "run1", files=FILES))
-    code, _, err = run(db, "search", '"unterminated')
+    code, out, _ = run(db, "search", "/hr/payroll-2024")
+    assert code == 0 and "/hr/payroll_2024.xlsx" in out
+    code, _, err = run(db, "search", "--fts", '"unterminated')
     assert code == 2 and "search" in err.lower()
 
 
@@ -143,6 +145,18 @@ def test_fetch_dry_run_lists_without_downloading(db, tmp_path):
         out_dir=str(tmp_path / "dl"), engine_options={})
     code, out, _ = run(db, "fetch", "--min-score", "50", "--dry-run", hooks=hooks)
     assert code == 0 and called == [] and "/it/id_rsa" in out and "would fetch" in out
+
+
+def test_fetch_with_no_proxy_is_an_error_message_not_a_traceback(db, tmp_path):
+    run(db, "ingest", write_crawl_dir(tmp_path, "run1", files=FILES))
+
+    def no_proxies(*a, **k):
+        raise RuntimeError("no usable SOCKS5 proxy: start a farm")
+
+    hooks = types.SimpleNamespace(download=no_proxies, extract=no_proxies,
+                                  out_dir=str(tmp_path / "dl"), engine_options={})
+    code, _, err = run(db, "fetch", "--min-score", "50", hooks=hooks)
+    assert code == 1 and "no usable SOCKS5 proxy" in err
 
 
 def test_fetch_requires_a_threshold(db):
