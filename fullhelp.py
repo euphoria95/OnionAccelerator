@@ -32,6 +32,7 @@ MODES = {
     "speedtest": "measure every proxy and check the URLs are reachable",
     "tree": "list or extract members of a huge remote archive without downloading it",
     "crawl": "walk an open directory recursively and write a manifest of every file",
+    "index": "keep every listing in one searchable, scored index; diff it; fetch the hits",
 }
 
 EXIT_CODES = (
@@ -499,6 +500,128 @@ SECTIONS = {
             "3.8+. The other modes run without any of them.",
         ],
     },
+    "index": {
+        "what": [
+            "Keeps what crawls and archive walks found in one SQLite file, so the question "
+            "changes from \"what is on this site\" to \"what is new, and what touches us\". "
+            "Every path is stored once per target, with the runs that saw it, scored by rule "
+            "packs and by your own scope.toml, searchable by the words in the path, and "
+            "diffable between two sightings of a target. It makes no network request of its "
+            "own except 'live' (to a stream you name) and 'fetch' (through the download "
+            "engine, with the same proxy ladder as crawl and tree).",
+            "The file is --index, else $ONIONACCELERATOR_INDEX, else "
+            "~/.local/share/onionaccelerator/index.db: created 0600 in a 0700 directory "
+            "before SQLite sees it, in WAL mode, outside any repository. It is evidence -- "
+            "every path a leak site listed -- so treat it as such. A file that is not an "
+            "index, or that a newer version wrote, is refused untouched.",
+            "Ingest is idempotent: the same run twice, or an old run after a newer one, "
+            "changes nothing. An index built live from --stream and one built afterwards "
+            "from the same run's directory are row-for-row equal, because a stream event's "
+            "data is the record on disk and one code path reads both.",
+            "Scoring: rule packs for credential and key material, mail stores, directory-"
+            "service dumps, remote-access configs, database dumps, and HR, finance and "
+            "legal paths ship in index/packs/*.toml, each rule with a score from 1 to 100, "
+            "a reason, and example paths a test runs. Your own terms go in a scope.toml: "
+            "organisations, domains, suppliers (searched for as literal text) and regexes. "
+            "A hit stores the rule, the reason and the span of the path it matched. An "
+            "entry's score is its best hit.",
+            "Diff is honest about what it cannot know. A file is reported removed only "
+            "when its directory was listed again and it was not in it; a directory the "
+            "later crawl never reached (it was cut short, or gave up on it) leaves its "
+            "contents unknown, not removed. The index sees paths, not intent: a renamed "
+            "directory shows as the old one removed and the new one added, with the same "
+            "names and sizes on both sides.",
+        ],
+        "flags": [
+            ("ingest PATH... [--archive-url URL] [--job-id ID] [--partial] [--scope FILE]",
+             "A crawl directory (crawls/<job_id>/, read as listing.jsonl, dirs.jsonl and "
+             "stats.json, plus any <name>.oa.json custody records beneath it), or a file of "
+             "rvtree '-f ndjson' output, which needs --archive-url because rvtree does not "
+             "say which archive it walked. --partial marks a walk that was interrupted, so "
+             "a later diff does not read its gaps as removals. Runs are ordered by when "
+             "they were ingested: ingest oldest first."),
+            ("live --stream-url URL [--token T] [--reconcile DIR] [--follow]",
+             "Index a run as it happens, from its --stream. Reconnects from the last "
+             "sequence number; a different run on the same address is started from its "
+             "first event. If this consumer fell behind (stream.gap) the loss is reported "
+             "and, when the run's output directory can be read -- named with --reconcile, "
+             "or announced by the run's /status -- it is ingested after run.stop to fill "
+             "the holes. Exits at run.stop unless --follow."),
+            ("diff --target HOST [--since RUN] [--until RUN] [--format text|json]",
+             "Added (+), removed (-), resized (~) and unknown (?) between two sightings of "
+             "a target. By default the last two. A run that did not see the target is not "
+             "a sighting of it."),
+            ("search WORD... [--fts] [--limit N] [--target HOST] [--format text|json]",
+             "Paths containing every word, read the way the index reads paths: "
+             "/Backups/Payroll_2024.xlsx is the words backups, payroll and 2024, and a "
+             "trailing * is a prefix. --fts passes the query to SQLite FTS5 as it is "
+             "(phrases, OR, NOT)."),
+            ("hits [--min-score N] [--limit N] [--target HOST] [--explain] [--format text|json]",
+             "The best-scoring entries first. --explain prints every rule, why, and the "
+             "part of the path it matched."),
+            ("runs", "Every run the index knows, with when it ran and why it stopped."),
+            ("target HOST [--label L] [--group G] [--victim V]",
+             "Record what you know about a host, or show it. These travel with every hit "
+             "in an export."),
+            ("rescore [--scope FILE]",
+             "Apply the current rule packs and scope to everything already indexed. A term "
+             "you removed loses its hits."),
+            ("export --format jsonl|csv [--min-score N] [--target HOST] [--out FILE] [--force]",
+             "Hits with their rules, runs and download hashes. CSV cells a spreadsheet "
+             "would run as a formula (a leading = + - @) are prefixed with an apostrophe, "
+             "because every path was written by the server being investigated. --out is "
+             "created 0600 and not overwritten without --force."),
+            ("fetch --min-score N [--target HOST] [--limit N] [--again] [--dry-run] "
+             "[--max-fetch MiB]",
+             "Hand every file scoring at least N, best first, to the download engine; a "
+             "hit inside an archive goes to rvtree's extract instead, bounded by "
+             "--max-fetch (default 64 MiB), never downloading the whole archive. Files "
+             "already downloaded are skipped unless --again. --dry-run lists what would be "
+             "fetched. Custody records are linked back to the entry. --piece-size, "
+             "--retries, --fresh, --socks and --circuits-per-endpoint apply as for the "
+             "download modes."),
+            ("--index PATH",
+             "The index file (see above). Not an action option: it goes before the action."),
+            ("--scope FILE",
+             "Your scope.toml, for ingest, live and rescore. Default: "
+             "$ONIONACCELERATOR_SCOPE, else a scope.toml beside the index file if there is "
+             "one."),
+        ],
+        "examples": [
+            ("python3 OnionAccelerator.py --mode index ingest crawls/20261113_103000_ab12cd",
+             "index a finished crawl"),
+            ("python3 OnionAccelerator.py --mode crawl --url https://example.onion/ --stream &\n"
+             "python3 OnionAccelerator.py --mode index live --stream-url http://127.0.0.1:8787",
+             "index it as it runs"),
+            ("python3 OnionAccelerator.py --mode index ingest tree.ndjson \\\n"
+             "    --archive-url https://example.onion/dumps/backup.7z",
+             "index an rvtree listing"),
+            ("python3 OnionAccelerator.py --mode index diff --target example.onion",
+             "what changed since the last crawl of it?"),
+            ("python3 OnionAccelerator.py --mode index hits --min-score 60 --explain",
+             "what touches us, and why"),
+            ("python3 OnionAccelerator.py --mode index search payroll",
+             "every path with that word, across every target"),
+            ("python3 OnionAccelerator.py --mode index fetch --min-score 85 --dry-run",
+             "what would be pulled down"),
+            ("python3 OnionAccelerator.py --mode index export --format csv --min-score 60 \\\n"
+             "    --out case-12.csv",
+             "hand the hits to somebody"),
+        ],
+        "notes": [
+            "scope.toml:  [scope]  organisations = [\"Example Corp\"]  domains = "
+            "[\"example.test\"]  suppliers = [\"Widget Supply Ltd\"]  regexes = "
+            "['(?i)\\bPO-\\d{6}\\b']   [scope.scores]  organisations = 75.  Defaults are "
+            "70, 70, 50 and 60. A [[rule]] table (id, score, regex, reason, optional on = "
+            "\"name\") adds a rule of your own.",
+            "A regex with a repeat inside an unbounded repeat -- (a+)+ -- is refused when "
+            "the file loads: paths come from the server being investigated, and that shape "
+            "backtracks exponentially on input built for it. Only the last 1,024 characters "
+            "of a path are matched.",
+            "Standard library only. Nothing here needs aiohttp, requests or rvtree until "
+            "'fetch' runs.",
+        ],
+    },
 }
 
 FARM = {
@@ -678,6 +801,7 @@ crawling over a pool of SOCKS5 proxies (normally Tor), plus a native Tor-instanc
   python3 OnionAccelerator.py --mode multi|partial|speedtest [--url URL ...] [OPTIONS]
   python3 OnionAccelerator.py --mode tree [--url URL] [OPTIONS] [-- RVTREE ARGS...]
   python3 OnionAccelerator.py --mode crawl [--url URL ...] [OPTIONS]
+  python3 OnionAccelerator.py --mode index ACTION [ACTION OPTIONS] [--index PATH]
   python3 OnionAccelerator.py --farm up|status|down|destroy [OPTIONS]
 
 Exactly one of --mode or --farm is required. '--full-help MODE' narrows this reference to

@@ -516,6 +516,59 @@ def tree_mode(rv_args, proxies, retries=DEFAULT_RETRIES, sink=None):
                               "requests": transport.requests_made})
 
 
+# =========== PERSISTENT INDEX (--mode index) ===========
+# The index/ package: a SQLite store of every path a crawl or archive walk listed, with
+# rule-based scores, a diff between sightings, and a hand-off to the download engine. It
+# is standard library only, so unlike crawl and tree it cannot fail to import on a host
+# that has installed nothing; the shim exists to keep the failure message in one place.
+def _import_index():
+    try:
+        from index import cli as index_cli
+        return index_cli
+    except ImportError as e:                          # pragma: no cover - ships with this script
+        logger.error(f"--mode index needs the index package ({e}). Expected it next to "
+                     f"this script; it has no third-party dependencies.")
+        return None
+
+
+class IndexHooks:
+    """What `--mode index fetch` needs from the rest of the program, handed in so that the
+    index package itself never imports the download engine or a proxy list.
+
+    Endpoints are resolved once, on first use, the way tree and crawl resolve them (--socks,
+    --external, the farm probe, a local client): an action that only reads the index never
+    opens a socket. The engine options are the ones the download modes take, so
+    '--piece-size 8M --circuits-per-endpoint 4 fetch --min-score 70' means what it says.
+    """
+
+    def __init__(self, args):
+        self.args = args
+        self.out_dir = DOWNLOAD_DIR
+        self.engine_options = {
+            "retries": args.retries, "piece_size": args.piece_size, "fresh": args.fresh,
+            "circuits_per_endpoint": args.circuits_per_endpoint, "job_id": JOB_ID,
+        }
+        self._proxies = None
+
+    def _endpoints(self, urls):
+        if self._proxies is None:
+            self._proxies = resolve_crawl_endpoints(self.args, urls)
+            if not self._proxies:
+                raise RuntimeError("no usable SOCKS5 proxy: start a farm, or pass --socks "
+                                   "host:port or --external")
+        return self._proxies
+
+    def download(self, urls, **options):
+        return multi_download_mode(urls, self._endpoints(urls),
+                                   **{**self.engine_options, **options})
+
+    def extract(self, archive_url, member, dest, max_fetch_mib):
+        code = tree_mode(["extract", archive_url, member, "-o", dest,
+                          "--max-fetch", str(max_fetch_mib)],
+                         self._endpoints([archive_url]), retries=self.args.retries)
+        return code == 0
+
+
 # =========== STREAMING API (--stream) ===========
 
 # --stream publishes what a run finds, as it finds it, to an HTTP endpoint an external
@@ -1006,12 +1059,19 @@ def build_parser():
                "--full-help MODE narrows it to one."
     )
     parser.add_argument("--mode", choices=list(fullhelp.MODES), default=None,
-                        help="Mode: multi, partial, speedtest, tree, or crawl. 'tree' "
+                        help="Mode: multi, partial, speedtest, tree, crawl, or index. "
+                             "'index' keeps what crawls and archive walks found in one "
+                             "searchable, scored, diffable store: '--mode index ACTION ...' "
+                             "(see --full-help index). 'tree' "
                              "lists/extracts members of a huge remote archive over the "
                              "proxy pool without downloading it; everything after '--' is "
                              "passed to rvtree. 'crawl' recursively harvests 'Index of /' "
                              "open directories starting from the seed URLs. "
                              "Mutually exclusive with --farm.")
+    parser.add_argument("--index", metavar="PATH", default=None,
+                        help="The index file for --mode index (default: "
+                             "$ONIONACCELERATOR_INDEX, else ~/.local/share/onionaccelerator/"
+                             "index.db). Created 0600 in a 0700 directory.")
     parser.add_argument("--full-help", action=_FullHelpAction, metavar="MODE",
                         choices=list(fullhelp.TOPICS),
                         help="Print the long-form per-mode reference and exit. Give a "
@@ -1301,7 +1361,9 @@ def main(argv=None):
     # so the separator survives into the leftovers and would reach rvtree as a mode name.
     if "--" in rv_args:
         rv_args.remove("--")
-    if rv_args and args.mode != "tree":
+    # tree hands its leftovers to rvtree and index hands them to its own action parser;
+    # for every other mode a stray argument is still a typo and still an error.
+    if rv_args and args.mode not in ("tree", "index"):
         parser.error(f"unrecognized arguments: {' '.join(rv_args)}")
 
     # Listing the templates answers a question about this program, not about a target, so
@@ -1333,6 +1395,18 @@ def main(argv=None):
                         tune=args.farm_tune or "off")
         logger.info("OnionAccelerator farm action finished.")
         return
+
+    # The index reads and writes a file and, for `fetch`, asks for proxies itself. It needs
+    # no URL list and must not resolve endpoints for an action like `diff`.
+    if args.mode == "index":
+        if args.stream:
+            parser.error("--stream has nothing to publish in --mode index: it consumes "
+                         "what other runs publish. To index a run live, start it with "
+                         "--stream and run '--mode index live --stream-url URL'.")
+        index_cli = _import_index()
+        if index_cli is None:
+            sys.exit(1)
+        sys.exit(index_cli.main(rv_args, index_path=args.index, hooks=IndexHooks(args)))
 
     # Tree mode takes its target from --url or the passed-through arguments, never from
     # URLs.txt. Injection happens before the emptiness check, so '--url X' alone is a
