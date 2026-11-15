@@ -10,6 +10,7 @@ import os
 import random
 import re
 import socket
+from typing import Optional
 from urllib.parse import unquote, urlparse
 
 import requests.packages.urllib3
@@ -171,3 +172,58 @@ def discover_local_socks_ports(base_port=BASE_PORT, max_ports=MAX_WORKERS, host=
         if _port_is_open(host, port):
             live.append(f"{host}:{port}")
     return live
+
+
+# =========== RESPONSE SANITY ===========
+# Markup content types, and the target extensions for which markup is a plausible
+# answer. Anything else answering with markup is an error page wearing the filename.
+_MARKUP_TYPES = frozenset({"text/html", "application/xhtml+xml"})
+_MARKUP_EXTENSIONS = frozenset({
+    "", ".html", ".htm", ".xhtml", ".shtml", ".php", ".asp", ".aspx", ".jsp", ".cgi",
+})
+
+
+def _error_page_reason(url: str, content_type: str) -> Optional[str]:
+    """Why this response body is a server error page and not the requested file.
+
+    Returns None when the body should be believed.
+
+    The status line cannot be used for this. The file managers behind these onions
+    answer 404 while sending the complete file -- a 16-byte note arrives with the
+    right length, the right `text/plain`, and a 404 -- and they answer *200* with a
+    9.6 KB "not available" HTML page in place of a 166 MB CAD model. Trusting the
+    code both throws away good files and saves rubbish under their names, and the
+    second failure is silent: the page is written to `Auftragslayout....STEP`,
+    reported [OK], and only found much later by whoever tries to open it.
+
+    What does separate the two is the content type against the target's extension.
+    A `.STEP`, `.zip` or `.xlsx` request answered with markup is an error page on any
+    server, whatever the status line claims; a `.txt` answered with `text/plain` is
+    the file, whatever the status line claims. Extensions that could legitimately be
+    served as markup are exempt, so this can only reject a body that contradicts the
+    name it was asked for.
+    """
+    ctype = (content_type or "").split(";")[0].strip().lower()
+    if ctype not in _MARKUP_TYPES:
+        return None
+    ext = os.path.splitext(urlparse(url).path)[1].lower()
+    if ext in _MARKUP_EXTENSIONS:
+        return None
+    return f"server sent {ctype} for a '{ext}' target -- an error page, not the file"
+
+
+def _check_response(url, response) -> None:
+    """Raise unless `response` carries the requested file. See _error_page_reason()."""
+    reason = _error_page_reason(url, response.headers.get("content-type", ""))
+    if reason is not None:
+        raise RuntimeError(f"HTTP {response.status_code}: {reason}")
+    if not response.ok:
+        if not response.headers.get("content-type"):
+            # A bad status with nothing to identify the body is just a bad status.
+            response.raise_for_status()
+        # A body that survived the check above is the file, mislabelled. Say so once,
+        # loudly, because "downloaded 404s" is otherwise indistinguishable from a bug.
+        logger.warning(
+            f"HTTP {response.status_code} for {url}, but the body is "
+            f"{response.headers.get('content-type')} and not an error page -- keeping it."
+        )

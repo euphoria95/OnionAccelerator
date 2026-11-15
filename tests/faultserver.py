@@ -146,14 +146,16 @@ class FaultServer:
         self.last_modified = formatdate(1_700_000_000, usegmt=True)
         self.honor_if_range = honor_if_range
         self.validators = validators
-        # No Content-Length, no ranges: the body just ends when the connection does.
+        # No Content-Length and no ranges, the body sent chunked -- what a file manager that
+        # streams a file it has not measured does, and what lets a truncation be noticed.
         self.hide_length = hide_length
         self.faults: list[Callable[[Req], Optional[Fault]]] = []
         # ua -> bytes per second, or None for full speed.
         self.throttle: Callable[[str], Optional[float]] = lambda ua: None
         self.log: list[Req] = []
         self.body_bytes = 0                 # bytes actually written, all responses
-        self._lock = threading.Lock()
+        # Re-entrant: fault rules run under it and call back into ranged() and swap().
+        self._lock = threading.RLock()
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -171,6 +173,10 @@ class FaultServer:
         class Server(ThreadingHTTPServer):
             daemon_threads = True
             request_queue_size = 128
+
+            def handle_error(self, request, client_address):
+                # A client closing a keep-alive socket, or a Drop fault, is not news.
+                pass
 
         self.httpd = Server(("127.0.0.1", 0), Handler)
         self.port = self.httpd.server_address[1]
@@ -261,8 +267,7 @@ class FaultServer:
         if status == 206:
             h.send_header("Content-Range", f"bytes {start}-{end}/{size}")
         if self.hide_length:
-            h.send_header("Connection", "close")
-            h.close_connection = True
+            h.send_header("Transfer-Encoding", "chunked")
         else:
             h.send_header("Content-Length", str(length))
         h.send_header("Content-Type", "application/octet-stream")
@@ -292,11 +297,16 @@ class FaultServer:
                 if isinstance(fault, Stall) and sent >= fault.after:
                     time.sleep(fault.seconds)
                     fault = None
-                h.wfile.write(chunk)
+                if self.hide_length:
+                    h.wfile.write(b"%x\r\n" % len(chunk) + chunk + b"\r\n")
+                else:
+                    h.wfile.write(chunk)
                 sent += len(chunk)
                 with self._lock:
                     self.body_bytes += len(chunk)
                 if bps:
                     time.sleep(len(chunk) / bps)
+            if self.hide_length:
+                h.wfile.write(b"0\r\n\r\n")
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             h.close_connection = True

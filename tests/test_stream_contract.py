@@ -20,6 +20,7 @@ from eventstream.bus import KINDS
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 RVTREE_CLI = os.path.join(ROOT, "remote_viewer", "rvtree", "cli.py")
+ENGINE = os.path.join(ROOT, "oacore", "engine.py")
 ONIONACCELERATOR = os.path.join(ROOT, "OnionAccelerator.py")
 
 
@@ -57,6 +58,12 @@ def test_rvtree_publishes_only_kinds_the_schema_describes():
     assert declared <= set(KINDS)
 
 
+def test_the_download_engine_publishes_only_kinds_the_schema_describes():
+    declared = declared_in(ENGINE)
+    assert declared == {"download.start", "download.piece", "download.done", "download.fail"}
+    assert declared <= set(KINDS)
+
+
 def test_the_kinds_published_as_literals_are_described_too():
     """--mode tree and --detect publish their own run facts without a constant."""
     literals = literals_in(ONIONACCELERATOR)
@@ -68,7 +75,7 @@ def test_every_described_kind_is_actually_published_by_something():
     """A schema entry nobody emits is a rule somebody writes and never sees fire."""
     # stream.* are the protocol's own, emitted by the server rather than by a producer.
     protocol = {kind for kind in KINDS if kind.startswith("stream.")}
-    produced = (published_in(crawl_report) | declared_in(RVTREE_CLI)
+    produced = (published_in(crawl_report) | declared_in(RVTREE_CLI) | declared_in(ENGINE)
                 | literals_in(ONIONACCELERATOR) | literals_in(RVTREE_CLI))
     # run.start is published by the streaming() context manager, from the constant.
     produced |= {"run.start"}

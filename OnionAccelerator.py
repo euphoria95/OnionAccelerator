@@ -30,7 +30,7 @@ import fullhelp
 # Importing oacore.common also silences urllib3's InsecureRequestWarning: TLS
 # verification is off on purpose, since an onion address authenticates the peer.
 from oacore import common as _common, config as _config, download as _download
-from oacore import farm as _farm, sizeprobe as _sizeprobe
+from oacore import engine as _engine, farm as _farm, sizeprobe as _sizeprobe
 from oacore.config import (
     MAX_WORKERS, BASE_PORT, CHUNK_SIZE, MIN_PARTIAL_CHUNK_SIZE, REQUEST_TIMEOUT,
     TRANSFER_TIMEOUT, USERAGENTS_FILE, URLS_FILE, DOWNLOAD_DIR,
@@ -41,18 +41,23 @@ from oacore.config import (
 from oacore.common import (
     TOR_SOCKS_REPLIES, load_user_agents, random_user_agent, url_to_local_path,
     _safe_path_component, make_proxies, _TOR_REPLY_RE, explain_error,
-    PORT_PROBE_TIMEOUT, _port_is_open, discover_local_socks_ports,
+    PORT_PROBE_TIMEOUT, _port_is_open, discover_local_socks_ports, _MARKUP_TYPES,
+    _MARKUP_EXTENSIONS, _error_page_reason, _check_response,
 )
 from oacore.sizeprobe import (
     IDENTITY_ENCODINGS, SizeProbe, _positive_int, _size_from_content_length,
     _size_from_content_disposition, _size_from_content_range, _size_from_response,
-    _probe, probe_remote_size, get_remote_file_size,
+    _probe, Validators, validators_from, probe_remote_size, probe_remote_size_ex,
+    get_remote_file_size,
 )
 from oacore.download import (
-    ProxyPool, _UMASK, _DOWNLOAD_MODE, _MARKUP_TYPES, _MARKUP_EXTENSIONS,
-    _error_page_reason, _check_response, download_file, _warn_on_path_collisions,
-    multi_download_mode, partial_download_chunk_to_file,
-    fallback_sequential_download, partial_download_file, partial_download_mode,
+    _UMASK, _DOWNLOAD_MODE, _warn_on_path_collisions, _make_downloader, _summarise,
+    multi_download_mode, partial_download_mode, download_file,
+)
+from oacore.engine import (
+    DEFAULT_PIECE_SIZE, EVENT_DOWNLOAD_START, EVENT_DOWNLOAD_PIECE,
+    EVENT_DOWNLOAD_DONE, EVENT_DOWNLOAD_FAIL, plan_pieces, EngineConfig,
+    DownloadResult, Downloader, read_journal,
 )
 from oacore.farm import (
     TOR_INSTANCE_PREFIX, FARM_RE, FARM_RESERVED, TOR_INSTANCES_DIR, TOR_LIB_DIR,
@@ -717,6 +722,23 @@ def parse_socks_list(value):
     return endpoints
 
 
+def parse_piece_size(value):
+    """Parse --piece-size: bytes, or a number with a K, M or G suffix (powers of 1024).
+
+    Bounded because a lane holds one whole piece in memory while it fetches it: below
+    64 KiB the journal and the request overhead dominate, above 256 MiB eight lanes
+    would be holding two gigabytes.
+    """
+    match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([KMG]?)(?:I?B)?\s*", value, re.IGNORECASE)
+    if not match:
+        raise argparse.ArgumentTypeError(
+            f"not a size: {value!r} (use bytes, or 512K, 4M, 64M)")
+    size = int(float(match.group(1)) * 1024 ** ("", "K", "M", "G").index(match.group(2).upper()))
+    if not 64 * 1024 <= size <= 256 * 1024 * 1024:
+        raise argparse.ArgumentTypeError(f"--piece-size must be between 64K and 256M, got {value}")
+    return size
+
+
 def parse_url(value):
     """Validate one --url. A scheme is required, and the reason is not pedantry.
 
@@ -749,7 +771,7 @@ class _FullHelpAction(argparse.Action):
 
 
 def resolve_crawl_endpoints(args, urls):
-    """SOCKS5 endpoints for crawl mode.
+    """SOCKS5 endpoints for crawl mode, and for the download modes, which share the ladder.
 
     --socks wins outright and is checked but never second-guessed: it is how you point
     the crawler at a Tor daemon this script does not manage (a personal client on 9050,
@@ -956,7 +978,10 @@ def crawl_mode(urls, proxies, args, sink=None):
         # concurrency models on the same Tor daemons at the same time.
         logger.info(f"Downloading {len(file_urls)} discovered file(s) into "
                     f"{DOWNLOAD_DIR}/ ...")
-        multi_download_mode(file_urls, proxies, retries=args.retries, preserve_path=True)
+        multi_download_mode(file_urls, proxies, retries=args.retries, preserve_path=True,
+                            piece_size=args.piece_size, fresh=args.fresh,
+                            circuits_per_endpoint=args.circuits_per_endpoint, sink=sink,
+                            job_id=JOB_ID)
         stop["downloaded"] = len(file_urls)
         return 0
     finally:
@@ -1022,7 +1047,18 @@ def build_parser():
                              "Instances whose torrc changes are reloaded, or restarted "
                              "one at a time if their SocksPort line changed.")
     parser.add_argument("--retries", type=int, default=DEFAULT_RETRIES,
-                        help="Number of retries for download failures.")
+                        help="Attempts per piece (--mode multi and partial) or per request "
+                             "(crawl and tree) before giving up. A piece that runs out of "
+                             "attempts stops that file but leaves it resumable.")
+    parser.add_argument("--piece-size", type=parse_piece_size, default=DEFAULT_PIECE_SIZE,
+                        metavar="SIZE",
+                        help="Size of one download piece (default 4M; bytes, or 512K, 4M, "
+                             "64M; 64K to 256M). Lanes pull pieces from a shared queue, so a fast lane "
+                             "does more of them; each lane holds one piece in memory.")
+    parser.add_argument("--fresh", action="store_true",
+                        help="Discard any partial download (the .oa-state journal and "
+                             ".oa-part file beside it) and start each file over. Without "
+                             "it, rerunning the same command resumes.")
     parser.add_argument("--preserve-path", action="store_true",
                         help=f"Mirror each URL's remote directory tree under "
                              f"{DOWNLOAD_DIR}/<host>/ instead of flattening every "
@@ -1317,11 +1353,10 @@ def main(argv=None):
         logger.info(f"OnionAccelerator tree mode finished (exit {code}).")
         sys.exit(code)
 
-    if args.stream and args.mode in ("multi", "partial", "speedtest"):
-        parser.error(f"--stream has nothing to publish in --mode {args.mode}: it mirrors "
-                     f"what a run *discovers*, and these modes consume a URL list rather "
-                     f"than produce one. It applies to --mode crawl, --mode tree and "
-                     f"--detect.")
+    if args.stream and args.mode == "speedtest":
+        parser.error("--stream has nothing to publish in --mode speedtest: it measures "
+                     "proxies and finds and fetches nothing. It applies to --mode crawl, "
+                     "--mode tree, --mode multi, --mode partial and --detect.")
 
     urls = resolve_urls(args)
     source = "--url" if args.url else URLS_FILE
@@ -1356,6 +1391,32 @@ def main(argv=None):
         logger.info(f"OnionAccelerator crawl mode finished (exit {code}).")
         sys.exit(code)
 
+    # The download modes resolve endpoints the way tree and crawl do: --socks, then a live
+    # probe of the farm range, then a single local client, then an error. They used to
+    # take the fixed BASE_PORT..+19 list on a miss and cap the pool at MAX_WORKERS, which
+    # for a transfer that runs for hours meant timing out on twenty ports that were never
+    # there.
+    if args.mode in ("multi", "partial"):
+        proxies = resolve_crawl_endpoints(args, urls)
+        if not proxies:
+            logger.error("No usable proxies available. Aborting.")
+            sys.exit(1)
+        logger.info(f"Using {len(proxies)} SOCKS endpoint(s) x "
+                    f"{args.circuits_per_endpoint} circuit(s).")
+        run = multi_download_mode if args.mode == "multi" else partial_download_mode
+        with streaming(args, args.mode, urls) as stream:
+            results = run(urls, proxies, retries=args.retries,
+                          preserve_path=args.preserve_path, piece_size=args.piece_size,
+                          fresh=args.fresh, circuits_per_endpoint=args.circuits_per_endpoint,
+                          sink=stream, job_id=JOB_ID)
+        failed = [r for r in results if not r.ok]
+        if failed:
+            logger.error(f"OnionAccelerator finished with {len(failed)} of {len(results)} "
+                         f"file(s) incomplete.")
+            sys.exit(1)
+        logger.info("OnionAccelerator finished successfully.")
+        return
+
     proxies = resolve_proxies(args.external, urls, test_url=args.test_url)
     if not proxies:
         logger.error("No usable proxies available. Aborting.")
@@ -1363,13 +1424,7 @@ def main(argv=None):
     logger.info(f"Using {len(proxies)} proxies "
                 f"({'external list' if args.external else 'local docker'}).")
 
-    if args.mode == "multi":
-        multi_download_mode(urls, proxies, retries=args.retries,
-                            preserve_path=args.preserve_path)
-    elif args.mode == "partial":
-        partial_download_mode(urls, proxies, retries=args.retries,
-                              preserve_path=args.preserve_path)
-    elif args.mode == "speedtest":
+    if args.mode == "speedtest":
         speedtest_mode(urls, proxies)
 
     logger.info("OnionAccelerator finished successfully.")
@@ -1384,7 +1439,7 @@ def main(argv=None):
 # re-exported name is forwarded to every oacore module that holds the same object
 # under the same name, and monkeypatch's undo is a write too. tests/test_facade.py
 # patches each forwarded name and checks the defining module sees it.
-_MOVED_MODULES = (_config, _common, _sizeprobe, _download, _farm)
+_MOVED_MODULES = (_config, _common, _sizeprobe, _download, _engine, _farm)
 
 
 def _forwarding_table():

@@ -56,9 +56,10 @@ package-dir = {"rvtree" = "remote_viewer/rvtree"}
 # The rvtree suite under remote_viewer/ has its own conftest.py and runs from there.
 # Collecting both from the root imports two top-level modules named `conftest`.
 testpaths = ["tests"]
-addopts = "-m 'not network'"
+addopts = "-m 'not network and not slow'"
 markers = [
     "network: hits the real internet over Tor; run with -m network",
+    "slow: minutes of local transfer (2 GiB); run with -m slow",
 ]
 
 [tool.ruff]

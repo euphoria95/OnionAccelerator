@@ -6,16 +6,16 @@ OnionAccelerator is a multi-functional Python script designed for discovering an
 
 ### Multi-Download Mode
 
-- Simultaneously download multiple files listed in `URLs.txt`, with worker-thread concurrency bounded by the proxy count (capped at the number of URLs, so no idle threads are spawned).
-- Automatically retries failed downloads a configurable number of times, drawing a fresh proxy from the pool on each retry so a dead endpoint doesn't doom a URL.
+- Downloads many files at once over a shared set of **lanes** — one lane is one isolated Tor circuit with its own SOCKS credential and its own User-Agent, pinned for the lane's life. Concurrency is the lane count (endpoints × `--circuits-per-endpoint`), not a fixed twenty.
+- Cuts every file larger than `--piece-size` (4 MiB by default) into pieces that any free lane takes next, so a fast circuit does more of the work and a stalled one is abandoned (see **The download engine** below).
 - Aggregates download progress via a single progress bar in the terminal.
 
 ### Partial-Download Mode
 
-- Splits each file into parallel byte-range chunks — up to one per proxy, but never more chunks than the file size warrants (chunks are at least `MIN_PARTIAL_CHUNK_SIZE`, 1 MB by default) — each served by a SOCKS5 proxy drawn from the shared pool.
+- The same engine, one file at a time with every lane working on it, into `partials/<host>/`. There is no merge pass: each piece is written at its offset into one preallocated file, so memory is lanes × piece size however large the file is.
 - Establishes the file size through a ladder of four probes, so a server that withholds `Content-Length` no longer costs you the parallelism: a `HEAD`, then the `size=` parameter of that same response's `Content-Disposition`, then the total in the `Content-Range` of a one-byte `Range: bytes=0-0` GET, and finally a plain streamed GET aborted the moment its headers arrive. No probe transfers a payload.
-- If none of the four can establish a size, the script automatically falls back to a single, sequential download.
-- Merges the downloaded chunks into a final file upon success, and performs retry logic if any chunk fails — each chunk retry lands on a different live proxy via the pool's failover.
+- If none of the four can establish a size, or the file fits in one piece, it is fetched as a single GET with nothing to resume.
+- A piece that runs out of `--retries` stops its file and leaves it resumable: nothing is deleted, and rerunning the same command carries on.
 
 ### Remote Archive Tree Mode (`--mode tree`)
 
@@ -71,14 +71,13 @@ end. See **Live Streaming API** below.
 
 ### Multiple Threads & SOCKS5 Proxies
 
-- Dynamically assigns up to 20 local SOCKS5 ports (e.g., `127.0.0.1:5000–127.0.0.1:5019`) for parallel fetching, potentially speeding up downloads over Tor.
+- Discovers the live local SOCKS5 ports of a farm (by default `127.0.0.1:5000–127.0.0.1:5019`), falls back to a personal Tor client on `127.0.0.1:9150` when there is none, and stops with an error when there is neither — the same ladder for download, tree and crawl. `--socks` names your own endpoints.
 
 ### Progress Bars
 
 - Utilizes `tqdm` to show clear download progress:
   - A single aggregated bar for multi-downloads.
-  - A dedicated bar per file in partial-download mode.
-  - Fallback sequential downloads also show an inline progress bar.
+  - A dedicated bar per file in partial-download mode, with its total filled in once the size is known.
 
 ### Retry Logic
 
@@ -100,7 +99,7 @@ end. See **Live Streaming API** below.
 
 ### Seamless Fallback
 
-- In partial-download mode, if none of the four size probes can establish a file size, the script automatically switches to a single GET request and proceeds with a standard download. The same applies when a response arrives under a `Content-Encoding`: the length it advertises describes the compressed transfer rather than the file, so it is not safe to split into ranges.
+- In multi and partial mode, if none of the four size probes can establish a file size, the script automatically switches to a single GET request and proceeds with a standard download. The same applies when a response arrives under a `Content-Encoding`: the length it advertises describes the compressed transfer rather than the file, so it is not safe to split into ranges.
 
 ## Installation
 
@@ -142,7 +141,7 @@ shared or logged host that difference matters.
 python3 OnionAccelerator.py --farm <up|status|down|destroy> [--count N] [--base-port PORT] [--bootstrap-timeout SEC] [--farm-tune off|onion|onion-aggressive]
 
 # Download / speedtest through the proxies:
-python3 OnionAccelerator.py --mode <multi|partial|speedtest> [--url URL ...] [--retries N] [--external] [--test-url URL]
+python3 OnionAccelerator.py --mode <multi|partial|speedtest> [--url URL ...] [--retries N] [--piece-size SIZE] [--fresh] [--external] [--test-url URL]
 
 # Read a remote archive's file tree without downloading it:
 python3 OnionAccelerator.py --mode tree [--url URL] [--external] [-- <rvtree arguments>]
@@ -167,8 +166,8 @@ Exactly one of `--farm` or `--mode` must be given.
 - `--farm`: manage a farm of native Tor instances instead of Docker (see **Native Tor Farm** below).
 
 - `--mode`:
-  - `multi`: Parallel download of every target, each in a separate worker thread with its own SOCKS5 proxy.
-  - `partial`: Parallel chunk-based download for each URL, automatically merging chunks.
+  - `multi`: Many files at once, each cut into resumable pieces fetched by whichever lane is free.
+  - `partial`: One file at a time with every lane on it, in resumable pieces written straight into place.
   - `speedtest`: Test download speed and basic health for each SOCKS5 proxy using the first target.
   - `tree`: List or extract members of a remote archive over the proxy pool without downloading it. Takes its target from `--url` or from the arguments after `--`, never from `URLs.txt` (see **Remote Archive Tree** below).
   - `crawl`: Recursively walk the open directories seeded from `--url` or `URLs.txt` and write a manifest of every file found, spread across many Tor circuits at once (see **Open-Directory Crawl** below).
@@ -192,8 +191,12 @@ python3 OnionAccelerator.py --mode partial --url https://example.onion/backup.is
 # Multi-download mode, retrying up to 3 times:
 python3 OnionAccelerator.py --mode multi --retries 3
 
-# Partial-download mode, splitting each file into 20 chunks in parallel:
+# Partial-download mode, every lane on one file at a time; killed? run it again and it resumes:
 python3 OnionAccelerator.py --mode partial
+
+# Bigger pieces over more lanes, or throw away a partial download and start over:
+python3 OnionAccelerator.py --mode partial --piece-size 16M --circuits-per-endpoint 4
+python3 OnionAccelerator.py --mode partial --url https://example.onion/backup.iso --fresh
 
 # Speedtest mode, checks each proxy port:
 python3 OnionAccelerator.py --mode speedtest
@@ -214,6 +217,71 @@ python3 OnionAccelerator.py --mode crawl --url https://a.onion/dumps/ --url http
 # What does each mode actually take?
 python3 OnionAccelerator.py --full-help crawl
 ```
+
+## The download engine (`--mode multi`, `--mode partial`, `crawl --download`)
+
+One engine moves every file, and it is built to be interrupted. A sized file is cut into
+fixed **pieces** (`--piece-size`, 4 MiB by default). Each lane — one isolated Tor circuit —
+pulls the next piece from a shared queue, so a fast lane does more of them, and writes it
+at its offset into a single preallocated file. A lane holds at most one piece in memory, so
+the footprint is lanes × piece size whatever the file weighs.
+
+**On disk, while it runs** (`<name>` is the file's final path):
+
+| File | What it is |
+|---|---|
+| `<name>.oa-part` | the file itself, preallocated, pieces written in place |
+| `<name>.oa-state` | an append-only JSON-lines journal: a job header, then one line per finished piece with its SHA-256, lane and attempts. Each line is one `write()`, so a kill tears at most the last, which the reader drops |
+
+**Resume.** Run the same command again. The journal is read, every piece it calls finished
+is re-hashed against `<name>.oa-part`, and only the rest is fetched. A journal that no
+longer fits (a different size, piece size or ETag) is discarded rather than trusted;
+`--fresh` discards it on purpose. A piece that runs out of `--retries` stops that file and
+**deletes nothing** — the process exits 1 and the file is resumable.
+
+**A file that changes underneath it.** The size probe's `ETag` (or `Last-Modified` when
+the ETag is weak or absent) is sent as `If-Range` with every piece. A server that sees a
+different version answers `200` with the new entity; a server that ignores `If-Range` gives
+itself away by a different `ETag` on the `206`, or a different total in `Content-Range`.
+Either way the file starts over from byte zero **once**, so the result is never spliced
+from two versions, and fails if it changes again. A server that answers ranged requests
+with `200` regardless gets the same one restart and then a single plain GET. A server that
+sends no validators at all can only be caught by a change of size, and the log says so.
+
+**Slow and stalled lanes.** A piece that has run far below the median lane (under a tenth
+of it, for 20 seconds) is cancelled, requeued, and its lane rotated onto a new circuit. The
+rule is relative on purpose: when every lane is slow the median is low too and nothing is
+cancelled. The last few pieces are **raced** on two lanes and the first to finish wins, so
+one bad circuit cannot hold a finished file hostage.
+
+**Custody record.** When a file completes, the journal and the part file are gone and
+`<name>.oa.json` is written beside it:
+
+```json
+{
+  "kind": "custody", "job_id": "20261113_103000_ab12cd", "url": "http://example.onion/a.iso",
+  "path": "partials/example.onion/a.iso", "size": 734003200,
+  "sha256": "…whole-file SHA-256, computed from what is on disk…",
+  "etag": "\"5d8c72a5edda8\"", "last_modified": "Wed, 01 Oct 2025 08:00:00 GMT",
+  "piece_size": 4194304, "pieces": 175, "resumed_pieces": 0, "restarts": 0,
+  "lanes": [{"lane": 0, "endpoint": "socks5h://127.0.0.1:5000", "pieces": 9}],
+  "started_at": "2026-11-13T10:30:00Z", "finished_at": "2026-11-13T10:41:12Z"
+}
+```
+
+A file with no discoverable size, or that fits in one piece, is a single GET: there is
+nothing to resume, so a failure leaves nothing behind.
+
+**Identity.** Every lane keeps one User-Agent for its whole life — one lane is one identity
+as far as the far end can tell — and the size probe goes out on a lane's own credentialed
+proxy, not the daemon's shared circuit. Endpoints are resolved the way tree and crawl do it
+(`--socks`, `--external`, the farm probe, then a personal Tor client on `127.0.0.1:9150`);
+the old fixed twenty-port fallback and the 20-worker cap are gone.
+
+With `--stream`, the transfer publishes `download.start`, `download.piece`, `download.done`
+and `download.fail` (see **Live Streaming API**). A piece event is the journal line written
+for it and `download.done` is the custody record, byte for byte; the start and fail events
+of a single-GET file have no journal to match.
 
 ## Remote Archive Tree (`--mode tree`)
 
@@ -700,6 +768,7 @@ reason a live stream is safe to base a conclusion on.
 | `crawl.progress` | periodic counters, so a consumer can tell "finding nothing" from "stuck" |
 | `crawl.page` | fetched page text, truncated — only with `--stream-bodies`, never written to disk |
 | `tree.open` / `tree.entry` / `tree.done` | the archive, each member as it is walked, and the cost |
+| `download.start` / `download.piece` / `download.done` / `download.fail` | a file's transfer under `--mode multi`, `partial` or `crawl --download`: the job, each finished piece, the custody record, and why a file stopped |
 | `detect.result` | which listing templates read a target, and how well |
 | `stream.hello` / `stream.gap` / `stream.heartbeat` | the protocol's own |
 
@@ -780,7 +849,7 @@ as they would to a run started by hand.
 ## Project Structure
 
 - `OnionAccelerator.py`: The command line, speedtest, proxy discovery and the glue for tree, crawl and stream. Installed as the `onionaccelerator` command.
-- `oacore/`: The download modes (`download.py`), the remote size probe (`sizeprobe.py`), the native farm (`farm.py`) and the settings and helpers they share. `OnionAccelerator.py` re-exports all of it.
+- `oacore/`: The download engine (`engine.py`) and the modes built on it (`download.py`), the remote size probe (`sizeprobe.py`), the native farm (`farm.py`) and the settings and helpers they share. `OnionAccelerator.py` re-exports all of it.
 - `remote_viewer/`: The `rvtree` package behind `--mode tree`. Usable on its own too — see its own README.
 - `crawler/`: The asyncio package behind `--mode crawl` — multi-circuit proxy pool, frontier, fetcher and reporting. The only async code in the project; the other modes stay on threads over `requests`.
 - `crawler/listing/`: The scraping layer, with no crawl in it: the structural reader, the JSON/XML/row/manifest strategies, the addressing rules, and the template engine behind `--profile` and `--detect`. Adding support for a target is a file in `crawler/listing/templates/`, not a change to the crawler — see that directory's [README](crawler/listing/templates/README.md).
@@ -793,7 +862,7 @@ as they would to a run started by hand.
 - `UserAgents.tsv`: Tab-separated file; first column is the User-Agent string.
 - `logs/`: A directory automatically created to store timestamped log files.
 - `downloads/<host>/`: Output directory for multi mode, organised by hostname. With `--mode crawl --download` the remote directory structure is mirrored underneath it.
-- `partials/<host>/`: Output directory for partial mode; temporary chunk files are merged here.
+- `partials/<host>/`: Output directory for partial mode. Unfinished files sit here as `<name>.oa-part` beside `<name>.oa-state`.
 - `crawls/<job_id>/`: Manifests written by crawl mode (`listing.jsonl`, `dirs.jsonl`, `failed.jsonl`, `stats.json`, `tree.txt`, `urls.txt`).
 
 ## Requirements

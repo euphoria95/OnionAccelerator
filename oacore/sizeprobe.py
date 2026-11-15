@@ -135,8 +135,33 @@ def _probe(session, url, method, extra_headers=None, stream=False):
         r.close()
 
 
+class Validators(NamedTuple):
+    """What the server said identifies this version of the file.
+
+    The download engine sends one back as `If-Range` on every piece, so a file that
+    changes mid-transfer comes back whole instead of as a splice of two versions.
+    """
+    etag: Optional[str] = None
+    last_modified: Optional[str] = None
+
+
+def validators_from(headers) -> Validators:
+    return Validators((headers.get("etag") or "").strip() or None,
+                      (headers.get("last-modified") or "").strip() or None)
+
+
 def probe_remote_size(url, proxy, ua=None) -> SizeProbe:
-    """Determine the size of `url` without downloading it.
+    """Determine the size of `url` without downloading it. See probe_remote_size_ex."""
+    return probe_remote_size_ex(url, proxy, ua)[0]
+
+
+def probe_remote_size_ex(url, proxy, ua=None):
+    """probe_remote_size(), plus the validators the answering response carried.
+
+    Returns `(SizeProbe, Validators)`. The validators come from the same response that
+    gave the size, so they describe the version whose length was measured.
+
+    Determine the size of `url` without downloading it.
 
     Four sources of evidence, tried in this order and stopping at the first that
     answers. They cost at most three requests, because the first two read the same
@@ -159,7 +184,10 @@ def probe_remote_size(url, proxy, ua=None) -> SizeProbe:
     reachable = False
 
     with requests.Session() as session:
-        session.proxies.update(make_proxies(proxy))
+        # `proxy=None` is a direct connection: only the engine's own tests ask for it,
+        # against a loopback server, where a SOCKS hop would add nothing.
+        if proxy is not None:
+            session.proxies.update(make_proxies(proxy))
         session.verify = False
         if ua:
             session.headers["User-Agent"] = ua
@@ -177,7 +205,7 @@ def probe_remote_size(url, proxy, ua=None) -> SizeProbe:
                 # unreachable, so the remaining probes would fail the same way on the
                 # same proxy. Stop rather than spend another 2 x REQUEST_TIMEOUT.
                 logger.debug(f"{label} for {url} (proxy={proxy}) could not connect: {e}")
-                return SizeProbe(reachable=reachable, error=str(e))
+                return SizeProbe(reachable=reachable, error=str(e)), Validators()
             except requests.RequestException as e:
                 # Read timeout, too many redirects, malformed response: this probe is
                 # out, but another method may still get an answer.
@@ -196,10 +224,11 @@ def probe_remote_size(url, proxy, ua=None) -> SizeProbe:
             size, source = _size_from_response(status, headers)
             if size:
                 logger.debug(f"{url}: size={size} B via {source} ({label})")
-                return SizeProbe(size=size, reachable=True, source=source)
+                return (SizeProbe(size=size, reachable=True, source=source),
+                        validators_from(headers))
 
     logger.debug(f"No size for {url} after all probes (last error: {last_error})")
-    return SizeProbe(reachable=reachable, error=last_error)
+    return SizeProbe(reachable=reachable, error=last_error), Validators()
 
 
 def get_remote_file_size(url, proxy, ua) -> Optional[int]:
