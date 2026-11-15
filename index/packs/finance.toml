@@ -1,0 +1,69 @@
+# Finance: invoices, bank and card data, tax and the books.
+[pack]
+name = "finance"
+description = "Invoices, bank statements, payment cards, tax and accounting files"
+
+[[rule]]
+id = "invoice-number"
+score = 50
+regex = '(?i)(?<![^/_.\- ])inv(oice)?[_-]?\d{2,}'
+reason = "A file named like a numbered invoice"
+positive = ["/finance/invoices/INV-2024-001.pdf", "/ap/invoice_20240101.pdf"]
+negative = ["/pub/invest2.pdf", "/ap/invoice.pdf"]
+
+[[rule]]
+id = "finance-folder"
+score = 35
+regex = '(?i)(^|/)(invoices?|receipts?|payables?|receivables?|accounts[_ -]?payable|accounts[_ -]?receivable)/'
+reason = "Inside a folder named for invoices or payables"
+positive = ["/finance/Invoices/a.pdf", "/ap/Accounts Payable/x.xlsx"]
+negative = ["/finance/invoicer/a.pdf", "/pub/receipt.txt"]
+
+[[rule]]
+id = "bank-details"
+score = 70
+regex = '(?i)(?<![^/_.\- ])(bank[_ -]?statements?|iban|swift[_ -]?(code|msg)|wire[_ -]?transfers?|account[_ -]?statements?)(?![^/_.\- ])'
+reason = "Bank statements, IBANs or wire transfers"
+positive = ["/fin/bank_statement_2024.pdf", "/fin/IBAN list.xlsx", "/fin/wire-transfer-0042.pdf"]
+negative = ["/fin/bankruptcy.txt", "/pub/ibanez.png"]
+
+[[rule]]
+id = "payment-cards"
+score = 75
+regex = '(?i)(?<![^/_.\- ])(credit[_ -]?cards?|card[_ -]?(numbers?|holders?|data)|cvv|pan[_ -]?data)(?![^/_.\- ])'
+reason = "Payment-card numbers or cardholder data"
+positive = ["/fin/credit_cards.xlsx", "/fin/Cardholder Data/a.csv", "/pay/cvv.txt"]
+negative = ["/pub/credit-policy.pdf", "/pub/cardinal.txt"]
+
+[[rule]]
+id = "tax"
+score = 65
+regex = '(?i)(?<![^/_.\- ])(tax[_ -]?(returns?|filings?|records?)|w-?[29]|1099|vat[_ -]?returns?)(?![^/_.\- ])'
+reason = "Tax returns, filings or forms"
+positive = ["/fin/tax_return_2023.pdf", "/hr/W-2_2023.pdf", "/fin/1099-misc.pdf"]
+negative = ["/fin/tax_policy.pdf", "/fin/w29x.txt"]
+
+[[rule]]
+id = "accounting-file"
+score = 80
+on = "name"
+regex = '(?i)\.(qbw|qbb|qbo|qbx)$'
+reason = "A QuickBooks company file or backup"
+positive = ["/acct/company.qbw", "/acct/backup.QBB"]
+negative = ["/docs/qbw.txt", "/docs/qb.pdf"]
+
+[[rule]]
+id = "financial-statements"
+score = 50
+regex = '(?i)(?<![^/_.\- ])(general[_ -]?ledger|trial[_ -]?balance|balance[_ -]?sheet|financial[_ -]?statements?|audit[_ -]?report|budget)(?![^/_.\- ])'
+reason = "Ledgers, statements, audit reports or budgets"
+positive = ["/fin/general_ledger_2023.xlsx", "/fin/Balance Sheet Q3.pdf", "/fin/budget-2025.xlsx"]
+negative = ["/pub/budgetary.txt", "/pub/ledgerwood.png"]
+
+[[rule]]
+id = "payment-batch"
+score = 60
+regex = '(?i)(?<![^/_.\- ])(sepa|ach)[_ -]?(batch|file|payments?)'
+reason = "A SEPA or ACH payment batch"
+positive = ["/pay/sepa_batch_0042.xml", "/pay/ACH payments.csv"]
+negative = ["/pay/sepal.txt", "/pay/each-file.txt"]

@@ -43,3 +43,14 @@ def payload_dir(tmp_path):
     """A directory holding one file of a known size, for RangeServer to serve."""
     (tmp_path / "file.zip").write_bytes(b"x" * PAYLOAD_SIZE)
     return str(tmp_path)
+
+
+@pytest.fixture(autouse=True)
+def _no_test_touches_the_real_index(monkeypatch, tmp_path_factory):
+    """Every test gets a private index path: none may write under ~/.local/share.
+
+    `--mode index` defaults to the user's data directory when no --index is given, so a
+    test that forgets the flag would otherwise create the operator's real index.
+    """
+    monkeypatch.setenv("ONIONACCELERATOR_INDEX",
+                       str(tmp_path_factory.mktemp("indexguard") / "index.db"))

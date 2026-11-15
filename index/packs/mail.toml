@@ -1,0 +1,57 @@
+# Mail stores. A mailbox is the densest single file a leak can contain: years of internal
+# correspondence, attachments and other people's credentials in one object.
+[pack]
+name = "mail"
+description = "Mailbox files, mail directories and server stores"
+
+[[rule]]
+id = "outlook-store"
+score = 70
+on = "name"
+regex = '(?i)\.(pst|ost|nst)$'
+reason = "An Outlook mail store"
+positive = ["/mail/archive.pst", "/mail/Outlook.OST"]
+negative = ["/mail/post.txt", "/docs/pst-format.md"]
+
+[[rule]]
+id = "mbox"
+score = 60
+on = "name"
+regex = '(?i)(\.(mbox|mbx)|^mbox)$'
+reason = "A Unix mbox mailbox"
+positive = ["/home/u/Mail/inbox.mbox", "/var/mail/mbox"]
+negative = ["/docs/mboxes.txt", "/docs/mbox-notes.txt"]
+
+[[rule]]
+id = "single-message"
+score = 40
+on = "name"
+regex = '(?i)\.(eml|emlx|msg)$'
+reason = "A single saved e-mail message"
+positive = ["/mail/offer.eml", "/mail/Re Invoice.msg"]
+negative = ["/docs/message.txt", "/docs/emlx-spec.md"]
+
+[[rule]]
+id = "maildir"
+score = 55
+regex = '(?i)(^|/)\.?maildir(/|$)'
+reason = "Inside a Maildir mail directory"
+positive = ["/home/u/Maildir/cur/1700000000.M1P2.host", "/srv/.maildir/new/x"]
+negative = ["/maildirectory/x", "/docs/maildir-howto.txt"]
+
+[[rule]]
+id = "exchange-database"
+score = 80
+on = "name"
+regex = '(?i)^(priv1\.edb|pub1\.edb|mailbox database[^/]*\.edb)$'
+reason = "A Microsoft Exchange mailbox database"
+positive = ["/exch/priv1.edb", "/exch/Mailbox Database 0123.edb"]
+negative = ["/exch/priv2.edb", "/docs/edb.txt"]
+
+[[rule]]
+id = "mail-client-profile"
+score = 50
+regex = '(?i)(^|/)\.?thunderbird/'
+reason = "Inside a Thunderbird profile"
+positive = ["/home/u/.thunderbird/abc.default/ImapMail/x", "/AppData/Thunderbird/Profiles/p"]
+negative = ["/pub/thunderbird_logo.png", "/pub/thunderbirds/x"]

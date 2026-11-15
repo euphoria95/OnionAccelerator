@@ -120,7 +120,7 @@ def test_every_package_directory_is_packaged():
     with open(os.path.join(ROOT, "pyproject.toml"), "rb") as fh:
         setuptools = tomllib.load(fh)["tool"]["setuptools"]
     found = set()
-    for top, base in (("crawler", ROOT), ("eventstream", ROOT), ("oacore", ROOT),
+    for top, base in (("crawler", ROOT), ("eventstream", ROOT), ("index", ROOT), ("oacore", ROOT),
                       ("rvtree", os.path.join(ROOT, "remote_viewer"))):
         for dirpath, _, files in os.walk(os.path.join(base, top)):
             if "__init__.py" in files:

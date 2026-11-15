@@ -1,0 +1,60 @@
+# Legal and compliance: contracts, privilege, litigation, deals and incident records.
+[pack]
+name = "legal"
+description = "Contracts, privileged and litigation material, deal documents, incident reports"
+
+[[rule]]
+id = "nda"
+score = 55
+regex = '(?i)(?<![^/_.\- ])(nda|non[_ -]?disclosure|confidentiality[_ -]?agreement)(?![^/_.\- ])'
+reason = "A non-disclosure or confidentiality agreement"
+positive = ["/legal/nda_signed.pdf", "/legal/Non-Disclosure Agreement.docx"]
+negative = ["/pub/panda.png", "/legal/ndalo.txt"]
+
+[[rule]]
+id = "contract"
+score = 40
+regex = '(?i)(?<![^/_.\- ])(contracts?|agreements?|mou|settlement)(?![^/_.\- ])'
+reason = "A contract, agreement or settlement"
+positive = ["/legal/contract_2024.pdf", "/legal/Settlement.docx", "/legal/agreement-v3.pdf"]
+negative = ["/pub/contractor.jpg", "/pub/moustache.png"]
+
+[[rule]]
+id = "privileged"
+score = 65
+regex = '(?i)(?<![^/_.\- ])(privileged|attorney[_ -]?client|litigation|subpoena|legal[_ -]?hold|work[_ -]?product)(?![^/_.\- ])'
+reason = "Privileged or litigation material"
+positive = ["/legal/PRIVILEGED/memo.docx", "/legal/attorney-client_advice.pdf", "/legal/subpoena_0042.pdf"]
+negative = ["/pub/unprivileged.txt", "/pub/litigator.jpg"]
+
+[[rule]]
+id = "court-filing"
+score = 55
+regex = '(?i)(?<![^/_.\- ])(complaint|plaintiff|defendant|deposition|affidavit|injunction)(?![^/_.\- ])'
+reason = "A court filing (or a customer complaint, which also matches)"
+positive = ["/legal/complaint_2024.pdf", "/legal/Affidavit.pdf", "/legal/deposition-smith.pdf"]
+negative = ["/pub/complainer.txt", "/pub/defendants-rights.pdf.txt"]
+
+[[rule]]
+id = "incident-record"
+score = 55
+regex = '(?i)(?<![^/_.\- ])(gdpr|breach[_ -]?(notification|report)|incident[_ -]?report|data[_ -]?protection[_ -]?impact)(?![^/_.\- ])'
+reason = "A data-protection or incident record"
+positive = ["/legal/gdpr_audit.docx", "/sec/Incident Report 2024-03.pdf", "/sec/breach_notification.pdf"]
+negative = ["/sec/gdprs.txt", "/sec/incidental.txt"]
+
+[[rule]]
+id = "deal-documents"
+score = 60
+regex = '(?i)(?<![^/_.\- ])(due[_ -]?diligence|term[_ -]?sheet|merger|acquisition|share[_ -]?purchase|cap[_ -]?table)(?![^/_.\- ])'
+reason = "Merger, acquisition or investment documents"
+positive = ["/deals/due_diligence_list.xlsx", "/deals/Term Sheet v2.pdf", "/deals/cap-table.xlsx"]
+negative = ["/pub/mergers.txt", "/pub/acquisitive.txt"]
+
+[[rule]]
+id = "intellectual-property"
+score = 50
+regex = '(?i)(?<![^/_.\- ])(patents?|trade[_ -]?secrets?|source[_ -]?code[_ -]?escrow)(?![^/_.\- ])'
+reason = "Patent, trade-secret or source-escrow material"
+positive = ["/ip/patent_application.pdf", "/ip/Trade Secret register.xlsx"]
+negative = ["/pub/patented.txt", "/pub/patentleather.jpg"]

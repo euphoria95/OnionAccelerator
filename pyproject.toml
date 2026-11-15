@@ -44,6 +44,7 @@ py-modules = ["OnionAccelerator", "fullhelp"]
 packages = [
     "crawler", "crawler.listing", "crawler.listing.strategies",
     "eventstream",
+    "index",
     "oacore",
     "rvtree", "rvtree.formats", "rvtree.transport",
 ]
@@ -51,6 +52,7 @@ package-dir = {"rvtree" = "remote_viewer/rvtree"}
 
 [tool.setuptools.package-data]
 "crawler.listing" = ["templates/*.toml"]
+"index" = ["packs/*.toml"]
 
 [tool.pytest.ini_options]
 # The rvtree suite under remote_viewer/ has its own conftest.py and runs from there.

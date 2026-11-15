@@ -1,0 +1,64 @@
+# Directory-service dumps: the files that turn one stolen account into all of them.
+[pack]
+name = "directory-service"
+description = "Active Directory and LDAP databases, registry hives, keytabs and exports"
+
+[[rule]]
+id = "ntds"
+score = 95
+on = "name"
+regex = '(?i)^ntds\.dit$'
+reason = "The Active Directory database, which holds every domain account's hash"
+positive = ["/dc/ntds.dit", "/backup/NTDS.DIT"]
+negative = ["/dc/ntds.txt", "/dc/ntds.dit.bak.txt"]
+
+[[rule]]
+id = "registry-hive"
+score = 90
+regex = '(?i)(^|/)system32/config/(sam|system|security|software)$'
+reason = "A Windows registry hive that holds local account hashes and secrets"
+positive = ["/backup/Windows/System32/config/SAM", "/c/windows/system32/config/system"]
+negative = ["/app/config/system", "/windows/system32/config/systemprofile/x"]
+
+[[rule]]
+id = "group-policy-preferences"
+score = 80
+regex = '(?i)(^|/)policies/.*/(groups|services|scheduledtasks|datasources|printers|drives)\.xml$'
+reason = "A Group Policy Preferences file, historically able to carry a reversible password"
+positive = ["/sysvol/corp/Policies/{31B2}/Machine/Preferences/Groups/Groups.xml"]
+negative = ["/docs/policies/groups.xml.txt", "/app/groups.xml"]
+
+[[rule]]
+id = "sysvol"
+score = 55
+regex = '(?i)(^|/)sysvol/'
+reason = "Inside a SYSVOL share, which holds domain-wide scripts and policy"
+positive = ["/dc/SYSVOL/corp/scripts/logon.bat"]
+negative = ["/dc/sysvolume/x", "/pub/sysvol.txt"]
+
+[[rule]]
+id = "ldif-export"
+score = 65
+on = "name"
+regex = '(?i)\.ldif$'
+reason = "An LDIF export of a directory"
+positive = ["/ldap/export.ldif"]
+negative = ["/ldap/ldif.txt", "/ldap/export.ldif.md"]
+
+[[rule]]
+id = "kerberos-secret"
+score = 80
+on = "name"
+regex = '(?i)(\.keytab$|^krb5cc_)'
+reason = "A Kerberos keytab or credential cache"
+positive = ["/etc/krb5.keytab", "/tmp/krb5cc_1000", "/svc/http.KEYTAB"]
+negative = ["/docs/keytab.txt", "/docs/krb5.conf"]
+
+[[rule]]
+id = "ad-collection"
+score = 60
+on = "name"
+regex = '(?i)(bloodhound|sharphound)[^/]*\.(zip|json)$'
+reason = "Output of an Active Directory attack-path collection tool"
+positive = ["/tmp/20240101_BloodHound.zip", "/tmp/sharphound_computers.json"]
+negative = ["/tmp/dog.zip", "/tmp/bloodhound-readme.md"]

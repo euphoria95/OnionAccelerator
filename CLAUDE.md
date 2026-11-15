@@ -12,6 +12,7 @@ The phased plan is docs/ROADMAP.md. Work on one phase at a time.
 - crawler/                   asyncio open-directory crawler
 - crawler/listing/           listing parsers and TOML templates
 - eventstream/               live NDJSON stream (stdlib only)
+- index/                     persistent SQLite index: ingest, rule packs, diff, fetch, export (stdlib only)
 - fullhelp.py                per-mode reference (stdlib only)
 - contrib/streamhunt.py      example stream consumer
 
@@ -34,7 +35,11 @@ The phased plan is docs/ROADMAP.md. Work on one phase at a time.
   the peer. Do not change that default.
 
 ## Invariants
-- eventstream/ and fullhelp.py import only the standard library.
+- eventstream/, index/ and fullhelp.py import only the standard library.
+- Index fixtures, rule packs and tests use synthetic names only (*.test hosts, "Example
+  Corp"): tests/test_index_rules.py scans the packs for onion addresses.
+- No test may write the real index: tests/conftest.py points ONIONACCELERATOR_INDEX at a
+  temp path for every test.
 - A stream event's `data` is byte-identical to the record written to disk.
 - The farm touches only instances named oaNN.
 - A hostile URL or archive member name can never write outside the output directory.

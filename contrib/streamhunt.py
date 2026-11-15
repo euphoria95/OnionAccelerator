@@ -21,6 +21,15 @@ Two things it does that a naive `curl | grep` does not:
   complete, and the gap record says which range to reconcile.
 
 Standard library only, so it runs on the analysis box without installing anything.
+
+This is the minimal example. To keep what a run finds -- scored, searchable, diffable
+against the last time -- rather than print it, use the index, which is this script with a
+database behind it:
+
+    python3 OnionAccelerator.py --mode index live --stream-url http://127.0.0.1:8787
+
+(index/live.py reconnects and records gaps the same way, and mends a gap from the run's
+own directory.) See "The persistent index" in the README.
 """
 
 from __future__ import annotations
