@@ -53,9 +53,9 @@ jobs:
       - name: rvtree suite
         working-directory: remote_viewer
         run: python -m pytest -q
-      - name: Download engine, 2 GiB with eight lanes (peak memory under 200 MiB)
+      - name: Slow checks, 3.13 only (2 GiB with eight lanes; a million index entries)
         if: matrix.python == '3.13'
-        run: python -m pytest -q -m slow tests/test_download_engine.py
+        run: python -m pytest -q -s -m slow tests/test_download_engine.py tests/test_index_scale.py
 
   lowest-deps:
     # Every dependency at the floor pyproject.toml declares, on the oldest Python.
