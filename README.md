@@ -237,7 +237,9 @@ the footprint is lanes × piece size whatever the file weighs.
 is re-hashed against `<name>.oa-part`, and only the rest is fetched. A journal that no
 longer fits (a different size, piece size or ETag) is discarded rather than trusted;
 `--fresh` discards it on purpose. A piece that runs out of `--retries` stops that file and
-**deletes nothing** — the process exits 1 and the file is resumable.
+**deletes nothing** — the process exits 1 and the file is resumable. No new pieces are taken
+once one gives up, but the ones already in flight get up to ten seconds to land, since
+over Tor each is minutes of someone's bandwidth and the rerun will not have to fetch it.
 
 **A file that changes underneath it.** The size probe's `ETag` (or `Last-Modified` when
 the ETag is weak or absent) is sent as `If-Range` with every piece. A server that sees a

@@ -100,6 +100,7 @@ class EngineConfig:
     slow_ratio: float = 0.1                 # "far below": under this fraction of the median; 0 = off
     slow_min_lanes: int = 4                 # lanes that must have a rate before there is a median
     slow_max_cancels: int = 2               # per piece, so a uniformly bad path cannot thrash
+    drain_grace: float = 10.0               # after a piece gives up, seconds in-flight ones may finish
     verify: Any = None                      # None: rvtree's default (off; the onion authenticates)
     file_mode: int = 0o644
 
@@ -739,6 +740,8 @@ class _Transfer:
                            f"of the file mid-transfer can only be noticed by its size.")
         self.cv = threading.Condition()
         self.halt: Optional[str] = None          # "done" | "failed" | "stale"
+        self.failing = False                     # a piece gave up: take nothing new, let the rest land
+        self.drain_deadline = 0.0
         self.failure: Optional[tuple] = None     # (reason, piece index)
         self.stale: Optional[_Stale] = None
         self.lane_pieces: collections.Counter = collections.Counter()
@@ -758,7 +761,10 @@ class _Transfer:
                 if self.done_count == len(self.pieces):
                     self.halt = "done"
                 while self.halt is None:
-                    self.cv.wait(0.5)
+                    if self.failing and (not self.live or time.monotonic() >= self.drain_deadline):
+                        self.halt = "failed"
+                        break
+                    self.cv.wait(0.2)
                 for a in self.live:
                     a.cancel = a.cancel or "halt"
                     a.abort.set()
@@ -769,6 +775,20 @@ class _Transfer:
     def _set_halt(self, how: str) -> None:
         if self.halt is None:
             self.halt = how
+        self.cv.notify_all()
+
+    def _begin_failure(self, reason: str, piece: Optional[int]) -> None:
+        """A piece has run out of attempts. Stop taking work; let what is running land.
+
+        Called with `cv` held. The pieces already in flight are bytes this run has paid
+        for, and committing them is what makes the rerun cheap, so they get
+        `drain_grace` seconds. A stalled one is abandoned when the grace runs out.
+        """
+        if self.failure is None:
+            self.failure = (reason, piece)
+        if not self.failing:
+            self.failing = True
+            self.drain_deadline = time.monotonic() + self.cfg.drain_grace
         self.cv.notify_all()
 
     def _bump(self, name: str) -> None:
@@ -787,14 +807,14 @@ class _Transfer:
             with self.cv:
                 if self.failure is None:
                     self.failure = (f"internal error: {exc!r}", None)
-                self._set_halt("failed")
+                self._set_halt("failed")      # a bug is not worth waiting for
 
     def _next(self):
         """The next (piece, lane, raced) for a worker, or None when the job is over."""
         pool = self.dl.pool
         while True:
             with self.cv:
-                if self.halt:
+                if self.halt or self.failing:
                     return None
                 if self.pending:
                     piece = self.pieces[self.pending.popleft()]
@@ -834,7 +854,7 @@ class _Transfer:
         att = _Attempt(piece, lane, raced, self.job.result, self.cv)
         with self.cv:
             piece.reserved -= 1
-            if self.halt or piece.state == "done":
+            if self.halt or self.failing or piece.state == "done":
                 dl.pool.release(lane)
                 return
             piece.owners.append(att)
@@ -870,9 +890,9 @@ class _Transfer:
                                f"{lane.index}: {reason}; attempt {piece.failures} of "
                                f"{cfg.retries}")
                 if piece.failures >= cfg.retries and piece.state != "done" and self.halt is None:
-                    self.failure = (f"piece {piece.i} (bytes {piece.start}-{piece.end}) failed "
-                                    f"{piece.failures} times; last error: {reason}", piece.i)
-                    self._set_halt("failed")
+                    self._begin_failure(f"piece {piece.i} (bytes {piece.start}-{piece.end}) "
+                                        f"failed {piece.failures} times; last error: {reason}",
+                                        piece.i)
         else:
             dl.pool.mark_alive(lane.endpoint)
             self._commit(att, body, digest)

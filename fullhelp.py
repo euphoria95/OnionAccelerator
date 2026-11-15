@@ -107,8 +107,8 @@ _RETRY_FLAG = (
     "--retries N",
     "Attempts per piece before giving up on the file (default 3). Each retry goes to a "
     "different endpoint and a new circuit, so a dead one costs one attempt, not the "
-    "file. A piece that runs out stops that file but deletes nothing: rerun the same "
-    "command and it resumes.",
+    "file. A piece that runs out stops that file but deletes nothing: the pieces already "
+    "in flight get ten seconds to finish, and rerunning the same command resumes.",
 )
 
 _PIECE_FLAGS = [

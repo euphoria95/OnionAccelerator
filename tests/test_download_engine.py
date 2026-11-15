@@ -220,6 +220,46 @@ def test_a_piece_that_exhausts_its_retries_leaves_the_file_resumable(tmp_path, s
     assert again.pieces_resumed >= result.pieces_done
 
 
+def test_a_failure_lets_the_pieces_already_in_flight_finish(tmp_path, source):
+    """Giving up on one piece must not throw away the others' nearly finished work.
+
+    Over Tor a piece takes tens of seconds, so aborting eight in-flight pieces the moment
+    one runs out of retries would discard up to eight pieces on every failure.
+    """
+    with FaultServer({NAME: source}) as server:
+        server.throttle = lambda ua: 600_000          # pieces 0-2 take ~0.4 s each
+        server.faults.append(lambda r: Drop(after=0) if r.start == 3 * PIECE else None)
+        out = tmp_path / "got.bin"
+        started = time.monotonic()
+        result = fetch(server, out, retries=2, drain_grace=10)
+        elapsed = time.monotonic() - started
+
+        assert not result.ok and "piece 3" in result.reason
+        assert result.pieces_done >= 3, "in-flight pieces were abandoned"
+        assert elapsed < 9, "the drain is bounded by what was in flight, not by the grace"
+        # And what they finished is journalled, so the rerun does not fetch it again.
+        server.faults.clear()
+        server.throttle = lambda ua: None
+        mark = len(server.log)
+        again = fetch(server, out)
+    assert again.ok and again.pieces_resumed >= 3
+    assert sha(out) == source.sha256()
+    assert {r.start for r in server.log[mark:] if r.start is not None}.isdisjoint(
+        {i * PIECE for i in range(3)})
+
+
+def test_the_drain_after_a_failure_gives_up_on_a_stalled_piece(tmp_path, source):
+    """The grace is a ceiling: a lane that has stalled is abandoned, not waited for."""
+    with FaultServer({NAME: source}) as server:
+        server.faults.append(lambda r: Drop(after=0) if r.start == 3 * PIECE else (
+            Stall(after=10, seconds=30) if r.start == 0 else None))
+        out = tmp_path / "got.bin"
+        started = time.monotonic()
+        result = fetch(server, out, retries=2, drain_grace=1.5, timeout=(5, 20))
+        elapsed = time.monotonic() - started
+    assert not result.ok and elapsed < 8
+
+
 def test_a_failed_run_never_touches_an_existing_finished_file(tmp_path, server):
     out = tmp_path / "got.bin"
     out.write_bytes(b"the good file from an earlier run")
