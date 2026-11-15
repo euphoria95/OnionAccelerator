@@ -36,7 +36,10 @@ The phased plan is docs/ROADMAP.md. Work on one phase at a time.
 ## Invariants
 - eventstream/ and fullhelp.py import only the standard library.
 - A stream event's `data` is byte-identical to the record written to disk.
-- The farm touches only instances named oaNN.
+- The farm touches only instances named oaNN, and the process backend only ones it
+  made itself (marker files, real directories inside its state directory, a pid whose
+  command line is its own tor). No test may reach the real state directory or a real
+  tor: tests/conftest.py points both at nothing, and tests/stubtor.py stands in.
 - A hostile URL or archive member name can never write outside the output directory.
 - A flag change updates README.md and fullhelp.py in the same commit.
   tests/test_cli.py checks the mirrored rvtree subcommands.

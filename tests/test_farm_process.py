@@ -20,7 +20,6 @@ import signal
 import socket
 import subprocess
 import sys
-import textwrap
 import time
 
 import pytest
@@ -340,6 +339,19 @@ def test_a_directory_the_farm_did_not_create_is_not_adopted(env, monkeypatch):
     assert os.listdir(env) == ["somebody-elses-file"]
 
 
+def test_a_port_someone_else_holds_refuses_the_run_and_creates_nothing(backend, env):
+    base = free_block(2)
+    holder = socket.socket()
+    holder.bind(("127.0.0.1", base + 1))
+    holder.listen(1)
+    try:
+        with pytest.raises(farm_process.FarmError, match="already in use"):
+            backend.up(count=2, base_port=base, timeout=5)
+    finally:
+        holder.close()
+    assert not os.path.exists(env), "a refused run left a directory behind"
+
+
 def test_an_empty_directory_is_adopted_and_marked(backend, env):
     os.makedirs(env)
     backend.up(count=1, base_port=free_block(1), timeout=20)
@@ -364,6 +376,12 @@ def test_a_recycled_pid_is_never_signalled(backend, env):
 
 
 # ----------------------------------------------------------------- selection and the CLI
+
+
+def test_no_test_can_reach_the_real_farm_state_or_a_real_tor():
+    """The guard in conftest.py: this is what keeps a stray `--farm up` off the home dir."""
+    assert not farm_process.farm_state_dir().startswith(os.path.expanduser("~/.local"))
+    assert farm_process.find_tor() is None
 
 
 def test_the_default_backend_is_process_unless_root():
