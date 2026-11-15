@@ -142,6 +142,19 @@ def farm_preflight():
                        "tor from the Tor Project's own repository (tor >= 0.4.8).")
 
 
+def warn_if_tor_lacks_pow(tor="tor"):
+    """The same warning farm_preflight() gives, for a backend that names its own tor."""
+    try:
+        modules = subprocess.run([tor, "--list-modules"], capture_output=True,
+                                 text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        modules = ""
+    if modules and "pow: yes" not in modules:
+        logger.warning("This tor was built without the 'pow' module, so onion services "
+                       "defended by proof-of-work will refuse every connection. Install "
+                       "tor from the Tor Project's own repository (tor >= 0.4.8).")
+
+
 def farm_mem_budget(count):
     """MaxMemInQueues for one of `count` farm instances, in MB.
 
@@ -173,12 +186,20 @@ def render_torrc(name, port, tune="off", count=1):
         "SafeLogging 1\n"
         f"Log notice file {TOR_LIB_DIR}/{name}/notices.log\n"
     )
+    return torrc + tune_block(tune, count)
+
+
+def tune_block(tune, count):
+    """The lines a --farm-tune profile appends to a torrc ("" for off), why-comments included.
+
+    Shared by every backend, so a profile means the same thing wherever the instance runs.
+    """
     if tune == "off":
-        return torrc
-    torrc += f"{FARM_TUNE_HEADER}{tune}\n"
+        return ""
+    block = f"{FARM_TUNE_HEADER}{tune}\n"
     for line, why in FARM_TUNE_PROFILES[tune]:
-        torrc += f"# {why}\n{line.format(mem=farm_mem_budget(count))}\n"
-    return torrc
+        block += f"# {why}\n{line.format(mem=farm_mem_budget(count))}\n"
+    return block
 
 
 def farm_tune_of(torrc):
@@ -362,12 +383,89 @@ def farm_destroy():
     logger.info("Farm destroyed. Your own (non-farm) Tor instances were left untouched.")
 
 
-def run_farm_action(action, count, base_port, timeout, tune="off"):
+# =========== BACKENDS ===========
+# Two ways to run the same farm of oaNN instances on 127.0.0.1:<base-port + NN>:
+#
+#   systemd  tor-instance-create + tor@oaNN units. Root, Debian or Ubuntu. Everything
+#            above is this backend; SystemdBackend only gives it the common shape.
+#   process  plain `tor -f` children under the user's state directory, with health read
+#            from each instance's control socket. Any Linux or macOS user with a tor
+#            binary. oacore/farm_process.py.
+#
+# Both only ever act on instances whose names pass assert_farm_name().
+FARM_BACKENDS = ("systemd", "process")
+
+
+class FarmBackend:
+    """What `--farm` needs of a backend. `run` is optional: only `process` can supervise."""
+
+    name = ""
+
+    def up(self, count, base_port, timeout, tune):
+        raise NotImplementedError
+
+    def status(self, base_port):
+        raise NotImplementedError
+
+    def down(self):
+        raise NotImplementedError
+
+    def destroy(self):
+        raise NotImplementedError
+
+    def run(self, count, base_port, timeout, tune):
+        raise ValueError(f"--farm run needs the 'process' backend, not '{self.name}': "
+                         f"systemd already supervises its own instances.")
+
+
+class SystemdBackend(FarmBackend):
+    """The original farm, unchanged: each method calls the function it always was."""
+
+    name = "systemd"
+
+    def up(self, count, base_port, timeout, tune):
+        return farm_up(count, base_port, timeout=timeout, tune=tune)
+
+    def status(self, base_port):
+        return farm_status(base_port)
+
+    def down(self):
+        return farm_down()
+
+    def destroy(self):
+        return farm_destroy()
+
+
+def select_backend(requested=None, euid=None):
+    """The backend to use: what was asked for, else `process` unless running as root.
+
+    Root is where the systemd stack is usable (and what the farm has always required);
+    anyone else gets a farm that needs no privileges at all.
+    """
+    if requested is not None:
+        if requested not in FARM_BACKENDS:
+            raise ValueError(f"unknown farm backend {requested!r}; choose from "
+                             f"{', '.join(FARM_BACKENDS)}")
+        return requested
+    return "systemd" if (os.geteuid() if euid is None else euid) == 0 else "process"
+
+
+def get_backend(name):
+    if name == "systemd":
+        return SystemdBackend()
+    from .farm_process import ProcessBackend       # not at import: it imports this module
+    return ProcessBackend()
+
+
+def run_farm_action(action, count, base_port, timeout, tune="off", backend=None):
+    impl = get_backend(select_backend(backend))
     if action == "up":
-        farm_up(count, base_port, timeout=timeout, tune=tune)
+        impl.up(count, base_port, timeout, tune)
     elif action == "status":
-        farm_status(base_port)
+        impl.status(base_port)
     elif action == "down":
-        farm_down()
+        impl.down()
     elif action == "destroy":
-        farm_destroy()
+        impl.destroy()
+    elif action == "run":
+        impl.run(count, base_port, timeout, tune)

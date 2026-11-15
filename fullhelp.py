@@ -439,29 +439,51 @@ SECTIONS = {
 }
 
 FARM = {
-    "summary": "provision and manage a farm of native client-only Tor instances",
+    "summary": "provision and manage a farm of client-only Tor instances",
     "what": [
-        "Not a --mode, and mutually exclusive with one. --farm provisions SOCKS5 proxies "
-        "using the Debian/Ubuntu tor-instance-create + systemd tor@<name> stack, with no "
-        "containers. Each instance is client-only (ClientOnly 1, no ORPort or DirPort, so "
-        "it never publishes a relay descriptor) and binds 127.0.0.1:<base-port + NN>, "
-        "which is exactly where the other modes look for it.",
-        "It is namespaced and it stays in its lane: every privileged action is gated by a "
-        "name guard that matches ^oa[0-9]+$ and excludes 'default', 'relay2' and "
-        "'torclient'. A stray '--farm destroy' cannot stop or delete your own relay or "
-        "client instances -- only oaNN are ever touched.",
-        "'up' and 'down'/'destroy' need root. 'status' does not.",
+        "Not a --mode, and mutually exclusive with one. --farm provisions SOCKS5 proxies, "
+        "with no containers required. Each instance is client-only (ClientOnly 1, no "
+        "ORPort or DirPort, so it never publishes a relay descriptor) and binds "
+        "127.0.0.1:<base-port + NN>, which is exactly where the other modes look for it.",
+        "Two backends run the same farm. 'process' (the default unless you are root) "
+        "starts plain 'tor -f' children under ~/.local/state/onionaccelerator/farm "
+        "(or $ONIONACCELERATOR_FARM_DIR): no root, no systemd, any Linux or macOS user "
+        "with a tor binary ($ONIONACCELERATOR_TOR to name one). Every instance has a "
+        "private control socket with cookie authentication, and bootstrap progress and "
+        "circuit counts are read from tor over it -- not from a log, which can say 100% "
+        "about a tor whose control port says otherwise. 'systemd' is the original: "
+        "tor-instance-create + tor@<name> units, Debian/Ubuntu, root.",
+        "Both are namespaced and stay in their lane: every action is gated by a name "
+        "guard that matches ^oa[0-9]+$ and excludes 'default', 'relay2' and 'torclient'. "
+        "The process backend adds three more: it refuses a state directory it did not "
+        "create, removes only directories carrying its own marker that sit directly "
+        "inside the state directory, and signals a pid only after its command line shows "
+        "it is tor running that instance's torrc. A stray '--farm destroy' cannot touch "
+        "your own relay or client instances.",
+        "The systemd backend's 'up', 'down' and 'destroy' need root; the process backend "
+        "needs none. 'status' needs none for either.",
     ],
     "flags": [
         ("--farm up",
          "Create, start and wait for each instance to report 'Bootstrapped 100%' with its "
-         "SOCKS port listening."),
+         "SOCKS port listening. A port already held by something that is not this farm "
+         "refuses the whole run before anything is created."),
         ("--farm status",
-         "Report each instance's systemd state, SOCKS port and bootstrap percentage."),
+         "Report each instance's state, SOCKS port and bootstrap percentage; with the "
+         "process backend also its pid, bootstrap tag and built/total circuits, all "
+         "read from tor's control socket."),
         ("--farm down",
          "Stop the farm, keeping configs and data."),
         ("--farm destroy",
-         "Stop the farm and purge it entirely."),
+         "Stop the farm and purge it entirely. The process backend removes only the "
+         "instances it made, and its state directory once nothing else is in it."),
+        ("--farm run",
+         "Process backend only. Like 'up', but stays in the foreground, restarts an "
+         "instance that dies, and stops them all cleanly on SIGTERM or Ctrl-C. For a "
+         "container's PID 1 or a user service."),
+        ("--farm-backend {systemd,process}",
+         "Which backend. Default: process, unless you are root, in which case systemd "
+         "(what --farm always was)."),
         ("--count N",
          "How many instances '--farm up' creates (default 20)."),
         ("--base-port PORT",
@@ -486,11 +508,14 @@ FARM = {
          "which a reload does not apply. '--farm status' shows each instance's profile."),
     ],
     "examples": [
-        ("sudo python3 OnionAccelerator.py --farm up --count 20", "bring proxies up"),
-        ("sudo python3 OnionAccelerator.py --farm up --count 20 --farm-tune onion",
+        ("python3 OnionAccelerator.py --farm up --count 20",
+         "bring proxies up as an ordinary user"),
+        ("python3 OnionAccelerator.py --farm up --count 20 --farm-tune onion",
          "bring them up tuned for onion crawling"),
         ("python3 OnionAccelerator.py --farm status", "check on them"),
-        ("sudo python3 OnionAccelerator.py --farm destroy", "tear down when done"),
+        ("python3 OnionAccelerator.py --farm destroy", "tear down when done"),
+        ("sudo python3 OnionAccelerator.py --farm up --farm-backend systemd",
+         "the systemd stack, as before"),
     ],
 }
 

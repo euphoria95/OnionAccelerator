@@ -27,6 +27,21 @@ import OnionAccelerator as _oa  # noqa: E402  (needs the sys.path above)
 PAYLOAD_SIZE = 1048576
 
 
+@pytest.fixture(autouse=True)
+def _no_test_touches_the_real_farm(monkeypatch, tmp_path_factory):
+    """Every test gets a private farm state directory and no usable `tor`.
+
+    The process backend is the default for a non-root user, so a test that reaches
+    `--farm up` by accident would otherwise write under the real ~/.local/state -- this
+    happened once, to an empty directory, which is once too often -- or, on a host with
+    tor installed, start it. Tests that mean to run a farm override both (the stub tor,
+    in tests/test_farm_process.py).
+    """
+    monkeypatch.setenv("ONIONACCELERATOR_FARM_DIR",
+                       str(tmp_path_factory.mktemp("farmguard") / "state"))
+    monkeypatch.setenv("ONIONACCELERATOR_TOR", "/nonexistent/tor-for-the-tests")
+
+
 @pytest.fixture
 def oa(monkeypatch):
     """OnionAccelerator with the SOCKS proxy stripped out.
