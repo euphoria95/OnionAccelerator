@@ -218,7 +218,7 @@ def test_a_download_appears_in_the_export_with_its_hash(populated, tmp_path):
 
 def test_csv_is_flat_and_round_trips_awkward_paths(ix, tmp_path):
     from indexfixtures import file_record
-    awkward = 'id_rsa, "the key"\nline two'
+    awkward = 'payroll "Q3", final\nline two.xlsx'
     ingest_dir(ix, write_crawl_dir(tmp_path, "run1", files=[], extra_files=[
         file_record(HOST_A, "/it/" + awkward, 5)]), rules=load_rules())
     _, text = export(ix, "csv", min_score=1)

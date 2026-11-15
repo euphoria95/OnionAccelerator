@@ -175,14 +175,28 @@ def test_a_missing_scope_file_is_an_error_when_asked_for_by_name(tmp_path):
         rulesmod.load_rules(scope_path=str(tmp_path / "absent.toml"))
 
 
-def test_a_pathological_regex_cannot_hang_the_ingest(tmp_path):
-    """Scope regexes are the operator's, but paths are an attacker's: bound the damage."""
-    scope = write_scope(tmp_path, "[scope]\nregexes = ['(a+)+$']\n")
+@pytest.mark.parametrize("pattern", ["(a+)+$", "(.*)*x", "(a*)*b", "^(\\w+\\s?)*$", "(x+x+)+y"])
+def test_a_regex_that_backtracks_exponentially_is_refused_at_load(tmp_path, pattern):
+    """Scope regexes are the operator's, but paths are an attacker's: refuse the shape."""
+    scope = write_scope(tmp_path, f"[scope]\nregexes = ['{pattern}']\n")
+    with pytest.raises(rulesmod.RuleError, match="backtrack"):
+        rulesmod.load_rules(scope_path=scope)
+
+
+@pytest.mark.parametrize("pattern", [r"(?i)\bPO-\d{6}\b", r"a+b+c+", r"(foo|bar)+", r"[^/]*\.pdf$",
+                                     r"(?:ab){1,3}c", r"x(\d+)y(\d+)z"])
+def test_ordinary_patterns_are_not_refused(tmp_path, pattern):
+    scope = write_scope(tmp_path, f"[scope]\nregexes = ['''{pattern}''']\n")
+    rulesmod.load_rules(scope_path=scope)
+
+
+def test_a_huge_path_is_matched_by_its_tail_only(tmp_path):
+    scope = write_scope(tmp_path, "[scope]\nregexes = ['secret$']\n")
     loaded = rulesmod.load_rules(scope_path=scope)
-    import time
-    started = time.monotonic()
-    loaded.score_path("/" + "a" * 5000 + "!")
-    assert time.monotonic() - started < 2, "a hostile path ran a catastrophic regex unbounded"
+    hits = loaded.score_path("/" + "x" * 2_000_000 + "/secret")
+    assert [h.rule for h in hits if h.rule.startswith("scope:")]
+    hit = next(h for h in hits if h.rule.startswith("scope:"))
+    assert hit.end == 2_000_008, "spans are offsets into the whole path, not the truncated tail"
 
 
 # ----------------------------------------------------------------------- in the index
@@ -231,3 +245,16 @@ def test_an_entrys_score_is_its_best_hit(ix, tmp_path):
     assert top[0]["path"] == "/it/id_rsa"
     assert top[0]["score"] == max(h["score"] for h in top[0]["hits"])
     assert top[0]["host"] == HOST_A
+
+
+@pytest.mark.parametrize("path, rule, word", [
+    ("/hr/payroll_2024.xlsx", "hr:payroll", "payroll"),
+    ("/fin/Bank Statement 2024.pdf", "finance:bank-details", "Bank Statement"),
+    ("/legal/nda_signed.pdf", "legal:nda", "nda"),
+    ("/mail/archive.pst", "mail:outlook-store", ".pst"),
+    ("/ops/api_keys.txt", "credentials:api-token-file", "api_keys.txt"),
+])
+def test_a_span_covers_what_matched_and_not_the_separators_around_it(path, rule, word):
+    """An explanation that highlights the slash and underscore beside the word is wrong."""
+    hit = next(h for h in rulesmod.load_rules().score_path(path) if h.rule == rule)
+    assert path[hit.start:hit.end] == word

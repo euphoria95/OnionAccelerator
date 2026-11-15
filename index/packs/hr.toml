@@ -1,0 +1,61 @@
+# Human-resources material: pay, personnel files, identity documents. The most personal
+# data in a leak, and the kind a breach notification has to count.
+[pack]
+name = "hr"
+description = "Payroll, personnel records, identity documents and benefits"
+
+[[rule]]
+id = "payroll"
+score = 70
+regex = '(?i)(?<![^/_.\- ])(payroll|salary|salaries|payslips?|remuneration)(?![^/_.\- ])'
+reason = "Pay information: payroll, salaries or payslips"
+positive = ["/hr/payroll_2024.xlsx", "/hr/Salary 2023.pdf", "/staff/payslip.pdf"]
+negative = ["/pub/payrolling-news", "/pub/salaryman.jpg"]
+
+[[rule]]
+id = "personnel-records"
+score = 65
+regex = '(?i)(?<![^/_.\- ])(personnel|employee|staff)[_ -]?(files?|records?|list|database|data|directory)(?![^/_.\- ])'
+reason = "Personnel records, lists or databases"
+positive = ["/hr/Employee_Records_2023.xlsx", "/hr/staff-list.csv", "/hr/personnel files/a.pdf"]
+negative = ["/pub/staff-party.jpg", "/pub/employees.txt"]
+
+[[rule]]
+id = "identity-document"
+score = 70
+regex = '(?i)(?<![^/_.\- ])(passports?|ssn|social[_ -]?security([_ -]?numbers?)?|national[_ -]?id)(?![^/_.\- ])'
+reason = "A passport, social-security or national-ID document or list"
+positive = ["/hr/passport scans/a.jpg", "/hr/ssn_list.xlsx", "/hr/Social Security Numbers.csv"]
+negative = ["/pub/passportal.png", "/pub/classnotes.txt"]
+
+[[rule]]
+id = "disciplinary"
+score = 60
+regex = '(?i)(performance[_ -]?reviews?|disciplinary|grievance|termination[_ -]?letters?|severance)'
+reason = "Performance, disciplinary or termination records"
+positive = ["/hr/Performance Review 2023.docx", "/hr/disciplinary/case1.pdf", "/hr/severance_terms.pdf"]
+negative = ["/hr/holiday-rota.xlsx", "/hr/onboarding.pdf"]
+
+[[rule]]
+id = "benefits"
+score = 55
+regex = '(?i)(?<![^/_.\- ])(pension|benefits?|medical[_ -]?claims?|health[_ -]?insurance)(?![^/_.\- ])'
+reason = "Pension, benefits or medical-claim records"
+positive = ["/hr/pension_scheme.xlsx", "/hr/Health Insurance 2024.pdf"]
+negative = ["/pub/pensioner.jpg", "/pub/beneficial.txt"]
+
+[[rule]]
+id = "cv"
+score = 30
+regex = '(?i)(?<![^/_.\- ])(cv|resume|curriculum[_ -]?vitae)(?![^/_.\- ])'
+reason = "A CV or resume"
+positive = ["/hr/recruiting/CV.pdf", "/hr/jane_doe_resume.docx"]
+negative = ["/src/cvs/readme", "/pub/resumed.txt"]
+
+[[rule]]
+id = "hr-folder"
+score = 35
+regex = '(?i)(^|/)(hr|human[_ -]?resources)/'
+reason = "Inside a folder named for human resources"
+positive = ["/HR/anything.txt", "/shares/Human Resources/x.docx"]
+negative = ["/chr/x", "/pub/hrs/x"]

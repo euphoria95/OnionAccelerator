@@ -4,6 +4,7 @@ Marked `slow` (a few minutes of local work, no network); CI runs it once, on 3.1
 """
 
 import os
+import stat
 import time
 
 import pytest
@@ -56,6 +57,9 @@ def test_a_million_entries_ingest_and_a_path_search_is_fast(tmp_path):
         t0 = time.monotonic()
         query.top_hits(ix, min_score=50, limit=20)
         assert time.monotonic() - t0 < 1.0
+        # A file this size has been through hundreds of WAL checkpoints; it must still be
+        # exactly as private as the empty one was.
+        assert stat.S_IMODE(os.stat(ix.path).st_mode) == 0o600
         size_mib = os.path.getsize(ix.path) / 2**20
         print(f"\n{N} entries: ingest {ingest_seconds:.0f}s ({N / ingest_seconds:.0f}/s), "
               f"db {size_mib:.0f} MiB")

@@ -1,0 +1,67 @@
+# Remote-access configuration: VPN profiles, saved sessions and server lists.
+[pack]
+name = "remote-access"
+description = "VPN profiles, RDP and SSH client files, saved-session exports"
+
+[[rule]]
+id = "openvpn-profile"
+score = 70
+on = "name"
+regex = '(?i)\.ovpn$'
+reason = "An OpenVPN client profile, which often embeds its certificate and key"
+positive = ["/vpn/client.ovpn", "/vpn/Corp-UK.OVPN"]
+negative = ["/vpn/ovpn_notes.txt", "/vpn/openvpn.exe"]
+
+[[rule]]
+id = "wireguard-config"
+score = 70
+on = "name"
+regex = '(?i)^(wg\d+|wg-[A-Za-z0-9_-]+)\.conf$'
+reason = "A WireGuard interface configuration, which holds its private key"
+positive = ["/etc/wireguard/wg0.conf", "/vpn/wg-office.conf"]
+negative = ["/etc/wget.conf", "/etc/wg.conf"]
+
+[[rule]]
+id = "ipsec-secrets"
+score = 85
+on = "name"
+regex = '(?i)^ipsec\.secrets$'
+reason = "An IPsec pre-shared-key file"
+positive = ["/etc/ipsec.secrets"]
+negative = ["/etc/ipsec.conf", "/docs/ipsec.secrets.md"]
+
+[[rule]]
+id = "rdp-file"
+score = 55
+on = "name"
+regex = '(?i)\.rdp$'
+reason = "A saved Remote Desktop connection, sometimes with a stored credential"
+positive = ["/users/u/Desktop/server01.rdp", "/users/u/Documents/Default.rdp"]
+negative = ["/docs/rdp-guide.pdf", "/docs/grdp.txt"]
+
+[[rule]]
+id = "saved-sessions"
+score = 75
+on = "name"
+regex = '(?i)^(putty[^/]*\.reg|winscp\.ini|filezilla\.xml|sitemanager\.xml|recentservers\.xml)$'
+reason = "A saved-session store of an SSH, SFTP or FTP client"
+positive = ["/AppData/Roaming/FileZilla/sitemanager.xml", "/u/WinSCP.ini", "/u/putty-sessions.reg"]
+negative = ["/docs/sitemap.xml", "/docs/putty.exe"]
+
+[[rule]]
+id = "ssh-client-state"
+score = 50
+on = "name"
+regex = '^(known_hosts|authorized_keys|ssh_config|sshd_config)$'
+reason = "SSH state that maps out which hosts and keys are trusted"
+positive = ["/home/u/.ssh/known_hosts", "/etc/ssh/sshd_config"]
+negative = ["/docs/known_hosts_explained.pdf", "/home/u/.ssh/known_hosts.old"]
+
+[[rule]]
+id = "connection-manager"
+score = 80
+on = "name"
+regex = '(?i)^(confcons\.xml|[^/]+\.rdg)$'
+reason = "A remote-connection manager export, which can list hosts and passwords"
+positive = ["/it/servers.rdg", "/AppData/mRemoteNG/confCons.xml"]
+negative = ["/it/rdg.txt", "/it/confcons.xml.txt"]

@@ -1,0 +1,67 @@
+# Database dumps and files. Large, central, and often unencrypted.
+[pack]
+name = "database"
+description = "SQL dumps, database files and database backups"
+
+[[rule]]
+id = "named-sql-dump"
+score = 70
+on = "name"
+regex = '(?i)(dump|backup|export|full|prod|production|db)[^/]*\.sql(\.(gz|bz2|xz|zst))?$'
+reason = "A SQL file whose name says it is a dump or backup"
+positive = ["/db/prod_dump.sql", "/db/full-backup.sql.gz", "/db/mysqldb.sql"]
+negative = ["/db/migrate.sql", "/db/dump.txt"]
+
+[[rule]]
+id = "sql-file"
+score = 40
+on = "name"
+regex = '(?i)\.sql$'
+reason = "A SQL file; it may be a script or a dump"
+positive = ["/db/migrate.sql"]
+negative = ["/db/sql.txt", "/db/migrate.sqlx"]
+
+[[rule]]
+id = "embedded-database"
+score = 45
+on = "name"
+regex = '(?i)^(?!thumbs\.db$|desktop\.db$)[^/]+\.(sqlite3?|db3?)$'
+reason = "An SQLite or generic embedded database file"
+positive = ["/app/data.sqlite", "/app/users.db", "/app/x.SQLITE3"]
+negative = ["/pic/Thumbs.db", "/app/desktop.db", "/app/dbfile.txt"]
+
+[[rule]]
+id = "server-database-file"
+score = 70
+on = "name"
+regex = '(?i)\.(mdf|ldf|ndf)$'
+reason = "A Microsoft SQL Server data or log file"
+positive = ["/sql/prod.mdf", "/sql/prod_log.LDF"]
+negative = ["/sql/mdf.txt", "/sql/prod.mdf.txt"]
+
+[[rule]]
+id = "binary-dump"
+score = 60
+on = "name"
+regex = '(?i)\.(dmp|pgdump|pg_dump|dump)$'
+reason = "A binary database dump (or a crash dump, which can also hold secrets)"
+positive = ["/oracle/exp.dmp", "/pg/all.pgdump"]
+negative = ["/docs/dmp.txt", "/docs/pgdump.md"]
+
+[[rule]]
+id = "document-store-export"
+score = 60
+on = "name"
+regex = '(?i)\.(bson|rdb)(\.gz)?$'
+reason = "A MongoDB BSON dump or a Redis snapshot"
+positive = ["/mongo/users.bson", "/redis/dump.rdb", "/mongo/orders.bson.gz"]
+negative = ["/docs/bson.md", "/docs/rdbms.txt"]
+
+[[rule]]
+id = "named-db-archive"
+score = 75
+on = "name"
+regex = '(?i)(?<![^_.-])(db|database|mysql|postgres|mongo)[_-]?(backup|dump|export)[^/]*\.(zip|tar|gz|tgz|7z|rar|bz2|xz)$'
+reason = "An archive named for a database backup"
+positive = ["/bk/mysql_backup_2024.tar.gz", "/bk/db-dump.zip"]
+negative = ["/bk/backup.zip", "/bk/mysql_notes.zip"]

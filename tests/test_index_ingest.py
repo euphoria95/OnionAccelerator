@@ -202,7 +202,8 @@ def test_the_output_of_a_real_crawl_ingests(ix, tmp_path):
 
     ingest_dir(ix, out)
     paths = {r[0]: (r[1], r[2]) for r in rows(ix, "SELECT path, kind, size FROM entries")}
-    assert paths["/top.bin"] == ("file", 2048)
+    # http.server's autoindex shows no sizes, and an unknown size must stay unknown.
+    assert paths["/top.bin"] == ("file", None)
     assert paths["/a/deep/buried.txt"][0] == "file"
     assert paths["/a/deep"][0] == "dir" and paths["/"][0] == "dir"
     assert rows(ix, "SELECT job_id FROM runs") == [("test",)]
@@ -274,10 +275,27 @@ def test_path_search_finds_words_and_prefixes_and_is_not_duplicated_by_reingest(
     assert query.search(ix, "nothing-matches-this") == []
 
 
-def test_a_malformed_search_is_an_error_not_a_crash(ix):
+@pytest.mark.parametrize("typed", ["/Backups/payroll", "payroll_2024.xlsx", "backups/payroll",
+                                   "Payroll-2024", "  PAYROLL  ", "payroll;", "\"payroll"])
+def test_a_path_typed_into_the_search_is_read_the_way_the_index_reads_paths(ix, tmp_path, typed):
+    """A search box that rejects '-' and '/' rejects the thing it exists to search for."""
     from index import query
+    ingest_dir(ix, write_crawl_dir(tmp_path, "run1", files=[("/Backups/Payroll_2024.xlsx", 1)]))
+    assert [r["path"] for r in query.search(ix, typed)] == ["/Backups/Payroll_2024.xlsx"], typed
+
+
+def test_a_search_with_no_words_finds_nothing_and_does_not_error(ix):
+    from index import query
+    assert query.search(ix, "///---") == [] and query.search(ix, "") == []
+
+
+def test_a_raw_fts_query_is_available_and_a_malformed_one_is_an_error_not_a_crash(ix, tmp_path):
+    from index import query
+    ingest_dir(ix, write_crawl_dir(tmp_path, "run1", files=[("/a/payroll.txt", 1), ("/b/mail.txt", 1)]))
+    assert {r["path"] for r in query.search(ix, "payroll OR mail", raw=True)} == {
+        "/a/payroll.txt", "/b/mail.txt"}
     with pytest.raises(query.QueryError):
-        query.search(ix, '"unterminated')
+        query.search(ix, '"unterminated', raw=True)
 
 
 # ----------------------------------------------------------------------- custody
@@ -317,3 +335,36 @@ def test_a_custody_record_for_an_unknown_url_is_kept_unlinked(ix):
     ing.apply("dl-1", "download.done", custody("http://elsewhere.test/f.bin"))
     ing.flush()
     assert rows(ix, "SELECT entry_id, url FROM downloads") == [(None, "http://elsewhere.test/f.bin")]
+
+
+# ----------------------------------------------------------------------- the docs
+
+
+def test_the_sql_examples_in_the_readme_run_against_the_real_schema(ix, tmp_path):
+    """Documentation that cannot be executed rots: run every ```sql block in the README."""
+    import re
+
+    from index.rules import load_rules
+    readme = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                               "README.md"), encoding="utf-8").read()
+    section = readme.split("## The persistent index", 1)[1].split("\n## ", 1)[0]
+    blocks = re.findall(r"```sql\n(.*?)```", section, re.S)
+    assert len(blocks) == 1, "expected the schema section's one SQL block"
+    statements = [s.strip() for s in blocks[0].split(";") if s.strip()]
+    assert len(statements) == 3
+
+    ingest_dir(ix, write_crawl_dir(tmp_path, "run1", files=[("/hr/payroll_2024.xlsx", 5)], at=0),
+               rules=load_rules())
+    ingest_dir(ix, write_crawl_dir(tmp_path, "run2", files=[("/hr/payroll_2024.xlsx", 5),
+                                                          ("/new/payroll_2025.xlsx", 9)], at=1000),
+               rules=load_rules())
+    runs = dict(rows(ix, "SELECT job_id, id FROM runs"))
+    params = {"host": HOST_A, "run": runs["run1"]}
+    results = []
+    for statement in statements:
+        wanted = {k: v for k, v in params.items() if f":{k}" in statement}
+        results.append(ix.conn.execute(statement, wanted).fetchall())
+    new_entries, top, sightings = results
+    assert ("/new/payroll_2025.xlsx", 9) in new_entries
+    assert top and top[0][2] >= 1
+    assert {r[1] for r in sightings} == {"/hr/payroll_2024.xlsx"}, "payroll AND 2024, not 2025"
