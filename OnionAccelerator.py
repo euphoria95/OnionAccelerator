@@ -31,6 +31,7 @@ import fullhelp
 # verification is off on purpose, since an onion address authenticates the peer.
 from oacore import common as _common, config as _config, download as _download
 from oacore import engine as _engine, farm as _farm, sizeprobe as _sizeprobe
+from oacore import farm_process, torcontrol  # noqa: F401  (torcontrol is re-exported)
 from oacore.config import (
     MAX_WORKERS, BASE_PORT, CHUNK_SIZE, MIN_PARTIAL_CHUNK_SIZE, REQUEST_TIMEOUT,
     TRANSFER_TIMEOUT, USERAGENTS_FILE, URLS_FILE, DOWNLOAD_DIR,
@@ -63,10 +64,12 @@ from oacore.farm import (
     TOR_INSTANCE_PREFIX, FARM_RE, FARM_RESERVED, TOR_INSTANCES_DIR, TOR_LIB_DIR,
     TOR_RUN_DIR, BOOTSTRAP_TIMEOUT, FARM_RESTART_STAGGER, FARM_TUNE_SAFE,
     FARM_TUNE_PROFILES, FARM_TUNE_SOCKS_FLAGS, FARM_TUNE_HEADER, assert_farm_name,
-    _run, _write_root_file, farm_instance_name, farm_preflight, farm_mem_budget,
-    render_torrc, farm_tune_of, _read_torrc, _socks_line, torrc_apply_action,
-    bootstrap_percent, wait_bootstrap, farm_up, farm_instances_on_disk,
-    systemd_active, farm_status, farm_down, farm_destroy, run_farm_action,
+    _run, _write_root_file, farm_instance_name, farm_preflight,
+    warn_if_tor_lacks_pow, farm_mem_budget, render_torrc, tune_block, farm_tune_of,
+    _read_torrc, _socks_line, torrc_apply_action, bootstrap_percent, wait_bootstrap,
+    farm_up, farm_instances_on_disk, systemd_active, farm_status, farm_down,
+    farm_destroy, FARM_BACKENDS, FarmBackend, SystemdBackend, select_backend,
+    get_backend, run_farm_action,
 )
 
 
@@ -1001,6 +1004,14 @@ def crawl_mode(urls, proxies, args, sink=None):
     except ValueError as e:                           # an unknown --profile, or a bad template
         logger.error(f"{e}")
         return 1
+    # Where an endpoint is an instance of the process farm, its tor can say how many
+    # circuits it held. A crawl that went quiet on one endpoint reads differently when
+    # that endpoint had three built circuits than when it had none. Best effort: it is
+    # telemetry, and never costs the run its exit code.
+    try:
+        farm_process.annotate_stats(os.path.join(out_dir, "stats.json"), proxies)
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"no circuit counts for stats.json: {e!r}")
     # Held until this function actually returns rather than published here: with
     # --download the process keeps pulling bytes for hours after the crawl stops, and a
     # consumer told the run ended while the job is still working cannot tell a finished
@@ -1084,12 +1095,21 @@ def build_parser():
                              "the file entirely: URLs.txt is not read and need not exist. "
                              "Under --mode tree it becomes rvtree's URL argument, so "
                              "'--url X -- extract p' runs 'extract X p'.")
-    parser.add_argument("--farm", choices=["up", "status", "down", "destroy"], default=None,
-                        help="Manage a native Tor-instance farm (tor-instance-create + "
-                             "systemd, no Docker): 'up' creates/starts/bootstraps "
-                             "instances, 'status' reports them, 'down' stops them, "
-                             "'destroy' purges them. Only ever touches farm-owned "
-                             f"'{TOR_INSTANCE_PREFIX}NN' instances. Mutually exclusive with --mode.")
+    parser.add_argument("--farm", choices=["up", "status", "down", "destroy", "run"], default=None,
+                        help="Manage a farm of Tor instances (no Docker): 'up' creates/starts/"
+                             "bootstraps instances, 'status' reports them, 'down' stops them, "
+                             "'destroy' purges them, and 'run' (process backend) is 'up' "
+                             "that stays in the foreground, restarts what dies and stops "
+                             "cleanly on SIGTERM, for a container or a user service. Only "
+                             f"ever touches farm-owned '{TOR_INSTANCE_PREFIX}NN' instances. "
+                             "Mutually exclusive with --mode.")
+    parser.add_argument("--farm-backend", choices=list(FARM_BACKENDS), default=None,
+                        help="How the farm runs. 'systemd': tor-instance-create + tor@NN "
+                             "units, needs root, Debian/Ubuntu (what --farm always was). "
+                             "'process': plain 'tor -f' children under ~/.local/state/"
+                             "onionaccelerator/farm, any Linux or macOS user with a tor "
+                             "binary, health read from tor's control socket. Default: "
+                             "process unless run as root.")
     parser.add_argument("--count", type=int, default=MAX_WORKERS,
                         help=f"Number of farm instances for '--farm up' (default {MAX_WORKERS}).")
     parser.add_argument("--base-port", type=int, default=BASE_PORT,
@@ -1385,14 +1405,25 @@ def main(argv=None):
                      "daemons and discovers nothing. It applies to --mode crawl, "
                      "--mode tree and --detect.")
 
+    if args.farm_backend and not args.farm:
+        parser.error("--farm-backend only applies to --farm.")
+
+    if args.farm == "run" and select_backend(args.farm_backend) != "process":
+        parser.error("--farm run needs the process backend: the systemd backend is "
+                     "supervised by systemd itself. Pass --farm-backend process.")
+
     if args.farm_tune and args.farm != "up":
         parser.error("--farm-tune only applies to '--farm up', which is what writes the "
                      "torrc; '--farm status' shows the profile each instance runs.")
 
     # Farm management needs no URL list; run the action and exit.
     if args.farm:
-        run_farm_action(args.farm, args.count, args.base_port, args.bootstrap_timeout,
-                        tune=args.farm_tune or "off")
+        try:
+            run_farm_action(args.farm, args.count, args.base_port, args.bootstrap_timeout,
+                            tune=args.farm_tune or "off", backend=args.farm_backend)
+        except farm_process.FarmError as e:
+            logger.error(f"--farm {args.farm}: {e}")
+            sys.exit(1)
         logger.info("OnionAccelerator farm action finished.")
         return
 

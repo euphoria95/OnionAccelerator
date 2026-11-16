@@ -206,7 +206,9 @@ def test_farm_tune_reaches_farm_up(tmp_path, monkeypatch):
     seen = {}
     monkeypatch.setattr(oa, "farm_up", lambda count, base_port, timeout, tune: seen.update(
         count=count, tune=tune))
-    oa.main(["--farm", "up", "--count", "2", "--farm-tune", "onion"])
+    # The default backend is `process` for a non-root user; farm_up is the systemd one.
+    oa.main(["--farm", "up", "--count", "2", "--farm-tune", "onion",
+             "--farm-backend", "systemd"])
     assert seen == {"count": 2, "tune": "onion"}
 
 
@@ -215,7 +217,7 @@ def test_farm_up_without_the_flag_is_untuned(tmp_path, monkeypatch):
     seen = {}
     monkeypatch.setattr(oa, "farm_up", lambda count, base_port, timeout, tune: seen.update(
         tune=tune))
-    oa.main(["--farm", "up", "--count", "1"])
+    oa.main(["--farm", "up", "--count", "1", "--farm-backend", "systemd"])
     assert seen == {"tune": "off"}
 
 

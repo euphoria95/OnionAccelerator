@@ -994,8 +994,9 @@ as they would to a run started by hand.
 
 ## Project Structure
 
+- `Dockerfile`: the farm as a container (`--farm run`, process backend).
 - `OnionAccelerator.py`: The command line, speedtest, proxy discovery and the glue for tree, crawl and stream. Installed as the `onionaccelerator` command.
-- `oacore/`: The download engine (`engine.py`) and the modes built on it (`download.py`), the remote size probe (`sizeprobe.py`), the native farm (`farm.py`) and the settings and helpers they share. `OnionAccelerator.py` re-exports all of it.
+- `oacore/`: The download engine (`engine.py`) and the modes built on it (`download.py`), the remote size probe (`sizeprobe.py`), the native farm (`farm.py`: the backend interface and the systemd backend; `farm_process.py`: the rootless backend; `torcontrol.py`: its control-port client) and the settings and helpers they share. `OnionAccelerator.py` re-exports all of it.
 - `remote_viewer/`: The `rvtree` package behind `--mode tree`. Usable on its own too — see its own README.
 - `crawler/`: The asyncio package behind `--mode crawl` — multi-circuit proxy pool, frontier, fetcher and reporting. The only async code in the project; the other modes stay on threads over `requests`.
 - `crawler/listing/`: The scraping layer, with no crawl in it: the structural reader, the JSON/XML/row/manifest strategies, the addressing rules, and the template engine behind `--profile` and `--detect`. Adding support for a target is a file in `crawler/listing/templates/`, not a change to the crawler — see that directory's [README](crawler/listing/templates/README.md).
@@ -1024,23 +1025,53 @@ The version floors are in `pyproject.toml`. CI tests them as written, on the old
 ## Native Tor Farm (`--farm`)
 
 Instead of the Docker one-liner, OnionAccelerator can provision a farm of **native
-Tor instances** using the Debian/Ubuntu `tor-instance-create` + systemd `tor@<name>`
-stack — no containers. Each instance is a **client-only** SOCKS5 proxy bound to
-`127.0.0.1:<base-port + N>`, matching what the download modes expect.
+Tor instances** — no containers. Each instance is a **client-only** SOCKS5 proxy bound to
+`127.0.0.1:<base-port + N>`, matching what the download modes expect. Two backends run it:
+
+| `--farm-backend` | What it is | Needs |
+|---|---|---|
+| `process` (default unless root) | plain `tor -f` children under `~/.local/state/onionaccelerator/farm` (or `$ONIONACCELERATOR_FARM_DIR`), one DataDirectory, pidfile and control socket each | any Linux or macOS user with a `tor` binary (`$ONIONACCELERATOR_TOR` names one) |
+| `systemd` | the original: `tor-instance-create` + `tor@<name>` units | root, Debian or Ubuntu |
 
 ```bash
-# Create, start, and wait for 20 instances to bootstrap (needs root/sudo):
-sudo python3 OnionAccelerator.py --farm up --count 20
+# Create, start, and wait for 20 instances to bootstrap — as an ordinary user:
+python3 OnionAccelerator.py --farm up --count 20
 
-# Report each instance's systemd state, SOCKS port, and bootstrap %:
+# Report each instance's state, SOCKS port, bootstrap % and circuits:
 python3 OnionAccelerator.py --farm status
 
 # Stop the farm (configs/data kept):
-sudo python3 OnionAccelerator.py --farm down
+python3 OnionAccelerator.py --farm down
 
 # Stop and purge the farm entirely:
-sudo python3 OnionAccelerator.py --farm destroy
+python3 OnionAccelerator.py --farm destroy
+
+# Stay in the foreground, restart what dies, stop cleanly on SIGTERM (containers, user services):
+python3 OnionAccelerator.py --farm run --count 8
+
+# The systemd stack, as it always was:
+sudo python3 OnionAccelerator.py --farm up --count 20 --farm-backend systemd
 ```
+
+**Health comes from tor, not from a log.** Each process-backend instance has a
+`ControlSocket` with cookie authentication, mode `0600` in a `0700` directory. `--farm up`
+waits for `GETINFO status/bootstrap-phase` to say `PROGRESS=100` and the SOCKS port to be
+listening, and `--farm status` shows each instance's pid, bootstrap tag and built/total
+circuits from `GETINFO circuit-status`. A tor that is stuck at 40% while its log claims
+100% is reported at 40%. The client behind this is `oacore/torcontrol.py`: standard
+library only, and it speaks exactly `AUTHENTICATE`, those two `GETINFO` keys, and
+`SIGNAL NEWNYM` / `SIGNAL SHUTDOWN` — nothing else. The control port is for bootstrap,
+health and telemetry; it is not a second way to rotate circuits, since a fresh SOCKS
+credential already buys one. A crawl run over a farm instance records its circuit counts
+under `tor_circuits` in `stats.json`.
+
+**What it will and will not touch.** Beyond the `oaNN` name guard below, the process
+backend refuses a state directory it did not create (no `.oa-farm` marker), removes only
+instance directories that carry its own marker and sit directly inside the state
+directory (a symlink out of it, or a hand-made `oa07`, is left alone), and signals a pid
+only after confirming its command line is `tor -f <this instance's torrc>` — a pidfile
+outlives its process and pids get reused. A port that something else already holds
+refuses the whole `up` before anything is created.
 
 - **Namespaced & safe.** The farm owns only instances named `oaNN` (e.g. `oa00`..`oa19`).
   Every privileged action is gated by a name guard, so `--farm down`/`destroy` can
@@ -1048,8 +1079,10 @@ sudo python3 OnionAccelerator.py --farm destroy
   you named yourself) — only `oa*` instances are ever touched.
 - **Client-only.** Farm torrc files set `ClientOnly 1` with no `ORPort`/`DirPort`, so
   instances never publish a relay descriptor.
-- **Bootstrap-aware.** `--farm up` waits until each instance reports `Bootstrapped 100%`
-  and its SOCKS port is listening (bounded by `--bootstrap-timeout`, default 120s).
+- **Bootstrap-aware.** `--farm up` waits until each instance reports bootstrap 100% and
+  its SOCKS port is listening (bounded by `--bootstrap-timeout`, default 120s). The
+  process backend asks tor over its control socket; the systemd backend still reads the
+  tail of `notices.log`.
 - **Configurable size/ports.** `--count` (default 20) and `--base-port` (default 5000)
   control how many instances and which ports; instance `NN` binds `base_port + NN`.
 
@@ -1142,11 +1175,26 @@ python3 OnionAccelerator.py --mode multi                # download
 sudo python3 OnionAccelerator.py --farm destroy         # tear down when done
 ```
 
-## Alternative: wrap Tor proxies with Docker (Bash one-liner)
+## Alternative: a container (`Dockerfile`)
+
+The `Dockerfile` at the repository root runs the process backend as the container's main
+process (`--farm run`): an unprivileged user, no systemd, the instances stopped cleanly when
+the container is.
 
 ```bash
-for port in {5000..5020}; do     docker run -d --name "torproxy_$port" -p 127.0.0.1:$port:9050 dperson/torproxy; done
+docker build -t onionaccelerator .
+# The SOCKS ports are bound to the container's loopback, so share the host's network
+# namespace to use them from the host (and keep them off every other interface):
+docker run -d --name oa-farm --network host -e OA_COUNT=8 onionaccelerator
+python3 OnionAccelerator.py --mode speedtest          # finds 127.0.0.1:5000-5007
+docker stop oa-farm                                   # SIGTERM: instances shut down cleanly
 ```
+
+`OA_COUNT` and `OA_BASE_PORT` set the farm's size and first port (8 and 5000). Mount a
+volume at `/home/oa/.local/state/onionaccelerator` to keep the instances' consensus and
+guards between runs. This replaces the earlier one-liner that started a `dperson/torproxy`
+container per port: one container per proxy cannot share a guard set or be health-checked
+from tor, and the image it pulled is not this project's to vouch for.
 
 ## External Proxy List (`--external`)
 
