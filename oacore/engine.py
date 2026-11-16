@@ -95,7 +95,9 @@ class EngineConfig:
     retries: int = DEFAULT_RETRIES          # attempts per piece before the job gives up
     timeout: tuple = TRANSFER_TIMEOUT       # (connect, read)
     fresh: bool = False                     # discard any journal and start over
-    endgame_pieces: int = 3                 # race the last N pieces on two lanes; 0 = never
+    endgame_pieces: int = 3                 # race a late piece among the last N on a second lane; 0 = never
+    race_factor: float = 2.0                # "late": running this many times the median finished piece
+    race_floor: float = 1.0                 # ...and never earlier than this many seconds
     slow_window: float = 20.0               # seconds a piece must be slow before it is cancelled
     slow_ratio: float = 0.1                 # "far below": under this fraction of the median; 0 = off
     slow_min_lanes: int = 4                 # lanes that must have a rate before there is a median
@@ -744,6 +746,7 @@ class _Transfer:
         self.drain_deadline = 0.0
         self.failure: Optional[tuple] = None     # (reason, piece index)
         self.stale: Optional[_Stale] = None
+        self.durations: list[float] = []         # how long each finished piece took, for "late"
         self.lane_pieces: collections.Counter = collections.Counter()
         self.live: list[_Attempt] = []
 
@@ -838,14 +841,26 @@ class _Transfer:
             return piece, pool.acquire(exclude=exclude), False
 
     def _race_candidate(self) -> Optional[_Piece]:
-        """A piece worth running twice: one of the last few, running once, on one lane."""
+        """A *late* piece among the last few, running once, on one lane.
+
+        Racing every one of the last pieces the moment a lane goes idle looks harmless and is
+        not: when the lanes are equal the pieces finish together, so every race is a second
+        copy of bytes that were about to arrive (measured: a 16 MiB file over four equal lanes
+        was served 24 MiB). A race pays only for a piece that is behind, so "behind" is
+        defined against what the other pieces actually did: `race_factor` times the median
+        finished piece, and no sooner than `race_floor`. With nothing finished yet there is
+        nothing to compare with, and nothing is raced.
+        """
         cfg = self.cfg
-        if cfg.endgame_pieces <= 0 or len(self.pieces) < 2:
+        if cfg.endgame_pieces <= 0 or len(self.pieces) < 2 or not self.durations:
             return None
         left = [p for p in self.pieces if p.state != "done"]
         if not left or len(left) > cfg.endgame_pieces:
             return None
-        runnable = [p for p in left if len(p.owners) == 1 and p.reserved == 0]
+        late = max(cfg.race_floor, cfg.race_factor * statistics.median(self.durations))
+        now = time.monotonic()
+        runnable = [p for p in left if len(p.owners) == 1 and p.reserved == 0
+                    and now - p.owners[0].started >= late]
         return min(runnable, key=lambda p: p.owners[0].started, default=None)
 
     # -- one attempt ---------------------------------------------------------------
@@ -983,6 +998,7 @@ class _Transfer:
             self._write_at(piece.start, body)
             piece.state, piece.sha, piece.lane = "done", digest, lane.index
             self.done_count += 1
+            self.durations.append(elapsed)
             self.lane_pieces[lane.index] += 1
             record = {"kind": "piece", "url": self.url, "i": piece.i, "status": "done",
                       "sha256": digest, "lane": lane.index, "attempts": piece.fetches}
