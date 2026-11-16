@@ -3,7 +3,7 @@
 Any crawl, tree listing or detection can publish what it finds *while it runs*, as
 newline-delimited JSON over HTTP on loopback, for an external script to grep or index —
 so a keyword hit during a four-hour Tor crawl arrives at minute three instead of at the
-end. See **Live Streaming API** below.
+end. See the details below.
 
 ## Details
 

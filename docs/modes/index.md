@@ -1,8 +1,7 @@
 # The persistent index (`--mode index`)
 
 Every crawl and archive listing lands in one SQLite file, scored and searchable, so the
-question changes from "what is on this site" to "what is new, and what touches us". See
-**The persistent index** below.
+question changes from "what is on this site" to "what is new, and what touches us".
 
 ## Details
 

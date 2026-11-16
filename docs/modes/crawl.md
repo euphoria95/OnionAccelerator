@@ -5,7 +5,7 @@
 - Parses listings with a **server-agnostic** parser: Apache `<pre>` and `<table>`, nginx,
   lighttpd, Caddy, hand-rolled templates and nginx's JSON autoindex all come out as the
   same `directories` / `files` split, because the filtering is structural rather than
-  template-matched (see **Open-Directory Crawl** below).
+  template-matched (see the details below).
 - Also walks the **file managers** leak sites run, which serve a whole tree from one
   route and encode the path into it — `/r/filemanager/TOK/dumps%2Fraw/part.bin` — rather
   than serving the tree at its own paths.
