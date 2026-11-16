@@ -259,8 +259,11 @@ sends no validators at all can only be caught by a change of size, and the log s
 **Slow and stalled lanes.** A piece that has run far below the median lane (under a tenth
 of it, for 20 seconds) is cancelled, requeued, and its lane rotated onto a new circuit. The
 rule is relative on purpose: when every lane is slow the median is low too and nothing is
-cancelled. The last few pieces are **raced** on two lanes and the first to finish wins, so
-one bad circuit cannot hold a finished file hostage.
+cancelled. Among the last few pieces, one that is **running late** — twice the median finished
+piece, and never before a second — is raced on a second lane, and the first to finish wins, so
+one bad circuit cannot hold a finished file hostage. Only a late piece is raced: when the lanes
+are equal the pieces finish together, and racing them anyway would just fetch the same bytes
+twice (it did, until a benchmark measured it).
 
 **Custody record.** When a file completes, the journal and the part file are gone and
 `<name>.oa.json` is written beside it:

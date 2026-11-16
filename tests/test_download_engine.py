@@ -447,6 +447,43 @@ def test_the_last_pieces_are_raced_and_the_first_to_finish_wins(tmp_path):
     assert elapsed < 6, "the slow lane's piece held the whole file hostage"
 
 
+def test_pieces_that_are_all_on_schedule_are_never_fetched_twice(tmp_path):
+    """The endgame races a *straggler*, not every piece that happens to be last.
+
+    Found by the Phase 5 benchmark, not by a test: on a clean network a 16 MiB file over four
+    equal lanes was served 24 MiB, because the last pieces were raced the instant a lane
+    went idle, whether or not anything was late. Over Tor that is bandwidth spent on nothing.
+    """
+    source = PatternSource(4 * PIECE, seed=21)
+    with FaultServer({NAME: source}) as server:
+        server.throttle = lambda ua: 2_000_000            # every lane the same: ~0.13 s a piece
+        out = tmp_path / "got.bin"
+        result = fetch(server, out, lanes=4)
+        starts = [r.start for r in server.ranged()]
+        assert result.ok and sha(out) == source.sha256()
+    assert sorted(starts) == [i * PIECE for i in range(4)], "a piece was requested twice"
+    assert result.raced == 0
+
+
+def test_a_late_piece_is_raced_only_once_it_is_clearly_late(tmp_path):
+    """The other half: a real straggler still gets rescued, and not instantly."""
+    source = PatternSource(6 * PIECE, seed=22)
+    uas = [f"lane-{i}" for i in range(6)]
+    with FaultServer({NAME: source}) as server:
+        server.throttle = lambda ua: 40_000 if ua == "lane-0" else 4_000_000
+        out = tmp_path / "got.bin"
+        downloader = engine.Downloader([None] * 6, user_agents=uas,
+                                       config=cfg(slow_ratio=0, race_floor=0.4, timeout=(30, 30)))
+        slow_lane = downloader.lane_user_agents.index("lane-0")
+        started = time.monotonic()
+        result = downloader.download(server.url(NAME), str(out))
+        elapsed = time.monotonic() - started
+        downloader.close()
+    assert result.ok and sha(out) == source.sha256()
+    assert result.raced >= 1 and result.pieces_by_lane.get(slow_lane, 0) == 0
+    assert elapsed < 5, "the straggler held the file hostage"
+
+
 def test_each_lane_keeps_one_user_agent_for_its_whole_life(tmp_path, server, source,
                                                            monkeypatch):
     import OnionAccelerator as oa

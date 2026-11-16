@@ -185,8 +185,9 @@ SECTIONS = {
             "validators stop matching, and that file starts over from zero once. If it "
             "changes again it fails.",
             "A piece running far below the median lane for 20 seconds is cancelled, "
-            "requeued, and its lane moved to a new circuit; the last few pieces are raced "
-            "on two lanes and the first to finish wins. A file whose size cannot be "
+            "requeued, and its lane moved to a new circuit; among the last few pieces, one "
+            "running late (twice the median finished piece, never before a second) is raced "
+            "on a second lane and the first to finish wins. A file whose size cannot be "
             "found, or that fits in one piece, is a single GET with nothing to resume, "
             "so a failure leaves nothing behind.",
         ],
