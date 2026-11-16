@@ -29,7 +29,7 @@ database behind it:
     python3 OnionAccelerator.py --mode index live --stream-url http://127.0.0.1:8787
 
 (index/live.py reconnects and records gaps the same way, and mends a gap from the run's
-own directory.) See "The persistent index" in the README.
+own directory.) See docs/modes/index.md.
 """
 
 from __future__ import annotations

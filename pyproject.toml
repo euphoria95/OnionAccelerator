@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,7 +7,23 @@ name = "onionaccelerator"
 version = "0.1.0.dev0"
 description = "Discover and download files over pools of Tor SOCKS5 circuits"
 readme = "README.md"
-license = {file = "LICENSE"}
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{name = "euphoria95"}]
+keywords = ["tor", "onion", "socks5", "downloader", "crawler", "threat-intelligence", "dfir"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Information Technology",
+    "Operating System :: POSIX",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Internet :: WWW/HTTP",
+    "Topic :: Security",
+]
 # One floor for the whole project. 3.11 is the oldest CPython still receiving security
 # fixes, and it ships tomllib, which the crawler's listing templates are read with.
 requires-python = ">=3.11"
@@ -31,6 +47,12 @@ dev = [
     "ruff>=0.6",
 ]
 
+[project.urls]
+Homepage = "https://github.com/euphoria95/OnionAccelerator"
+Documentation = "https://github.com/euphoria95/OnionAccelerator/tree/main/docs"
+Changelog = "https://github.com/euphoria95/OnionAccelerator/blob/main/CHANGELOG.md"
+Issues = "https://github.com/euphoria95/OnionAccelerator/issues"
+
 [project.scripts]
 onionaccelerator = "OnionAccelerator:main"
 
@@ -42,17 +64,17 @@ onionaccelerator = "OnionAccelerator:main"
 # tests/test_facade.py fails if a package directory is missing from this list.
 py-modules = ["OnionAccelerator", "fullhelp"]
 packages = [
-    "crawler", "crawler.listing", "crawler.listing.strategies",
+    "crawler", "crawler.listing", "crawler.listing.strategies", "crawler.listing.templates",
     "eventstream",
-    "index",
+    "index", "index.packs",
     "oacore",
     "rvtree", "rvtree.formats", "rvtree.transport",
 ]
 package-dir = {"rvtree" = "remote_viewer/rvtree"}
 
 [tool.setuptools.package-data]
-"crawler.listing" = ["templates/*.toml"]
-"index" = ["packs/*.toml"]
+"crawler.listing.templates" = ["*.toml"]
+"index.packs" = ["*.toml"]
 
 [tool.pytest.ini_options]
 # The rvtree suite under remote_viewer/ has its own conftest.py and runs from there.

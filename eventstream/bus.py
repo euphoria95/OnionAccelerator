@@ -56,7 +56,7 @@ DOWNLOAD_FAIL = "download.fail"
 
 # kind -> what it means, served verbatim by GET /schema. The point of publishing this is
 # that a consumer can be written against the running server rather than against the
-# README, and can tell a kind it has never seen from a kind it should ignore.
+# docs, and can tell a kind it has never seen from a kind it should ignore.
 KINDS = {
     STREAM_HELLO: "First line on every connection: run metadata and the current cursor.",
     STREAM_GAP: "This consumer fell behind and lost events. 'lost' says how many.",

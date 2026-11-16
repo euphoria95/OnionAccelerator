@@ -340,15 +340,14 @@ def test_a_custody_record_for_an_unknown_url_is_kept_unlinked(ix):
 # ----------------------------------------------------------------------- the docs
 
 
-def test_the_sql_examples_in_the_readme_run_against_the_real_schema(ix, tmp_path):
-    """Documentation that cannot be executed rots: run every ```sql block in the README."""
+def test_the_sql_examples_in_the_docs_run_against_the_real_schema(ix, tmp_path):
+    """Documentation that cannot be executed rots: run every ```sql block on the index page."""
     import re
 
     from index.rules import load_rules
-    readme = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                               "README.md"), encoding="utf-8").read()
-    section = readme.split("## The persistent index", 1)[1].split("\n## ", 1)[0]
-    blocks = re.findall(r"```sql\n(.*?)```", section, re.S)
+    page = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                             "docs", "modes", "index.md"), encoding="utf-8").read()
+    blocks = re.findall(r"```sql\n(.*?)```", page, re.S)
     assert len(blocks) == 1, "expected the schema section's one SQL block"
     statements = [s.strip() for s in blocks[0].split(";") if s.strip()]
     assert len(statements) == 3

@@ -1,0 +1,107 @@
+name: Release
+
+# Publishing to PyPI is irreversible: a version number, once uploaded, can never be used
+# again, even if the release is deleted. So this workflow does everything that can be checked
+# *before* the upload (the tag matches the version, the changelog has an entry for it, the
+# distributions pass `twine check`, and a clean install of the wheel runs), and the upload
+# itself waits for a person: the `pypi` environment must be configured with required
+# reviewers (docs/RELEASING.md).
+#
+# Authentication is PyPI "trusted publishing": a short-lived token minted from this
+# workflow's own identity. There is no API token in this repository or in its secrets.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Where to publish (testpypi is the rehearsal)"
+        type: choice
+        options: [testpypi, pypi]
+        default: testpypi
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install build twine
+
+      - name: The tag, the version and the changelog agree
+        run: |
+          python - <<'PY'
+          import os, re, sys, tomllib
+          version = tomllib.load(open("pyproject.toml", "rb"))["project"]["version"]
+          ref = os.environ["GITHUB_REF"]
+          if ref.startswith("refs/tags/"):
+              tag = ref.removeprefix("refs/tags/")
+              if tag != f"v{version}":
+                  sys.exit(f"tag {tag} does not match pyproject.toml version {version}")
+          if ref.startswith("refs/tags/") and ".dev" in version:
+              sys.exit(f"{version} is a development version and cannot be released from a tag")
+          heading = re.compile(rf"^## \[{re.escape(version)}\] - \d{{4}}-\d{{2}}-\d{{2}}$", re.M)
+          if not heading.search(open("CHANGELOG.md", encoding="utf-8").read()):
+              sys.exit(f"CHANGELOG.md has no '## [{version}] - YYYY-MM-DD' heading")
+          print(f"version {version}: tag and changelog agree")
+          PY
+
+      - run: python -m build
+      - run: twine check --strict dist/*
+
+      - name: A clean install of each distribution runs, from outside the checkout
+        run: |
+          for dist in dist/*.whl dist/*.tar.gz; do
+            python -m venv "$RUNNER_TEMP/v"
+            "$RUNNER_TEMP/v/bin/pip" install -q "$dist"
+            (cd "$RUNNER_TEMP" &&
+             "$RUNNER_TEMP/v/bin/onionaccelerator" --full-help >/dev/null &&
+             "$RUNNER_TEMP/v/bin/onionaccelerator" --list-profiles >/dev/null &&
+             "$RUNNER_TEMP/v/bin/python" -c "import crawler, eventstream, index, oacore, rvtree.cli, fullhelp" &&
+             "$RUNNER_TEMP/v/bin/python" -c "from index import rules; assert len(rules.load_rules()) > 40")
+            rm -rf "$RUNNER_TEMP/v"
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  publish-testpypi:
+    if: github.event_name == 'workflow_dispatch' && inputs.target == 'testpypi'
+    needs: build
+    runs-on: ubuntu-24.04
+    environment: testpypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+
+  publish-pypi:
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.target == 'pypi')
+    needs: build
+    runs-on: ubuntu-24.04
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
