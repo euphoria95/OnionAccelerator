@@ -23,10 +23,10 @@ MIB = lab.MIB
 
 PROFILES = {
     "full": dict(file_mib=128, rate=8.0, lanes=(1, 2, 4, 8, 16), reps=3, slow_lanes=8,
-                 flaky_lanes=8, flaky_mean_mib=24, flaky_reps=5, resume_lanes=8, resume_mib=128,
+                 flaky_lanes=8, flaky_mean_mib=24, flaky_reps=15, resume_lanes=8, resume_mib=128,
                  tar_members=50_000, list_reps=12, list_entries=25),
     "quick": dict(file_mib=16, rate=4.0, lanes=(1, 4), reps=1, slow_lanes=4, flaky_lanes=4,
-                  flaky_mean_mib=8, flaky_reps=2, resume_lanes=4, resume_mib=48, tar_members=2_000,
+                  flaky_mean_mib=8, flaky_reps=4, resume_lanes=4, resume_mib=48, tar_members=2_000,
                   list_reps=3, list_entries=10),
 }
 
@@ -179,15 +179,19 @@ def flaky(ctx: Context) -> list:
                 if run.ok:
                     finished += 1
                     times.append(run.seconds)
-        rows.append([system, f"{finished}/{p['flaky_reps']}", _s(_med(times)),
-                     f"{_med(served):.2f}x"])
+        rows.append([system, f"{finished}/{p['flaky_reps']}",
+                     _s(statistics.fmean(times) if times else float("nan")),
+                     f"{statistics.fmean(served):.2f}x"])
     notes = [f"{n} lanes at {p['rate']:g} MiB/s; every connection is reset after an average of "
              f"{p['flaky_mean_mib']} MiB, so a piece or a chunk is regularly cut off mid-transfer. "
              f"'Bytes served' is what the content server sent divided by the file size: 1.00x is "
-             f"no waste. Median of {p['flaky_reps']}. (How many resets each run met is the lab's "
-             f"dice, not a result, and is not tabulated.)"]
+             f"no waste. These are **means** over {p['flaky_reps']} runs, not medians: a download "
+             f"cut into per-proxy chunks has a two-humped outcome here (either no chunk runs out "
+             f"of retries, or the whole file starts again), and a median flips between the humps "
+             f"from one run of the benchmark to the next. How many resets each run met is the "
+             f"lab's dice, not a result, and is not tabulated."]
     return [Table("Connections that die mid-transfer",
-                  ["system", "finished", "median s", "bytes served"], rows, notes)]
+                  ["system", "finished", "mean s", "mean bytes served"], rows, notes)]
 
 
 # ----------------------------------------------------------------------------- resume
