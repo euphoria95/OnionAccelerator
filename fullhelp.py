@@ -689,7 +689,7 @@ FARM = {
          "a MaxMemInQueues that splits half the host's RAM across the instances. The "
          "latency knobs a tuning guide suggests (MaxClientCircuitsPending, SocksTimeout) "
          "were benchmarked against a self-hosted onion and measured no faster, so they are "
-         "not in it; see the README. 'onion-aggressive' adds MaxCircuitDirtiness 1800, a "
+         "not in it; see docs/farm.md. 'onion-aggressive' adds MaxCircuitDirtiness 1800, a "
          "linkability trade-off. Instances whose torrc changes are reloaded (SIGHUP, "
          "circuits kept), or restarted two seconds apart when the SocksPort line changed, "
          "which a reload does not apply. '--farm status' shows each instance's profile."),

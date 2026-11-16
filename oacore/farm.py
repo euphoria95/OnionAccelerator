@@ -42,7 +42,7 @@ FARM_RESTART_STAGGER = 2.0
 # --farm-tune: torrc lines appended to every farm instance, as (line, why) pairs. Drawn
 # from "Tor Client Performance Tuning" (the section numbers below are its) and then cut
 # down by an A/B benchmark against a self-hosted onion, with a crossover so guard luck
-# could not pass for a config effect (README, "Tuning the farm"). What survived is what
+# could not pass for a config effect (docs/farm.md, "Tuning the farm"). What survived is what
 # fixes something observed on a real farm; the latency and throughput knobs the guide
 # rates Safe -- MaxClientCircuitsPending 96 among them, tried at 64 concurrent cold
 # connects per instance -- measured no different from the defaults, and SocksTimeout
