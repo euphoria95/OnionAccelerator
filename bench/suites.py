@@ -166,29 +166,28 @@ def flaky(ctx: Context) -> list:
     size = p["file_mib"] * MIB
     for system in ("engine", "legacy"):
         if system == "legacy" and not ctx.legacy:
-            rows.append([system, NA, NA, NA, NA])
+            rows.append([system, NA, NA, NA])
             continue
         specs = _stubs(n, p["rate"], fail_mean_mib=p["flaky_mean_mib"])
-        times, served, resets, finished = [], [], [], 0
+        times, served, finished = [], [], 0
         with lab.Lab(file_mib=p["file_mib"], stubs=specs) as lb:
             for _ in range(p["flaky_reps"]):
                 lb.reset()
-                before = sum(s["resets"] for s in lb.stub_stats())
                 run = (runners.run_engine(lb) if system == "engine"
                        else runners.run_legacy(lb, ctx.legacy))
                 served.append(lb.stats()["bytes_sent"] / size)
-                resets.append(sum(s["resets"] for s in lb.stub_stats()) - before)
                 if run.ok:
                     finished += 1
                     times.append(run.seconds)
         rows.append([system, f"{finished}/{p['flaky_reps']}", _s(_med(times)),
-                     f"{_med(served):.2f}x", f"{_med(resets):.0f}"])
+                     f"{_med(served):.2f}x"])
     notes = [f"{n} lanes at {p['rate']:g} MiB/s; every connection is reset after an average of "
              f"{p['flaky_mean_mib']} MiB, so a piece or a chunk is regularly cut off mid-transfer. "
              f"'Bytes served' is what the content server sent divided by the file size: 1.00x is "
-             f"no waste. Median of {p['flaky_reps']}."]
+             f"no waste. Median of {p['flaky_reps']}. (How many resets each run met is the lab's "
+             f"dice, not a result, and is not tabulated.)"]
     return [Table("Connections that die mid-transfer",
-                  ["system", "finished", "median s", "bytes served", "resets per run"], rows, notes)]
+                  ["system", "finished", "median s", "bytes served"], rows, notes)]
 
 
 # ----------------------------------------------------------------------------- resume

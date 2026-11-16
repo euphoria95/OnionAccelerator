@@ -52,6 +52,14 @@ def test_a_changed_shape_never_reproduces():
     assert compare([], [table()])                      # published but not produced
 
 
+def test_an_outcome_count_is_compared_as_a_share_not_as_text():
+    """4/5 on one run and 5/5 on another is noise; 2/5 against 5/5 is not."""
+    def finished(cell):
+        return table([["engine", cell, "3.3"]], columns=("system", "finished", "median s"))
+    assert compare([finished("4/5")], [finished("5/5")]) == []
+    assert compare([finished("2/5")], [finished("5/5")])
+
+
 def test_a_text_cell_must_match_exactly_and_n_a_is_not_a_number():
     a = table([["1", "n/a", "98%"]])
     assert compare([a], [table([["1", "n/a", "98%"]])]) == []
@@ -59,7 +67,7 @@ def test_a_text_cell_must_match_exactly_and_n_a_is_not_a_number():
 
 
 @pytest.mark.parametrize("cell, value", [("16.2", 16.2), ("98%", 98.0), ("1.00x", 1.0),
-                                          ("0.68x", 0.68), ("n/a", None), ("2/5", None),
+                                          ("0.68x", 0.68), ("n/a", None), ("2/5", 40.0), ("5/5", 100.0),
                                           ("hedging on", None)])
 def test_cells_read_as_numbers_only_when_they_are_numbers(cell, value):
     assert report._number(cell) == value

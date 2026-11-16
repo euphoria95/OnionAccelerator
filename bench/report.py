@@ -53,7 +53,15 @@ def parse_tables(markdown: str) -> list:
 _NUMBER = re.compile(r"^[~<>≈]?\s*(-?\d+(?:\.\d+)?)\s*(%|x|×|s|ms|MiB/s)?$")
 
 
+_RATIO = re.compile(r"^(\d+)\s*/\s*(\d+)$")
+
+
 def _number(cell: str) -> Optional[float]:
+    """A cell as a number, or None. "4/5" is 80: an outcome count compared as a share, so
+    four of five finishing and five of five are 20% apart, not different words."""
+    m = _RATIO.match(cell.strip())
+    if m and int(m.group(2)):
+        return 100.0 * int(m.group(1)) / int(m.group(2))
     m = _NUMBER.match(cell.strip())
     return float(m.group(1)) if m else None
 
