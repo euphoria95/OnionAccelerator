@@ -27,8 +27,8 @@ WIDTH = 96
 # mode -> one-line summary. The source of truth for --mode's own help and for the tests
 # that check every mode has a section.
 MODES = {
-    "multi": "download every URL in parallel, one worker per proxy",
-    "partial": "download each URL as parallel byte-range chunks across the proxies",
+    "multi": "download many URLs at once, in resumable pieces, over every circuit",
+    "partial": "download one URL at a time, every circuit working on it, resumable",
     "speedtest": "measure every proxy and check the URLs are reachable",
     "tree": "list or extract members of a huge remote archive without downloading it",
     "crawl": "walk an open directory recursively and write a manifest of every file",
@@ -38,7 +38,8 @@ EXIT_CODES = (
     (0, "Success. For crawl, at least one directory was listed."),
     (1, "Failure: no usable proxies, no URLs.txt and no --url, an unimportable\n"
         "optional package (aiohttp for crawl, rvtree for tree), a bad\n"
-        "--include/--exclude regex, or a crawl that listed no directory at all."),
+        "--include/--exclude regex, a crawl that listed no directory at all, or a\n"
+        "multi/partial run that left a file incomplete (it stays resumable)."),
     (2, "Usage error from argparse: an unknown flag, a bad --mode/--farm\n"
         "combination, or a --url with no scheme."),
 )
@@ -104,8 +105,43 @@ _PROXY_FLAGS = [
 
 _RETRY_FLAG = (
     "--retries N",
-    "Attempts per failed download before giving up (default 3). Each retry draws a "
-    "fresh proxy from the pool, so a dead endpoint costs one attempt, not the URL.",
+    "Attempts per piece before giving up on the file (default 3). Each retry goes to a "
+    "different endpoint and a new circuit, so a dead one costs one attempt, not the "
+    "file. A piece that runs out stops that file but deletes nothing: the pieces already "
+    "in flight get ten seconds to finish, and rerunning the same command resumes.",
+)
+
+_PIECE_FLAGS = [
+    ("--piece-size SIZE",
+     "How big one piece is (default 4M; bytes, or 512K, 4M, 64M; between 64K and 256M). "
+     "Lanes pull pieces from a shared queue, so a fast circuit simply does more of "
+     "them. Each lane holds one whole piece in memory while it fetches it, so memory is "
+     "lanes x piece size, never the file size. Smaller pieces rebalance faster and lose "
+     "less to a failure; larger ones mean fewer requests."),
+    ("--fresh",
+     "Discard any partial download -- the <name>.oa-state journal and <name>.oa-part "
+     "file beside the target -- and start every file over. Without it, rerunning the "
+     "same command resumes, and a journal that no longer fits the file (a different "
+     "size, piece size or ETag) is discarded on its own."),
+]
+
+_LANE_FLAGS = [
+    ("--socks LIST",
+     "Comma-separated host:port SOCKS5 endpoints, e.g. '127.0.0.1:9050,127.0.0.1:9052'. "
+     "Overrides farm discovery and --external, and is how you point a transfer at Tor "
+     "daemons this script does not manage."),
+    ("--circuits-per-endpoint N",
+     "Lanes per SOCKS endpoint (default 2). Each lane has its own SOCKS credential, so "
+     "its own Tor circuit, and its own User-Agent for as long as it lives."),
+]
+
+_DOWNLOAD_STREAM_FLAG = (
+    "--stream [HOST:PORT]",
+    "Publish the transfer as it happens: download.start, download.piece (one per "
+    "finished piece), download.done and download.fail, with the same bind, token and "
+    "replay behaviour as crawl and tree (see 'crawl'). A piece event is the journal "
+    "line written for it and download.done is the <name>.oa.json custody record, "
+    "byte for byte.",
 )
 
 _PRESERVE_FLAG = (
@@ -127,18 +163,38 @@ _FARM_RANGE_FLAGS = [
 SECTIONS = {
     "multi": {
         "what": [
-            "Downloads every target in parallel, one worker thread per proxy, capped at "
-            "the number of URLs so no idle threads are spawned. Progress is aggregated "
-            "into a single bar.",
+            "Downloads many targets at once over a shared set of lanes -- one lane is one "
+            "isolated Tor circuit with its own User-Agent -- with progress aggregated "
+            "into a single bar. A file larger than --piece-size is cut into pieces that "
+            "any free lane takes next, which is what lets a fast circuit do more of the "
+            "work and a stalled one be abandoned.",
             "Files land in downloads/<host>/, one subdirectory per hostname, so two URLs "
             "from different hosts that share a filename never overwrite each other. "
             "Within one host they still can -- that is what --preserve-path is for.",
+            "While a file is in flight it is <name>.oa-part, preallocated, with every "
+            "piece written at its offset, beside <name>.oa-state, a journal of the pieces "
+            "finished and their SHA-256. Kill the run -- even with SIGKILL -- and run the "
+            "same command again: it re-verifies what it had by hash and fetches only the "
+            "rest. When a file completes the pieces are gone and <name>.oa.json remains: "
+            "URL, size, ETag and Last-Modified, the whole-file SHA-256, start and finish "
+            "times, the lanes used and the job id.",
+            "The ETag (or Last-Modified) the size probe saw goes out as If-Range on every "
+            "piece, so a file that changes mid-transfer is never spliced from two "
+            "versions: the server answers 200 with the new entity, or a piece's own "
+            "validators stop matching, and that file starts over from zero once. If it "
+            "changes again it fails.",
+            "A piece running far below the median lane for 20 seconds is cancelled, "
+            "requeued, and its lane moved to a new circuit; among the last few pieces, one "
+            "running late (twice the median finished piece, never before a second) is raced "
+            "on a second lane and the first to finish wins. A file whose size cannot be "
+            "found, or that fits in one piece, is a single GET with nothing to resume, "
+            "so a failure leaves nothing behind.",
         ],
         "flags": [
             _URL_FLAG,
             _RETRY_FLAG,
             _PRESERVE_FLAG,
-        ] + _PROXY_FLAGS,
+        ] + _PIECE_FLAGS + _LANE_FLAGS + [_DOWNLOAD_STREAM_FLAG] + _PROXY_FLAGS,
         "examples": [
             ("python3 OnionAccelerator.py --mode multi --url https://example.onion/a.iso",
              "one file, no URLs.txt needed"),
@@ -146,33 +202,41 @@ SECTIONS = {
              "every line of URLs.txt"),
             ("python3 OnionAccelerator.py --mode multi --preserve-path --retries 5",
              "a crawl manifest, paths kept"),
+            ("python3 OnionAccelerator.py --mode multi --url https://example.onion/a.iso --fresh",
+             "ignore any partial download of it and start over"),
         ],
     },
     "partial": {
         "what": [
-            "Splits each file into parallel byte-range chunks -- up to one per proxy, but "
-            "never more chunks than the size warrants, since a chunk is at least 1 MB -- "
-            "and merges them when they all land. A failed chunk is retried on a different "
-            "proxy, not the one that just died.",
+            "Downloads one file at a time with every lane working on it, as pieces of "
+            "--piece-size pulled from a shared queue into partials/<host>/. There is no "
+            "merge pass: each piece is written at its offset into one preallocated file, "
+            "so memory is lanes x piece size however big the file is. A failed piece is "
+            "retried on a different endpoint and a new circuit, not the one that just "
+            "died, and an interrupted run resumes from its journal -- see 'multi' for the "
+            "journal, the custody record and what happens when the file changes under it.",
             "The size is established by a ladder of four probes, none of which transfers a "
             "payload: a HEAD; then the size= parameter of that same response's "
             "Content-Disposition; then the total in the Content-Range of a one-byte "
             "'Range: bytes=0-0' GET; and finally a plain streamed GET aborted the moment "
             "its headers arrive. A server that withholds Content-Length therefore no "
             "longer costs you the parallelism.",
-            "If all four fail, the download falls back to a single sequential GET with its "
-            "own progress bar. So does a response that arrives under a Content-Encoding: "
-            "the length it advertises describes the compressed transfer rather than the "
-            "file, so it cannot be split into ranges safely.",
+            "If all four fail, the download falls back to a single sequential GET. So does "
+            "a response that arrives under a Content-Encoding: the length it advertises "
+            "describes the compressed transfer rather than the file, so it cannot be "
+            "split into ranges safely. A server that answers ranged requests with 200 "
+            "gets one restart and then the same single GET.",
         ],
         "flags": [
             _URL_FLAG,
             _RETRY_FLAG,
             _PRESERVE_FLAG,
-        ] + _PROXY_FLAGS,
+        ] + _PIECE_FLAGS + _LANE_FLAGS + [_DOWNLOAD_STREAM_FLAG] + _PROXY_FLAGS,
         "examples": [
             ("python3 OnionAccelerator.py --mode partial --url https://example.onion/big.iso",
-             "one big file, chunked"),
+             "one big file, in pieces; run it again to resume"),
+            ("python3 OnionAccelerator.py --mode partial --piece-size 16M --circuits-per-endpoint 4",
+             "fewer, larger pieces over more lanes"),
             ("python3 OnionAccelerator.py --mode partial",
              "every line of URLs.txt"),
         ],
@@ -503,27 +567,27 @@ COMMON = [
       "purpose -- a half-remembered file left over from the last job is the failure mode "
       "this avoids."]),
     ("Where the proxies come from",
-     ["--socks if given (crawl only), else --external, else a live probe of "
+     ["--socks if given (not speedtest), else --external, else a live probe of "
       "127.0.0.1:<base-port> .. <base-port + count - 1>, which is why a farm of any size "
-      "just works without editing constants. Tree and crawl then fall back to the local "
-      "Tor client on 127.0.0.1:9150 and say so; the download modes instead fall back to "
-      "the fixed twenty-port list, a deliberate bet on a Docker setup that raced the "
-      "probe. Note that the download modes always probe the default range: --base-port "
-      "and --count steer the farm, tree and crawl."]),
+      "just works without editing constants. Multi, partial, tree and crawl then fall "
+      "back to the local Tor client on 127.0.0.1:9150 and say so, and stop with an error "
+      "when there is none. Speedtest alone still falls back to the fixed twenty-port "
+      "list: it exists to find out which of those answer."]),
     ("Output",
-     ["downloads/<host>/ for multi, partials/<host>/ for partial's chunk merge, and "
-      "crawls/<job_id>/ for crawl manifests. Add --preserve-path to mirror the remote "
-      "directory tree instead of flattening to basenames; --mode crawl --download always "
-      "does."]),
+     ["downloads/<host>/ for multi, partials/<host>/ for partial, and "
+      "crawls/<job_id>/ for crawl manifests. Beside every finished download sits "
+      "<name>.oa.json, its custody record; beside an unfinished one, <name>.oa-part and "
+      "<name>.oa-state. Add --preserve-path to mirror the remote directory tree "
+      "instead of flattening to basenames; --mode crawl --download always does."]),
     ("Logging",
      ["Every run gets a job_id. DEBUG goes to logs/OnionAccelerator_<job_id>.log, INFO to "
       "the console, and tree mode additionally gets logs/rvtree_<job_id>.log. Nothing is "
       "written at import time, so importing this script from a test is free."]),
     ("User-Agents",
      ["Drawn at random from the first column of UserAgents.tsv (tab-separated; later "
-      "columns such as usage weights are ignored). Crawl pins one per circuit for the "
-      "circuit's lifetime -- a UA that changes per request on a fixed circuit is itself a "
-      "fingerprint."]),
+      "columns such as usage weights are ignored). Crawl, multi and partial pin one per "
+      "circuit for the circuit's lifetime -- a UA that changes per request on a fixed "
+      "circuit is itself a fingerprint."]),
 ]
 
 

@@ -393,13 +393,16 @@ def test_every_streaming_flag_is_documented_in_the_reference():
             assert flag in documented, flag
 
 
-@pytest.mark.parametrize("mode", ["multi", "partial", "speedtest"])
-def test_stream_is_refused_for_the_modes_that_discover_nothing(mode, tmp_path, monkeypatch):
-    """--stream mirrors what a run *finds*; these consume a URL list rather than make one."""
+def test_stream_is_refused_for_speedtest_which_finds_nothing(tmp_path, monkeypatch):
+    """--stream mirrors what a run does to files; speedtest only grades proxies.
+
+    multi and partial publish download.* events now, so they are no longer refused; the
+    wiring is checked in tests/test_download_cli.py with every network edge faked.
+    """
     monkeypatch.chdir(tmp_path)
     (tmp_path / "URLs.txt").write_text("http://a.onion/x\n")
     with pytest.raises(SystemExit) as excinfo:
-        oa.main(["--mode", mode, "--stream"])
+        oa.main(["--mode", "speedtest", "--stream"])
     assert excinfo.value.code == 2
 
 

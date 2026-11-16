@@ -9,6 +9,8 @@ local path -- and each is silent on its own, which is why both are pinned down h
 
 import os
 
+from faultserver import Drop, FaultServer, PatternSource
+
 import OnionAccelerator as oa
 
 
@@ -98,6 +100,18 @@ def test_distinct_basenames_never_collide():
 
 # ---------------------------------------------------------------- clobbering
 
+def _server_that_resets_mid_body():
+    """Serves two paths, chunked and without a length, dropping the connection at 100 bytes.
+
+    Without a length the size probe finds nothing and the file is fetched as one GET --
+    the path whose failure handling these tests are about.
+    """
+    files = {"a/v3/Thumbs.db": PatternSource(1 << 20), "a/thing.zip": PatternSource(1 << 20)}
+    server = FaultServer(files, hide_length=True, validators=False)
+    server.faults.append(lambda req: Drop(after=100) if req.method == "GET" else None)
+    return server
+
+
 def test_a_failed_download_leaves_an_existing_file_alone(tmp_path, monkeypatch):
     """A timeout on one URL must not delete a different URL's finished download.
 
@@ -106,17 +120,20 @@ def test_a_failed_download_leaves_an_existing_file_alone(tmp_path, monkeypatch):
     completed work whenever a same-named sibling failed later.
     """
     monkeypatch.setattr(oa, "DOWNLOAD_DIR", str(tmp_path))
-    url = "http://h.onion/a/v3/Thumbs.db"
-    out_path = oa.url_to_local_path(url, str(tmp_path), preserve_path=False)
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    with open(out_path, "wb") as fh:
-        fh.write(b"the good file that arrived earlier")
+    # The connection is reset mid-body by a loopback server, over a direct lane (proxy
+    # None): the download engine drives requests through its own sessions, so patching
+    # requests.get no longer intercepts anything, and pointing it at "127.0.0.1:9050"
+    # would dial whatever Tor client happens to listen there.
+    with _server_that_resets_mid_body() as server:
+        url = server.url("a/v3/Thumbs.db")
+        out_path = oa.url_to_local_path(url, str(tmp_path), preserve_path=False)
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        with open(out_path, "wb") as fh:
+            fh.write(b"the good file that arrived earlier")
 
-    def explode(*a, **kw):
-        raise OSError("connection reset mid-body")
-
-    monkeypatch.setattr(oa.requests, "get", explode)
-    assert oa.download_file(url, "127.0.0.1:9050", ["ua"]) is False
+        assert oa.download_file(url, None, ["ua"]) is False
+        # It failed because the body was reset, not because the path was never served.
+        assert any(r.method == "GET" and r.status == 200 for r in server.log)
 
     with open(out_path, "rb") as fh:
         assert fh.read() == b"the good file that arrived earlier"
@@ -124,12 +141,9 @@ def test_a_failed_download_leaves_an_existing_file_alone(tmp_path, monkeypatch):
 
 def test_no_partial_files_are_left_behind(tmp_path, monkeypatch):
     monkeypatch.setattr(oa, "DOWNLOAD_DIR", str(tmp_path))
-
-    def explode(*a, **kw):
-        raise OSError("connection reset")
-
-    monkeypatch.setattr(oa.requests, "get", explode)
-    oa.download_file("http://h.onion/a/thing.zip", "127.0.0.1:9050", ["ua"])
+    with _server_that_resets_mid_body() as server:
+        oa.download_file(server.url("a/thing.zip"), None, ["ua"])
+        assert any(r.method == "GET" and r.status == 200 for r in server.log)
 
     leftovers = [f for _, _, files in os.walk(tmp_path) for f in files]
     assert leftovers == []

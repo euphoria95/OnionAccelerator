@@ -49,6 +49,10 @@ TREE_OPEN = "tree.open"
 TREE_ENTRY = "tree.entry"
 TREE_DONE = "tree.done"
 DETECT_RESULT = "detect.result"
+DOWNLOAD_START = "download.start"
+DOWNLOAD_PIECE = "download.piece"
+DOWNLOAD_DONE = "download.done"
+DOWNLOAD_FAIL = "download.fail"
 
 # kind -> what it means, served verbatim by GET /schema. The point of publishing this is
 # that a consumer can be written against the running server rather than against the
@@ -69,6 +73,10 @@ KINDS = {
     TREE_ENTRY: "One member of a remote archive, as it is walked out of the headers.",
     TREE_DONE: "The archive walk finished: entries, bytes fetched, requests spent.",
     DETECT_RESULT: "Which listing templates read a target, and how well.",
+    DOWNLOAD_START: "A file's transfer began, or resumed. The job header written to its journal.",
+    DOWNLOAD_PIECE: "One piece finished and verified. The line appended to the journal.",
+    DOWNLOAD_DONE: "A file completed. The custody record written beside it, whole-file SHA-256 included.",
+    DOWNLOAD_FAIL: "A file stopped, and why. Resumable when a journal remains.",
 }
 
 # The replay ring, in events. Ten thousand is a few minutes of a fast crawl and costs a

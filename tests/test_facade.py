@@ -128,6 +128,23 @@ def test_every_package_directory_is_packaged():
     assert set(setuptools["packages"]) == found
 
 
+def test_the_engines_public_surface_is_reachable_on_the_old_module():
+    from oacore import engine
+
+    for name in ("Downloader", "EngineConfig", "DownloadResult", "plan_pieces",
+                 "read_journal", "DEFAULT_PIECE_SIZE", "EVENT_DOWNLOAD_START",
+                 "EVENT_DOWNLOAD_PIECE", "EVENT_DOWNLOAD_DONE", "EVENT_DOWNLOAD_FAIL"):
+        assert getattr(oa, name) is getattr(engine, name), name
+
+
+def test_the_helpers_the_engine_borrowed_still_answer_on_the_old_module():
+    """_check_response moved to common.py so the engine could use it without a cycle."""
+    from oacore import common
+
+    assert oa._check_response is common._check_response
+    assert oa._error_page_reason is common._error_page_reason
+
+
 def test_an_installed_rvtree_is_preferred_over_the_checkout(monkeypatch):
     """`pip install .` puts rvtree on the path; the checkout fallback must not shadow it."""
     import types
