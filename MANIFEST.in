@@ -1,0 +1,10 @@
+# What the sdist carries beyond the packages pyproject.toml lists: enough to read, test and
+# audit it, and to rebuild every table in docs/benchmarks.md.
+include CHANGELOG.md LICENSE README.md
+recursive-include docs *.md
+recursive-include bench *.py
+recursive-include tests *.py *.sh
+recursive-include index/packs *.toml
+recursive-include crawler/listing/templates *.toml *.md
+prune tests/__pycache__
+global-exclude __pycache__ *.py[cod] .DS_Store

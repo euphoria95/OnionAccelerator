@@ -35,6 +35,8 @@ jobs:
         python: ["3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0       # bench's baseline commit; without it those tests skip
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
@@ -53,9 +55,9 @@ jobs:
       - name: rvtree suite
         working-directory: remote_viewer
         run: python -m pytest -q
-      - name: Slow checks, 3.13 only (2 GiB with eight lanes; a million index entries)
+      - name: Slow checks, 3.13 only (2 GiB with eight lanes; a million index entries; a quick run of every benchmark)
         if: matrix.python == '3.13'
-        run: python -m pytest -q -s -m slow tests/test_download_engine.py tests/test_index_scale.py
+        run: python -m pytest -q -s -m slow tests/test_download_engine.py tests/test_index_scale.py tests/test_bench_report.py
 
   lowest-deps:
     # Every dependency at the floor pyproject.toml declares, on the oldest Python.
@@ -89,7 +91,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-      - run: pip wheel --no-deps -w dist .
+      - run: pip install build twine
+      # sdist first, then the wheel *from the sdist*: what a release does, so a file the sdist
+      # leaves out (a template, a rule pack) fails here and not at publication.
+      - run: python -m build
+      - run: twine check --strict dist/*
       - name: Install into a clean venv and run from elsewhere
         run: |
           python -m venv "$RUNNER_TEMP/venv"
